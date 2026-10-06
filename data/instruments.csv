@@ -1,0 +1,558 @@
+market,asset_type,name,ticker,currency
+Borsa Italiana,Stock,Amplifon,AMP.MI,EUR
+Borsa Italiana,Stock,Azimut Holding,AZM.MI,EUR
+Borsa Italiana,Stock,Banca Mediolanum,BMED.MI,EUR
+Borsa Italiana,Stock,Banca Monte dei Paschi di Siena,BMPS.MI,EUR
+Borsa Italiana,Stock,Banca Popolare di Sondrio,BPSO.MI,EUR
+Borsa Italiana,Stock,BPER Banca,BPE.MI,EUR
+Borsa Italiana,Stock,Brunello Cucinelli,BC.MI,EUR
+Borsa Italiana,Stock,Enav,ENAV.MI,EUR
+Borsa Italiana,Stock,Enel,ENEL.MI,EUR
+Borsa Italiana,Stock,Eni,ENI.MI,EUR
+Borsa Italiana,Stock,ERG,ERG.MI,EUR
+Borsa Italiana,Stock,Ferrari,RACE.MI,EUR
+Borsa Italiana,Stock,FinecoBank,FBK.MI,EUR
+Borsa Italiana,Stock,Generali,G.MI,EUR
+Borsa Italiana,Stock,Intesa Sanpaolo,ISP.MI,EUR
+Borsa Italiana,Stock,Italgas,IG.MI,EUR
+Borsa Italiana,Stock,Leonardo,LDO.MI,EUR
+Borsa Italiana,Stock,Moncler,MONC.MI,EUR
+Borsa Italiana,Stock,Mediobanca,MB.MI,EUR
+Borsa Italiana,Stock,Poste Italiane,PST.MI,EUR
+Borsa Italiana,Stock,Prysmian,PRY.MI,EUR
+Borsa Italiana,Stock,Saipem,SPM.MI,EUR
+Borsa Italiana,Stock,Snam,SRG.MI,EUR
+Borsa Italiana,Stock,Stellantis,STLAM.MI,EUR
+Borsa Italiana,Stock,STMicroelectronics,STMMI.MI,EUR
+Borsa Italiana,Stock,Telecom Italia,TIT.MI,EUR
+Borsa Italiana,Stock,Terna,TRN.MI,EUR
+Borsa Italiana,Stock,UniCredit,UCG.MI,EUR
+Borsa Italiana,Stock,A2A,A2A.MI,EUR
+Borsa Italiana,Stock,Acea,ACE.MI,EUR
+Borsa Italiana,Stock,Aeffe,AEF.MI,EUR
+Borsa Italiana,Stock,Alerion Clean Power,ARN.MI,EUR
+Borsa Italiana,Stock,Alkemy,ALK.MI,EUR
+Borsa Italiana,Stock,Almawave,AWE.MI,EUR
+Borsa Italiana,Stock,Anima Holding,ANIM.MI,EUR
+Borsa Italiana,Stock,Aquafil,AQF.MI,EUR
+Borsa Italiana,Stock,Ariston Holding,ARIS.MI,EUR
+Borsa Italiana,Stock,Ascopiave,ASC.MI,EUR
+Borsa Italiana,Stock,AS Roma,ASR.MI,EUR
+Borsa Italiana,Stock,Avio,AVIO.MI,EUR
+Borsa Italiana,Stock,B&C Speakers,BEC.MI,EUR
+Borsa Italiana,Stock,Banca Generali,BGN.MI,EUR
+Borsa Italiana,Stock,Banca IFIS,IF.MI,EUR
+Borsa Italiana,Stock,Banca Profilo,PRO.MI,EUR
+Borsa Italiana,Stock,Banca Sistema,BST.MI,EUR
+Borsa Italiana,Stock,Banco BPM,BAMI.MI,EUR
+Borsa Italiana,Stock,Be Think Solve Execute,BE.MI,EUR
+Borsa Italiana,Stock,BFF Bank,BFF.MI,EUR
+Borsa Italiana,Stock,Bialetti Industrie,BIA.MI,EUR
+Borsa Italiana,Stock,Biesse,BSS.MI,EUR
+Borsa Italiana,Stock,Brembo,BRE.MI,EUR
+Borsa Italiana,Stock,Brioschi Sviluppo Immobiliare,BRI.MI,EUR
+Borsa Italiana,Stock,Buzzi,BZU.MI,EUR
+Borsa Italiana,Stock,Caltagirone,CALT.MI,EUR
+Borsa Italiana,Stock,Caltagirone Editore,CED.MI,EUR
+Borsa Italiana,Stock,Campari,CPR.MI,EUR
+Borsa Italiana,Stock,Carel Industries,CRL.MI,EUR
+Borsa Italiana,Stock,Carraro,CARR.MI,EUR
+Borsa Italiana,Stock,Cellularline,CELL.MI,EUR
+Borsa Italiana,Stock,Cembre,CMB.MI,EUR
+Borsa Italiana,Stock,Cementir Holding,CEM.MI,EUR
+Borsa Italiana,Stock,CIR,CIR.MI,EUR
+Borsa Italiana,Stock,Civitanavi Systems,CVNS.MI,EUR
+Borsa Italiana,Stock,Class Editori,CLE.MI,EUR
+Borsa Italiana,Stock,Comer Industries,COM.MI,EUR
+Borsa Italiana,Stock,Credem,CE.MI,EUR
+Borsa Italiana,Stock,Cy4Gate,CY4.MI,EUR
+Borsa Italiana,Stock,Danieli,DAN.MI,EUR
+Borsa Italiana,Stock,Datalogic,DAL.MI,EUR
+Borsa Italiana,Stock,De'Longhi,DLG.MI,EUR
+Borsa Italiana,Stock,DiaSorin,DIA.MI,EUR
+Borsa Italiana,Stock,Digital Bros,DIB.MI,EUR
+Borsa Italiana,Stock,Digital Value,DGV.MI,EUR
+Borsa Italiana,Stock,doValue,DOV.MI,EUR
+Borsa Italiana,Stock,El.En.,ELN.MI,EUR
+Borsa Italiana,Stock,Elica,ELC.MI,EUR
+Borsa Italiana,Stock,Emak,EM.MI,EUR
+Borsa Italiana,Stock,Enervit,ENV.MI,EUR
+Borsa Italiana,Stock,Equita Group,EQUI.MI,EUR
+Borsa Italiana,Stock,Esprinet,PRT.MI,EUR
+Borsa Italiana,Stock,Eurogroup Laminations,EGLA.MI,EUR
+Borsa Italiana,Stock,Eurotech,ETH.MI,EUR
+Borsa Italiana,Stock,Exprivia,XPR.MI,EUR
+Borsa Italiana,Stock,Ferretti Group,YACHT.MI,EUR
+Borsa Italiana,Stock,Fiera Milano,FM.MI,EUR
+Borsa Italiana,Stock,Fila,FILA.MI,EUR
+Borsa Italiana,Stock,Fincantieri,FCT.MI,EUR
+Borsa Italiana,Stock,Garofalo Health Care,GHC.MI,EUR
+Borsa Italiana,Stock,Gefran,GEF.MI,EUR
+Borsa Italiana,Stock,Geox,GEO.MI,EUR
+Borsa Italiana,Stock,Giglio Group,GG.MI,EUR
+Borsa Italiana,Stock,GPI,GPI.MI,EUR
+Borsa Italiana,Stock,Gruppo MutuiOnline,MUT.MI,EUR
+Borsa Italiana,Stock,Hera,HER.MI,EUR
+Borsa Italiana,Stock,IGD Siiq,IGD.MI,EUR
+Borsa Italiana,Stock,Immsi,IMS.MI,EUR
+Borsa Italiana,Stock,Indel B,INDB.MI,EUR
+Borsa Italiana,Stock,Industrie De Nora,DNR.MI,EUR
+Borsa Italiana,Stock,Intercos,ICOS.MI,EUR
+Borsa Italiana,Stock,Interpump Group,IP.MI,EUR
+Borsa Italiana,Stock,Inwit,INW.MI,EUR
+Borsa Italiana,Stock,IRCE,IRC.MI,EUR
+Borsa Italiana,Stock,Iren,IRE.MI,EUR
+Borsa Italiana,Stock,Italian Exhibition Group,IEG.MI,EUR
+Borsa Italiana,Stock,Italmobiliare,ITM.MI,EUR
+Borsa Italiana,Stock,Iveco Group,IVG.MI,EUR
+Borsa Italiana,Stock,Juventus Football Club,JUVE.MI,EUR
+Borsa Italiana,Stock,Landi Renzo,LR.MI,EUR
+Borsa Italiana,Stock,Lazio,SSL.MI,EUR
+Borsa Italiana,Stock,Lottomatica Group,LTMC.MI,EUR
+Borsa Italiana,Stock,Lu-Ve,LUVE.MI,EUR
+Borsa Italiana,Stock,Maire,MAIRE.MI,EUR
+Borsa Italiana,Stock,Maps,MAPS.MI,EUR
+Borsa Italiana,Stock,MARR,MARR.MI,EUR
+Borsa Italiana,Stock,MediaForEurope A,MFEA.MI,EUR
+Borsa Italiana,Stock,MediaForEurope B,MFEB.MI,EUR
+Borsa Italiana,Stock,Mondadori,MN.MI,EUR
+Borsa Italiana,Stock,Monrif,MON.MI,EUR
+Borsa Italiana,Stock,Newlat Food,NWL.MI,EUR
+Borsa Italiana,Stock,Nexi,NEXI.MI,EUR
+Borsa Italiana,Stock,Openjobmetis,OJM.MI,EUR
+Borsa Italiana,Stock,Orsero,ORS.MI,EUR
+Borsa Italiana,Stock,OVS,OVS.MI,EUR
+Borsa Italiana,Stock,Pharmanutra,PHN.MI,EUR
+Borsa Italiana,Stock,Philogen,PHIL.MI,EUR
+Borsa Italiana,Stock,Piaggio,PIA.MI,EUR
+Borsa Italiana,Stock,Piovan,PVN.MI,EUR
+Borsa Italiana,Stock,Piquadro,PQ.MI,EUR
+Borsa Italiana,Stock,Pirelli,PIRC.MI,EUR
+Borsa Italiana,Stock,Rai Way,RWAY.MI,EUR
+Borsa Italiana,Stock,Ratti,RAT.MI,EUR
+Borsa Italiana,Stock,RCS MediaGroup,RCS.MI,EUR
+Borsa Italiana,Stock,Recordati,REC.MI,EUR
+Borsa Italiana,Stock,Reply,REY.MI,EUR
+Borsa Italiana,Stock,Revo Insurance,REVO.MI,EUR
+Borsa Italiana,Stock,Sabaf,SAB.MI,EUR
+Borsa Italiana,Stock,Saes Getters,SG.MI,EUR
+Borsa Italiana,Stock,Safilo Group,SFL.MI,EUR
+Borsa Italiana,Stock,Salcef Group,SCF.MI,EUR
+Borsa Italiana,Stock,Salvatore Ferragamo,SFER.MI,EUR
+Borsa Italiana,Stock,Sanlorenzo,SL.MI,EUR
+Borsa Italiana,Stock,Seco,SECO.MI,EUR
+Borsa Italiana,Stock,Servizi Italia,SRI.MI,EUR
+Borsa Italiana,Stock,Sesa,SES.MI,EUR
+Borsa Italiana,Stock,Sogefi,SO.MI,EUR
+Borsa Italiana,Stock,SOL,SOL.MI,EUR
+Borsa Italiana,Stock,Tamburi Investment Partners,TIP.MI,EUR
+Borsa Italiana,Stock,Technogym,TGYM.MI,EUR
+Borsa Italiana,Stock,Technoprobe,TPRO.MI,EUR
+Borsa Italiana,Stock,Tenaris,TEN.MI,EUR
+Borsa Italiana,Stock,Tesmec,TES.MI,EUR
+Borsa Italiana,Stock,Tinexta,TNXT.MI,EUR
+Borsa Italiana,Stock,Tiscali,TIS.MI,EUR
+Borsa Italiana,Stock,Tod's,TOD.MI,EUR
+Borsa Italiana,Stock,Trevi Finanziaria Industriale,TFI.MI,EUR
+Borsa Italiana,Stock,TXT e-solutions,TXT.MI,EUR
+Borsa Italiana,Stock,Unieuro,UNIR.MI,EUR
+Borsa Italiana,Stock,Unipol,UNI.MI,EUR
+Borsa Italiana,Stock,UnipolSai,US.MI,EUR
+Borsa Italiana,Stock,Valsoia,VLS.MI,EUR
+Borsa Italiana,Stock,Webuild,WBD.MI,EUR
+Borsa Italiana,Stock,Wiit,WIIT.MI,EUR
+Borsa Italiana,Stock,Zignago Vetro,ZV.MI,EUR
+market,asset_type,name,ticker,currency
+USA,Stock,Apple,AAPL,USD
+USA,Stock,Microsoft,MSFT,USD
+USA,Stock,NVIDIA,NVDA,USD
+USA,Stock,Alphabet Class A,GOOGL,USD
+USA,Stock,Alphabet Class C,GOOG,USD
+USA,Stock,Amazon,AMZN,USD
+USA,Stock,Meta Platforms,META,USD
+USA,Stock,Tesla,TSLA,USD
+USA,Stock,Broadcom,AVGO,USD
+USA,Stock,Oracle,ORCL,USD
+USA,Stock,Salesforce,CRM,USD
+USA,Stock,Adobe,ADBE,USD
+USA,Stock,Advanced Micro Devices,AMD,USD
+USA,Stock,Cisco Systems,CSCO,USD
+USA,Stock,Intel,INTC,USD
+USA,Stock,IBM,IBM,USD
+USA,Stock,Qualcomm,QCOM,USD
+USA,Stock,Texas Instruments,TXN,USD
+USA,Stock,Intuit,INTU,USD
+USA,Stock,ServiceNow,NOW,USD
+USA,Stock,Applied Materials,AMAT,USD
+USA,Stock,Micron Technology,MU,USD
+USA,Stock,Lam Research,LRCX,USD
+USA,Stock,KLA,KLAC,USD
+USA,Stock,Palo Alto Networks,PANW,USD
+USA,Stock,Palantir Technologies,PLTR,USD
+USA,Stock,Netflix,NFLX,USD
+USA,Stock,Uber Technologies,UBER,USD
+USA,Stock,Accenture,ACN,USD
+USA,Stock,Berkshire Hathaway Class B,BRK-B,USD
+USA,Stock,JPMorgan Chase,JPM,USD
+USA,Stock,Visa,V,USD
+USA,Stock,Mastercard,MA,USD
+USA,Stock,Bank of America,BAC,USD
+USA,Stock,Wells Fargo,WFC,USD
+USA,Stock,Goldman Sachs,GS,USD
+USA,Stock,Morgan Stanley,MS,USD
+USA,Stock,Citigroup,C,USD
+USA,Stock,American Express,AXP,USD
+USA,Stock,BlackRock,BLK,USD
+USA,Stock,Charles Schwab,SCHW,USD
+USA,Stock,S&P Global,SPGI,USD
+USA,Stock,PayPal,PYPL,USD
+USA,Stock,Chubb,CB,USD
+USA,Stock,Progressive,PGR,USD
+USA,Stock,Eli Lilly,LLY,USD
+USA,Stock,UnitedHealth Group,UNH,USD
+USA,Stock,Johnson & Johnson,JNJ,USD
+USA,Stock,AbbVie,ABBV,USD
+USA,Stock,Merck,MRK,USD
+USA,Stock,Pfizer,PFE,USD
+USA,Stock,Thermo Fisher Scientific,TMO,USD
+USA,Stock,Abbott Laboratories,ABT,USD
+USA,Stock,Danaher,DHR,USD
+USA,Stock,Amgen,AMGN,USD
+USA,Stock,Bristol-Myers Squibb,BMY,USD
+USA,Stock,Gilead Sciences,GILD,USD
+USA,Stock,Medtronic,MDT,USD
+USA,Stock,Intuitive Surgical,ISRG,USD
+USA,Stock,CVS Health,CVS,USD
+USA,Stock,Walmart,WMT,USD
+USA,Stock,Costco,COST,USD
+USA,Stock,Home Depot,HD,USD
+USA,Stock,Procter & Gamble,PG,USD
+USA,Stock,Coca-Cola,KO,USD
+USA,Stock,PepsiCo,PEP,USD
+USA,Stock,McDonald's,MCD,USD
+USA,Stock,Nike,NKE,USD
+USA,Stock,Starbucks,SBUX,USD
+USA,Stock,Walt Disney,DIS,USD
+USA,Stock,Lowe's,LOW,USD
+USA,Stock,Mondelez International,MDLZ,USD
+USA,Stock,Philip Morris International,PM,USD
+USA,Stock,Altria Group,MO,USD
+USA,Stock,Target,TGT,USD
+USA,Stock,Booking Holdings,BKNG,USD
+USA,Stock,Colgate-Palmolive,CL,USD
+USA,Stock,Marriott International,MAR,USD
+USA,Stock,Exxon Mobil,XOM,USD
+USA,Stock,Chevron,CVX,USD
+USA,Stock,ConocoPhillips,COP,USD
+USA,Stock,Caterpillar,CAT,USD
+USA,Stock,GE Aerospace,GE,USD
+USA,Stock,Boeing,BA,USD
+USA,Stock,Honeywell,HON,USD
+USA,Stock,United Parcel Service,UPS,USD
+USA,Stock,RTX,RTX,USD
+USA,Stock,Lockheed Martin,LMT,USD
+USA,Stock,Northrop Grumman,NOC,USD
+USA,Stock,Deere & Company,DE,USD
+USA,Stock,Union Pacific,UNP,USD
+USA,Stock,3M,MMM,USD
+USA,Stock,Eaton,ETN,USD
+USA,Stock,Verizon Communications,VZ,USD
+USA,Stock,AT&T,T,USD
+USA,Stock,Comcast,CMCSA,USD
+USA,Stock,T-Mobile US,TMUS,USD
+USA,Stock,NextEra Energy,NEE,USD
+USA,Stock,Duke Energy,DUK,USD
+USA,Stock,Southern Company,SO,USD
+USA,Stock,Prologis,PLD,USD
+USA,Stock,American Tower,AMT,USD
+USA,Stock,Linde,LIN,USD
+Germania,Stock,Adidas,ADS.DE,EUR
+Germania,Stock,Allianz,ALV.DE,EUR
+Germania,Stock,Aurubis,NDA.DE,EUR
+Germania,Stock,BASF,BAS.DE,EUR
+Germania,Stock,Bayer,BAYN.DE,EUR
+Germania,Stock,Bechtle,BC8.DE,EUR
+Germania,Stock,Beiersdorf,BEI.DE,EUR
+Germania,Stock,BMW,BMW.DE,EUR
+Germania,Stock,Brenntag,BNR.DE,EUR
+Germania,Stock,Carl Zeiss Meditec,AFX.DE,EUR
+Germania,Stock,Commerzbank,CBK.DE,EUR
+Germania,Stock,Continental,CON.DE,EUR
+Germania,Stock,Daimler Truck,DTG.DE,EUR
+Germania,Stock,Delivery Hero,DHER.DE,EUR
+Germania,Stock,Deutsche Bank,DBK.DE,EUR
+Germania,Stock,Deutsche Boerse,DB1.DE,EUR
+Germania,Stock,Deutsche Lufthansa,LHA.DE,EUR
+Germania,Stock,Deutsche Post DHL,DHL.DE,EUR
+Germania,Stock,Deutsche Telekom,DTE.DE,EUR
+Germania,Stock,E.ON,EOAN.DE,EUR
+Germania,Stock,Evonik,EVK.DE,EUR
+Germania,Stock,Fielmann,FIE.DE,EUR
+Germania,Stock,Fraport,FRA.DE,EUR
+Germania,Stock,Freenet,FNTN.DE,EUR
+Germania,Stock,Fresenius,FRE.DE,EUR
+Germania,Stock,Fresenius Medical Care,FME.DE,EUR
+Germania,Stock,GEA Group,G1A.DE,EUR
+Germania,Stock,Hannover Rueck,HNR1.DE,EUR
+Germania,Stock,Heidelberg Materials,HEI.DE,EUR
+Germania,Stock,Henkel,HEN3.DE,EUR
+Germania,Stock,Hochtief,HOT.DE,EUR
+Germania,Stock,Hugo Boss,BOSS.DE,EUR
+Germania,Stock,Infineon,IFX.DE,EUR
+Germania,Stock,Jungheinrich,JUN3.DE,EUR
+Germania,Stock,Kion Group,KGX.DE,EUR
+Germania,Stock,Knorr-Bremse,KBX.DE,EUR
+Germania,Stock,Lanxess,LXS.DE,EUR
+Germania,Stock,Mercedes-Benz Group,MBG.DE,EUR
+Germania,Stock,Merck KGaA,MRK.DE,EUR
+Germania,Stock,MTU Aero Engines,MTX.DE,EUR
+Germania,Stock,Munich Re,MUV2.DE,EUR
+Germania,Stock,Nemetschek,NEM.DE,EUR
+Germania,Stock,Porsche AG,P911.DE,EUR
+Germania,Stock,Porsche SE,PAH3.DE,EUR
+Germania,Stock,Puma,PUM.DE,EUR
+Germania,Stock,Qiagen,QIA.DE,EUR
+Germania,Stock,Rational,RAA.DE,EUR
+Germania,Stock,Rheinmetall,RHM.DE,EUR
+Germania,Stock,RWE,RWE.DE,EUR
+Germania,Stock,Salzgitter,SZG.DE,EUR
+Germania,Stock,SAP,SAP.DE,EUR
+Germania,Stock,Sartorius,SRT3.DE,EUR
+Germania,Stock,Scout24,G24.DE,EUR
+Germania,Stock,Siemens,SIE.DE,EUR
+Germania,Stock,Siemens Energy,ENR.DE,EUR
+Germania,Stock,Siemens Healthineers,SHL.DE,EUR
+Germania,Stock,Stroeer,SAX.DE,EUR
+Germania,Stock,Symrise,SY1.DE,EUR
+Germania,Stock,Talanx,TLX.DE,EUR
+Germania,Stock,Thyssenkrupp,TKA.DE,EUR
+Germania,Stock,TUI,TUI1.DE,EUR
+Germania,Stock,United Internet,UTDI.DE,EUR
+Germania,Stock,Volkswagen,VOW3.DE,EUR
+Germania,Stock,Vonovia,VNA.DE,EUR
+Germania,Stock,Wacker Chemie,WCH.DE,EUR
+Germania,Stock,Zalando,ZAL.DE,EUR
+Francia,Stock,Accor,AC.PA,EUR
+Francia,Stock,Aeroports de Paris,ADP.PA,EUR
+Francia,Stock,Air Liquide,AI.PA,EUR
+Francia,Stock,Airbus,AIR.PA,EUR
+Francia,Stock,Alstom,ALO.PA,EUR
+Francia,Stock,Amundi,AMUN.PA,EUR
+Francia,Stock,ArcelorMittal,MT.PA,EUR
+Francia,Stock,Arkema,AKE.PA,EUR
+Francia,Stock,AXA,CS.PA,EUR
+Francia,Stock,bioMerieux,BIM.PA,EUR
+Francia,Stock,BNP Paribas,BNP.PA,EUR
+Francia,Stock,Bollore,BOL.PA,EUR
+Francia,Stock,Bouygues,EN.PA,EUR
+Francia,Stock,Bureau Veritas,BVI.PA,EUR
+Francia,Stock,Capgemini,CAP.PA,EUR
+Francia,Stock,Carrefour,CA.PA,EUR
+Francia,Stock,Covivio,COV.PA,EUR
+Francia,Stock,Credit Agricole,ACA.PA,EUR
+Francia,Stock,Danone,BN.PA,EUR
+Francia,Stock,Dassault Aviation,AM.PA,EUR
+Francia,Stock,Dassault Systemes,DSY.PA,EUR
+Francia,Stock,Edenred,EDEN.PA,EUR
+Francia,Stock,Eiffage,FGR.PA,EUR
+Francia,Stock,Elis,ELIS.PA,EUR
+Francia,Stock,Engie,ENGI.PA,EUR
+Francia,Stock,EssilorLuxottica,EL.PA,EUR
+Francia,Stock,Eurazeo,RF.PA,EUR
+Francia,Stock,Eurofins Scientific,ERF.PA,EUR
+Francia,Stock,Euronext,ENX.PA,EUR
+Francia,Stock,Forvia,FRVIA.PA,EUR
+Francia,Stock,Gecina,GFC.PA,EUR
+Francia,Stock,Getlink,GET.PA,EUR
+Francia,Stock,Hermes International,RMS.PA,EUR
+Francia,Stock,Imerys,NK.PA,EUR
+Francia,Stock,Ipsen,IPN.PA,EUR
+Francia,Stock,Ipsos,IPS.PA,EUR
+Francia,Stock,Kering,KER.PA,EUR
+Francia,Stock,Klepierre,LI.PA,EUR
+Francia,Stock,Legrand,LR.PA,EUR
+Francia,Stock,L'Oreal,OR.PA,EUR
+Francia,Stock,LVMH,MC.PA,EUR
+Francia,Stock,Michelin,ML.PA,EUR
+Francia,Stock,Nexans,NEX.PA,EUR
+Francia,Stock,Orange,ORA.PA,EUR
+Francia,Stock,Pernod Ricard,RI.PA,EUR
+Francia,Stock,Pluxee,PLX.PA,EUR
+Francia,Stock,Publicis,PUB.PA,EUR
+Francia,Stock,Remy Cointreau,RCO.PA,EUR
+Francia,Stock,Renault,RNO.PA,EUR
+Francia,Stock,Rexel,RXL.PA,EUR
+Francia,Stock,Safran,SAF.PA,EUR
+Francia,Stock,Saint-Gobain,SGO.PA,EUR
+Francia,Stock,Sanofi,SAN.PA,EUR
+Francia,Stock,Sartorius Stedim Biotech,DIM.PA,EUR
+Francia,Stock,Schneider Electric,SU.PA,EUR
+Francia,Stock,Societe Generale,GLE.PA,EUR
+Francia,Stock,Sodexo,SW.PA,EUR
+Francia,Stock,SPIE,SPIE.PA,EUR
+Francia,Stock,Technip Energies,TE.PA,EUR
+Francia,Stock,Teleperformance,TEP.PA,EUR
+Francia,Stock,Thales,HO.PA,EUR
+Francia,Stock,TotalEnergies,TTE.PA,EUR
+Francia,Stock,Trigano,TRI.PA,EUR
+Francia,Stock,Ubisoft,UBI.PA,EUR
+Francia,Stock,Unibail-Rodamco-Westfield,URW.PA,EUR
+Francia,Stock,Valeo,FR.PA,EUR
+Francia,Stock,Vallourec,VK.PA,EUR
+Francia,Stock,Veolia,VIE.PA,EUR
+Francia,Stock,Vinci,DG.PA,EUR
+Francia,Stock,Worldline,WLN.PA,EUR
+Spagna,Stock,Acciona,ANA.MC,EUR
+Spagna,Stock,Acciona Energias Renovables,ANE.MC,EUR
+Spagna,Stock,Acerinox,ACX.MC,EUR
+Spagna,Stock,ACS,ACS.MC,EUR
+Spagna,Stock,Aena,AENA.MC,EUR
+Spagna,Stock,Almirall,ALM.MC,EUR
+Spagna,Stock,Amadeus IT Group,AMS.MC,EUR
+Spagna,Stock,ArcelorMittal Spagna,MTS.MC,EUR
+Spagna,Stock,Atresmedia,A3M.MC,EUR
+Spagna,Stock,Banco Bilbao Vizcaya Argentaria,BBVA.MC,EUR
+Spagna,Stock,Banco de Sabadell,SAB.MC,EUR
+Spagna,Stock,Banco Santander,SAN.MC,EUR
+Spagna,Stock,Bankinter,BKT.MC,EUR
+Spagna,Stock,CaixaBank,CABK.MC,EUR
+Spagna,Stock,Cellnex Telecom,CLNX.MC,EUR
+Spagna,Stock,CIE Automotive,CIE.MC,EUR
+Spagna,Stock,Ebro Foods,EBRO.MC,EUR
+Spagna,Stock,Enagas,ENG.MC,EUR
+Spagna,Stock,Endesa,ELE.MC,EUR
+Spagna,Stock,Faes Farma,FAE.MC,EUR
+Spagna,Stock,Ferrovial,FER.MC,EUR
+Spagna,Stock,Fluidra,FDR.MC,EUR
+Spagna,Stock,Gestamp,GEST.MC,EUR
+Spagna,Stock,Grifols,GRF.MC,EUR
+Spagna,Stock,Iberdrola,IBE.MC,EUR
+Spagna,Stock,Inditex,ITX.MC,EUR
+Spagna,Stock,Indra Sistemas,IDR.MC,EUR
+Spagna,Stock,Inmobiliaria Colonial,COL.MC,EUR
+Spagna,Stock,Logista,LOG.MC,EUR
+Spagna,Stock,Mapfre,MAP.MC,EUR
+Spagna,Stock,Melia Hotels,MEL.MC,EUR
+Spagna,Stock,Merlin Properties,MRL.MC,EUR
+Spagna,Stock,Naturgy,NTGY.MC,EUR
+Spagna,Stock,PharmaMar,PHM.MC,EUR
+Spagna,Stock,Prosegur,PSG.MC,EUR
+Spagna,Stock,Puig Brands,PUIG.MC,EUR
+Spagna,Stock,Redeia,RED.MC,EUR
+Spagna,Stock,Repsol,REP.MC,EUR
+Spagna,Stock,Laboratorios Rovi,ROVI.MC,EUR
+Spagna,Stock,Sacyr,SCYR.MC,EUR
+Spagna,Stock,Solaria Energia,SLR.MC,EUR
+Spagna,Stock,Telefonica,TEF.MC,EUR
+Spagna,Stock,Tubacex,TUB.MC,EUR
+Spagna,Stock,Unicaja Banco,UNI.MC,EUR
+Spagna,Stock,Vidrala,VID.MC,EUR
+Spagna,Stock,Viscofan,VIS.MC,EUR
+UK,Stock,3i Group,III.L,GBP
+UK,Stock,Admiral Group,ADM.L,GBP
+UK,Stock,Airtel Africa,AAF.L,GBP
+UK,Stock,Anglo American,AAL.L,GBP
+UK,Stock,Antofagasta,ANTO.L,GBP
+UK,Stock,Ashtead Group,AHT.L,GBP
+UK,Stock,Associated British Foods,ABF.L,GBP
+UK,Stock,AstraZeneca,AZN.L,GBP
+UK,Stock,Auto Trader,AUTO.L,GBP
+UK,Stock,Aviva,AV.L,GBP
+UK,Stock,B&M European Value Retail,BME.L,GBP
+UK,Stock,Babcock International,BAB.L,GBP
+UK,Stock,BAE Systems,BA.L,GBP
+UK,Stock,Barclays,BARC.L,GBP
+UK,Stock,Barratt Redrow,BTRW.L,GBP
+UK,Stock,Beazley,BEZ.L,GBP
+UK,Stock,Bellway,BWY.L,GBP
+UK,Stock,Berkeley Group,BKG.L,GBP
+UK,Stock,BP,BP.L,GBP
+UK,Stock,British American Tobacco,BATS.L,GBP
+UK,Stock,BT Group,BT-A.L,GBP
+UK,Stock,Bunzl,BNZL.L,GBP
+UK,Stock,Burberry,BRBY.L,GBP
+UK,Stock,Centrica,CNA.L,GBP
+UK,Stock,Coca-Cola HBC,CCH.L,GBP
+UK,Stock,Compass Group,CPG.L,GBP
+UK,Stock,Convatec,CTEC.L,GBP
+UK,Stock,Croda International,CRDA.L,GBP
+UK,Stock,DCC,DCC.L,GBP
+UK,Stock,Diageo,DGE.L,GBP
+UK,Stock,Domino's Pizza Group,DPLM.L,GBP
+UK,Stock,Dr. Martens,DOCS.L,GBP
+UK,Stock,easyJet,EZJ.L,GBP
+UK,Stock,Entain,ENT.L,GBP
+UK,Stock,Experian,EXPN.L,GBP
+UK,Stock,Flutter Entertainment,FLTR.L,GBP
+UK,Stock,Fresnillo,FRES.L,GBP
+UK,Stock,Games Workshop,GAW.L,GBP
+UK,Stock,Glencore,GLEN.L,GBP
+UK,Stock,Greggs,GRG.L,GBP
+UK,Stock,GSK,GSK.L,GBP
+UK,Stock,Haleon,HLN.L,GBP
+UK,Stock,Halma,HLMA.L,GBP
+UK,Stock,Hikma Pharmaceuticals,HIK.L,GBP
+UK,Stock,Hiscox,HSX.L,GBP
+UK,Stock,Howden Joinery,HWDN.L,GBP
+UK,Stock,HSBC,HSBA.L,GBP
+UK,Stock,IG Group,IGG.L,GBP
+UK,Stock,IMI,IMI.L,GBP
+UK,Stock,Imperial Brands,IMB.L,GBP
+UK,Stock,Informa,INF.L,GBP
+UK,Stock,InterContinental Hotels Group,IHG.L,GBP
+UK,Stock,International Consolidated Airlines Group,IAG.L,GBP
+UK,Stock,Intermediate Capital Group,ICG.L,GBP
+UK,Stock,Intertek,ITRK.L,GBP
+UK,Stock,ITV,ITV.L,GBP
+UK,Stock,J Sainsbury,SBRY.L,GBP
+UK,Stock,JD Sports Fashion,JD.L,GBP
+UK,Stock,Jet2,JET2.L,GBP
+UK,Stock,Kingfisher,KGF.L,GBP
+UK,Stock,Land Securities,LAND.L,GBP
+UK,Stock,Legal & General,LGEN.L,GBP
+UK,Stock,Lloyds Banking Group,LLOY.L,GBP
+UK,Stock,London Stock Exchange Group,LSEG.L,GBP
+UK,Stock,M&G,MNG.L,GBP
+UK,Stock,Man Group,EMG.L,GBP
+UK,Stock,Marks & Spencer,MKS.L,GBP
+UK,Stock,Melrose Industries,MRO.L,GBP
+UK,Stock,Mondi,MNDI.L,GBP
+UK,Stock,National Grid,NG.L,GBP
+UK,Stock,NatWest Group,NWG.L,GBP
+UK,Stock,Next,NXT.L,GBP
+UK,Stock,Ocado,OCDO.L,GBP
+UK,Stock,Pearson,PSON.L,GBP
+UK,Stock,Persimmon,PSN.L,GBP
+UK,Stock,Pets at Home,PETS.L,GBP
+UK,Stock,Phoenix Group,PHNX.L,GBP
+UK,Stock,Prudential,PRU.L,GBP
+UK,Stock,QinetiQ,QQ.L,GBP
+UK,Stock,Reckitt Benckiser,RKT.L,GBP
+UK,Stock,RELX,REL.L,GBP
+UK,Stock,Rentokil Initial,RTO.L,GBP
+UK,Stock,Rightmove,RMV.L,GBP
+UK,Stock,Rio Tinto,RIO.L,GBP
+UK,Stock,Rolls-Royce,RR.L,GBP
+UK,Stock,Rotork,ROR.L,GBP
+UK,Stock,Sage Group,SGE.L,GBP
+UK,Stock,Schroders,SDR.L,GBP
+UK,Stock,Segro,SGRO.L,GBP
+UK,Stock,Serco,SRP.L,GBP
+UK,Stock,Severn Trent,SVT.L,GBP
+UK,Stock,Shell,SHEL.L,GBP
+UK,Stock,Smith & Nephew,SN.L,GBP
+UK,Stock,Smiths Group,SMIN.L,GBP
+UK,Stock,Spirax Group,SPX.L,GBP
+UK,Stock,SSE,SSE.L,GBP
+UK,Stock,Standard Chartered,STAN.L,GBP
+UK,Stock,Tate & Lyle,TATE.L,GBP
+UK,Stock,Taylor Wimpey,TW.L,GBP
+UK,Stock,Tesco,TSCO.L,GBP
+UK,Stock,Unilever,ULVR.L,GBP
+UK,Stock,United Utilities,UU.L,GBP
+UK,Stock,Vistry Group,VTY.L,GBP
+UK,Stock,Vodafone,VOD.L,GBP
+UK,Stock,Weir Group,WEIR.L,GBP
+UK,Stock,Whitbread,WTB.L,GBP
+UK,Stock,Wise,WISE.L,GBP
+UK,Stock,WPP,WPP.L,GBP
