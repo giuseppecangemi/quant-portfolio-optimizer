@@ -29,6 +29,189 @@ st.set_page_config(
 
 
 # --------------------------------------------------
+# Custom metric cards
+# --------------------------------------------------
+
+def colored_metric(label, value, color):
+
+    colors = {
+        "green": {
+            "bg": "rgba(34, 197, 94, 0.09)",
+            "border": "rgba(34, 197, 94, 0.12)",
+        },
+        "red": {
+            "bg": "rgba(239, 68, 68, 0.09)",
+            "border": "rgba(239, 68, 68, 0.12)",
+        },
+        "blue": {
+            "bg": "rgba(56, 189, 248, 0.09)",
+            "border": "rgba(56, 189, 248, 0.12)",
+        },
+        "purple": {
+            "bg": "rgba(168, 85, 247, 0.09)",
+            "border": "rgba(168, 85, 247, 0.12)",
+        },
+        "yellow": {
+            "bg": "rgba(245, 158, 11, 0.09)",
+            "border": "rgba(245, 158, 11, 0.12)",
+        },
+    }
+
+    c = colors[color]
+
+    html = (
+        f'<div style="'
+        f'background:{c["bg"]};'
+        f'border:1px solid {c["border"]};'
+        f'border-radius:10px;'
+        f'padding:14px 16px;'
+        f'min-height:88px;'
+        f'box-sizing:border-box;'
+        f'">'
+        f'<div style="'
+        f'font-size:0.78rem;'
+        f'opacity:0.72;'
+        f'margin-bottom:6px;'
+        f'">'
+        f'{label}'
+        f'</div>'
+        f'<div style="'
+        f'font-size:1.65rem;'
+        f'font-weight:600;'
+        f'line-height:1.2;'
+        f'">'
+        f'{value}'
+        f'</div>'
+        f'</div>'
+    )
+
+    st.markdown(
+        html,
+        unsafe_allow_html=True
+    )
+
+
+# --------------------------------------------------
+# Portfolio allocation title
+# --------------------------------------------------
+
+def portfolio_allocation_title():
+
+    st.markdown(
+        """
+        <div style="
+            margin-top: 16px;
+            margin-bottom: 8px;
+            font-size: 0.95rem;
+            font-weight: 500;
+        ">
+            Portfolio allocation
+        </div>
+        """,
+        unsafe_allow_html=True
+    )
+
+
+# --------------------------------------------------
+# Portfolio table styling
+# --------------------------------------------------
+
+def style_portfolio_table(df, use_fractional_shares):
+
+    styled_df = df.style
+
+    # --------------------------------------------------
+    # Rows with Quantity = 0 -> red
+    # --------------------------------------------------
+
+    def highlight_zero_quantity(row):
+
+        if row["Quantity"] == 0:
+
+            return [
+                "background-color: rgba(239, 68, 68, 0.13); "
+                "color: #ffb4b4;"
+            ] * len(row)
+
+        return [""] * len(row)
+
+    styled_df = styled_df.apply(
+        highlight_zero_quantity,
+        axis=1
+    )
+
+
+    # --------------------------------------------------
+    # Quantity heatmap
+    # --------------------------------------------------
+
+    positive_quantities = df.loc[
+        df["Quantity"] > 0,
+        "Quantity"
+    ]
+
+    if not positive_quantities.empty:
+
+        min_quantity = positive_quantities.min()
+        max_quantity = positive_quantities.max()
+
+        def quantity_color(value):
+
+            if value == 0:
+
+                return (
+                    "background-color: rgba(239, 68, 68, 0.13); "
+                    "color: #ffb4b4; "
+                    "font-weight: 600;"
+                )
+
+            if max_quantity == min_quantity:
+
+                intensity = 1.0
+
+            else:
+
+                intensity = (
+                    (value - min_quantity)
+                    / (max_quantity - min_quantity)
+                )
+
+            alpha = 0.08 + (0.30 * intensity)
+
+            return (
+                f"background-color: rgba(34, 197, 94, {alpha:.3f}); "
+                "color: #ffffff; "
+                "font-weight: 600;"
+            )
+
+        styled_df = styled_df.map(
+            quantity_color,
+            subset=["Quantity"]
+        )
+
+
+    # --------------------------------------------------
+    # Number formatting
+    # --------------------------------------------------
+
+    styled_df = styled_df.format(
+        {
+            "Weight": "{:.2%}",
+            "Target Amount": "€{:,.2f}",
+            "Price": "€{:,.2f}",
+            "Quantity": (
+                "{:.4f}"
+                if use_fractional_shares
+                else "{:.0f}"
+            ),
+            "Invested": "€{:,.2f}"
+        }
+    )
+
+    return styled_df
+
+
+# --------------------------------------------------
 # Load instruments catalog
 # --------------------------------------------------
 
@@ -36,6 +219,18 @@ INSTRUMENTS_FILE = "data/instruments.csv"
 
 instruments = pd.read_csv(
     INSTRUMENTS_FILE
+)
+
+
+# --------------------------------------------------
+# Maps
+# --------------------------------------------------
+
+name_by_ticker = dict(
+    zip(
+        instruments["ticker"],
+        instruments["name"]
+    )
 )
 
 
@@ -75,21 +270,25 @@ market_instruments = instruments[
     instruments["market"] == market
 ]
 
-# Mappa nome -> ticker, per mostrare "Nome (TICKER)" nel menu
-ticker_by_name = dict(
+
+ticker_by_name_market = dict(
     zip(
         market_instruments["name"],
         market_instruments["ticker"]
     )
 )
 
+
 selected_names = st.sidebar.multiselect(
     "Select instruments",
     options=market_instruments["name"].tolist(),
     default=[],
-    format_func=lambda name: f"{name} ({ticker_by_name[name]})",
+    format_func=lambda name: (
+        f"{name} ({ticker_by_name_market[name]})"
+    ),
     placeholder="Scrivi per cercare (nome o ticker)..."
 )
+
 
 selected_instruments = market_instruments[
     market_instruments["name"].isin(
@@ -97,9 +296,11 @@ selected_instruments = market_instruments[
     )
 ]
 
+
 tickers = selected_instruments[
     "ticker"
 ].tolist()
+
 
 if selected_instruments.empty:
 
@@ -113,6 +314,7 @@ else:
         f"{len(selected_instruments)} "
         f"strumenti selezionati"
     )
+
 
 # --------------------------------------------------
 # Historical period
@@ -183,6 +385,7 @@ use_max_weight = st.sidebar.toggle(
     value=False
 )
 
+
 if use_max_weight:
 
     max_weight = st.sidebar.slider(
@@ -229,6 +432,7 @@ if run_analysis:
 
         st.stop()
 
+
     try:
 
         # --------------------------------------------------
@@ -244,6 +448,7 @@ if run_analysis:
                 period=period
             )
 
+
         # --------------------------------------------------
         # Returns
         # --------------------------------------------------
@@ -256,6 +461,7 @@ if run_analysis:
             returns
         )
 
+
         # --------------------------------------------------
         # Risk
         # --------------------------------------------------
@@ -267,6 +473,7 @@ if run_analysis:
         covariance = covariance_matrix(
             returns
         )
+
 
         # --------------------------------------------------
         # Optimization
@@ -284,6 +491,7 @@ if run_analysis:
             risk_free_rate,
             max_weight=max_weight
         )
+
 
         # --------------------------------------------------
         # Portfolio metrics
@@ -306,6 +514,7 @@ if run_analysis:
             else 0
         )
 
+
         max_return = portfolio_return(
             max_weights.values,
             expected_returns
@@ -323,6 +532,7 @@ if run_analysis:
             else 0
         )
 
+
         # --------------------------------------------------
         # Efficient frontier
         # --------------------------------------------------
@@ -334,13 +544,17 @@ if run_analysis:
             points=100
         )
 
+
         # --------------------------------------------------
         # Results
         # --------------------------------------------------
 
-        st.header("Portfolio Results")
+        st.header(
+            "Portfolio Results"
+        )
 
         col1, col2 = st.columns(2)
+
 
         # ==================================================
         # Minimum Volatility
@@ -354,30 +568,55 @@ if run_analysis:
 
             metric_col1, metric_col2, metric_col3 = st.columns(3)
 
-            metric_col1.metric(
-                "Expected Return",
-                f"{min_return:.2%}"
-            )
 
-            metric_col2.metric(
-                "Volatility",
-                f"{min_volatility:.2%}"
-            )
+            with metric_col1:
 
-            metric_col3.metric(
-                "Sharpe Ratio",
-                f"{min_sharpe:.2f}"
-            )
+                colored_metric(
+                    "Expected Return",
+                    f"{min_return:.2%}",
+                    "green"
+                )
 
-            st.write(
-                "Portfolio allocation"
-            )
+
+            with metric_col2:
+
+                colored_metric(
+                    "Volatility",
+                    f"{min_volatility:.2%}",
+                    "red"
+                )
+
+
+            with metric_col3:
+
+                colored_metric(
+                    "Sharpe Ratio",
+                    f"{min_sharpe:.2f}",
+                    "blue"
+                )
+
+
+            portfolio_allocation_title()
+
 
             min_weights_display = (
                 min_weights
                 .rename("Weight")
                 .to_frame()
             )
+
+
+            min_weights_display.insert(
+                0,
+                "Instrument",
+                min_weights_display.index.map(
+                    lambda ticker: name_by_ticker.get(
+                        ticker,
+                        ticker
+                    )
+                )
+            )
+
 
             # --------------------------------------------------
             # Target amount
@@ -389,13 +628,15 @@ if run_analysis:
                 min_weights * capital
             )
 
+
             # --------------------------------------------------
-            # Latest available market price
+            # Price
             # --------------------------------------------------
 
             min_weights_display[
                 "Price"
             ] = prices.iloc[-1]
+
 
             # --------------------------------------------------
             # Quantity
@@ -423,8 +664,9 @@ if run_analysis:
                     / min_weights_display["Price"]
                 ).astype(int)
 
+
             # --------------------------------------------------
-            # Actual amount invested
+            # Invested
             # --------------------------------------------------
 
             min_weights_display[
@@ -433,6 +675,21 @@ if run_analysis:
                 min_weights_display["Quantity"]
                 * min_weights_display["Price"]
             )
+
+
+            # --------------------------------------------------
+            # Sort
+            # --------------------------------------------------
+
+            min_weights_display = (
+                min_weights_display
+                .sort_values(
+                    by="Invested",
+                    ascending=False
+                )
+                .reset_index(drop=True)
+            )
+
 
             # --------------------------------------------------
             # Capital summary
@@ -449,94 +706,75 @@ if run_analysis:
                 - min_total_invested
             )
 
+
             # --------------------------------------------------
-            # Formatting
+            # Styled table
             # --------------------------------------------------
 
-            min_weights_display[
-                "Weight"
-            ] = (
-                min_weights_display["Weight"]
-                .map(
-                    lambda x: f"{x:.2%}"
-                )
+            min_table = style_portfolio_table(
+                min_weights_display,
+                use_fractional_shares
             )
 
-            min_weights_display[
-                "Target Amount"
-            ] = (
-                min_weights_display[
-                    "Target Amount"
-                ]
-                .map(
-                    lambda x: f"€{x:,.2f}"
-                )
-            )
-
-            min_weights_display[
-                "Price"
-            ] = (
-                min_weights_display["Price"]
-                .map(
-                    lambda x: f"€{x:,.2f}"
-                )
-            )
-
-            if use_fractional_shares:
-
-                min_weights_display[
-                    "Quantity"
-                ] = (
-                    min_weights_display[
-                        "Quantity"
-                    ]
-                    .map(
-                        lambda x: f"{x:.4f}"
-                    )
-                )
-
-            else:
-
-                min_weights_display[
-                    "Quantity"
-                ] = (
-                    min_weights_display[
-                        "Quantity"
-                    ]
-                    .map(
-                        lambda x: f"{int(x)}"
-                    )
-                )
-
-            min_weights_display[
-                "Invested"
-            ] = (
-                min_weights_display["Invested"]
-                .map(
-                    lambda x: f"€{x:,.2f}"
-                )
-            )
 
             st.dataframe(
-                min_weights_display,
-                use_container_width=True
+                min_table,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Instrument": st.column_config.TextColumn(
+                        "Instrument",
+                        width="small",
+                        help="Nome completo dello strumento"
+                    ),
+                    "Weight": st.column_config.Column(
+                        "Weight",
+                        width="small"
+                    ),
+                    "Target Amount": st.column_config.Column(
+                        "Target Amount",
+                        width="small"
+                    ),
+                    "Price": st.column_config.Column(
+                        "Price",
+                        width="small"
+                    ),
+                    "Quantity": st.column_config.Column(
+                        "Quantity",
+                        width="small"
+                    ),
+                    "Invested": st.column_config.Column(
+                        "Invested",
+                        width="small"
+                    ),
+                }
             )
 
+
             # --------------------------------------------------
-            # Capital summary
+            # Capital cards
             # --------------------------------------------------
 
             summary_col1, summary_col2 = st.columns(2)
 
-            summary_col1.metric(
-                "Total Invested",
-                f"€{min_total_invested:,.2f}"
-            )
 
-            summary_col2.metric(
-                "Residual Cash",
-                f"€{min_cash:,.2f}"
-            )
+            with summary_col1:
+
+                colored_metric(
+                    "Total Invested",
+                    f"€{min_total_invested:,.2f}",
+                    "purple"
+                )
+
+
+            with summary_col2:
+
+                colored_metric(
+                    "Residual Cash",
+                    f"€{min_cash:,.2f}",
+                    "yellow"
+                )
+
 
         # ==================================================
         # Maximum Sharpe
@@ -550,30 +788,55 @@ if run_analysis:
 
             metric_col1, metric_col2, metric_col3 = st.columns(3)
 
-            metric_col1.metric(
-                "Expected Return",
-                f"{max_return:.2%}"
-            )
 
-            metric_col2.metric(
-                "Volatility",
-                f"{max_volatility:.2%}"
-            )
+            with metric_col1:
 
-            metric_col3.metric(
-                "Sharpe Ratio",
-                f"{max_sharpe:.2f}"
-            )
+                colored_metric(
+                    "Expected Return",
+                    f"{max_return:.2%}",
+                    "green"
+                )
 
-            st.write(
-                "Portfolio allocation"
-            )
+
+            with metric_col2:
+
+                colored_metric(
+                    "Volatility",
+                    f"{max_volatility:.2%}",
+                    "red"
+                )
+
+
+            with metric_col3:
+
+                colored_metric(
+                    "Sharpe Ratio",
+                    f"{max_sharpe:.2f}",
+                    "blue"
+                )
+
+
+            portfolio_allocation_title()
+
 
             max_weights_display = (
                 max_weights
                 .rename("Weight")
                 .to_frame()
             )
+
+
+            max_weights_display.insert(
+                0,
+                "Instrument",
+                max_weights_display.index.map(
+                    lambda ticker: name_by_ticker.get(
+                        ticker,
+                        ticker
+                    )
+                )
+            )
+
 
             # --------------------------------------------------
             # Target amount
@@ -585,13 +848,15 @@ if run_analysis:
                 max_weights * capital
             )
 
+
             # --------------------------------------------------
-            # Latest available market price
+            # Price
             # --------------------------------------------------
 
             max_weights_display[
                 "Price"
             ] = prices.iloc[-1]
+
 
             # --------------------------------------------------
             # Quantity
@@ -619,8 +884,9 @@ if run_analysis:
                     / max_weights_display["Price"]
                 ).astype(int)
 
+
             # --------------------------------------------------
-            # Actual amount invested
+            # Invested
             # --------------------------------------------------
 
             max_weights_display[
@@ -629,6 +895,21 @@ if run_analysis:
                 max_weights_display["Quantity"]
                 * max_weights_display["Price"]
             )
+
+
+            # --------------------------------------------------
+            # Sort
+            # --------------------------------------------------
+
+            max_weights_display = (
+                max_weights_display
+                .sort_values(
+                    by="Invested",
+                    ascending=False
+                )
+                .reset_index(drop=True)
+            )
+
 
             # --------------------------------------------------
             # Capital summary
@@ -645,94 +926,75 @@ if run_analysis:
                 - max_total_invested
             )
 
+
             # --------------------------------------------------
-            # Formatting
+            # Styled table
             # --------------------------------------------------
 
-            max_weights_display[
-                "Weight"
-            ] = (
-                max_weights_display["Weight"]
-                .map(
-                    lambda x: f"{x:.2%}"
-                )
+            max_table = style_portfolio_table(
+                max_weights_display,
+                use_fractional_shares
             )
 
-            max_weights_display[
-                "Target Amount"
-            ] = (
-                max_weights_display[
-                    "Target Amount"
-                ]
-                .map(
-                    lambda x: f"€{x:,.2f}"
-                )
-            )
-
-            max_weights_display[
-                "Price"
-            ] = (
-                max_weights_display["Price"]
-                .map(
-                    lambda x: f"€{x:,.2f}"
-                )
-            )
-
-            if use_fractional_shares:
-
-                max_weights_display[
-                    "Quantity"
-                ] = (
-                    max_weights_display[
-                        "Quantity"
-                    ]
-                    .map(
-                        lambda x: f"{x:.4f}"
-                    )
-                )
-
-            else:
-
-                max_weights_display[
-                    "Quantity"
-                ] = (
-                    max_weights_display[
-                        "Quantity"
-                    ]
-                    .map(
-                        lambda x: f"{int(x)}"
-                    )
-                )
-
-            max_weights_display[
-                "Invested"
-            ] = (
-                max_weights_display["Invested"]
-                .map(
-                    lambda x: f"€{x:,.2f}"
-                )
-            )
 
             st.dataframe(
-                max_weights_display,
-                use_container_width=True
+                max_table,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "Instrument": st.column_config.TextColumn(
+                        "Instrument",
+                        width="small",
+                        help="Nome completo dello strumento"
+                    ),
+                    "Weight": st.column_config.Column(
+                        "Weight",
+                        width="small"
+                    ),
+                    "Target Amount": st.column_config.Column(
+                        "Target Amount",
+                        width="small"
+                    ),
+                    "Price": st.column_config.Column(
+                        "Price",
+                        width="small"
+                    ),
+                    "Quantity": st.column_config.Column(
+                        "Quantity",
+                        width="small"
+                    ),
+                    "Invested": st.column_config.Column(
+                        "Invested",
+                        width="small"
+                    ),
+                }
             )
 
+
             # --------------------------------------------------
-            # Capital summary
+            # Capital cards
             # --------------------------------------------------
 
             summary_col1, summary_col2 = st.columns(2)
 
-            summary_col1.metric(
-                "Total Invested",
-                f"€{max_total_invested:,.2f}"
-            )
 
-            summary_col2.metric(
-                "Residual Cash",
-                f"€{max_cash:,.2f}"
-            )
+            with summary_col1:
+
+                colored_metric(
+                    "Total Invested",
+                    f"€{max_total_invested:,.2f}",
+                    "purple"
+                )
+
+
+            with summary_col2:
+
+                colored_metric(
+                    "Residual Cash",
+                    f"€{max_cash:,.2f}",
+                    "yellow"
+                )
+
 
         # ==================================================
         # Efficient Frontier
@@ -741,6 +1003,7 @@ if run_analysis:
         st.header(
             "Efficient Frontier"
         )
+
 
         fig = plot_efficient_frontier(
             frontier,
@@ -751,23 +1014,27 @@ if run_analysis:
             risk_free_rate
         )
 
+
         st.plotly_chart(
             fig,
             use_container_width=True
         )
 
+
         # ==================================================
-        # Historical Asset Statistics
+        # Asset Statistics
         # ==================================================
 
         st.header(
             "Asset Statistics"
         )
 
+
         asset_statistics = pd.DataFrame({
             "Expected Return": expected_returns,
             "Volatility": volatility
         })
+
 
         st.dataframe(
             asset_statistics.style.format(
@@ -779,11 +1046,13 @@ if run_analysis:
             use_container_width=True
         )
 
+
     except Exception as e:
 
         st.error(
             f"Analysis failed: {e}"
         )
+
 
 else:
 
