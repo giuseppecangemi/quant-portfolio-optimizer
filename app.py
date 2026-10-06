@@ -120,8 +120,108 @@ def style_portfolio_table(df, use_fractional_shares):
 
     styled_df = df.style
 
+
     # --------------------------------------------------
-    # Rows with Quantity = 0 -> red
+    # Generic heatmap function
+    # --------------------------------------------------
+
+    def make_heatmap(column, rgb, min_alpha=0.06, max_alpha=0.32):
+
+        positive_values = df.loc[
+            df[column] > 0,
+            column
+        ]
+
+        if positive_values.empty:
+            return None
+
+        min_value = positive_values.min()
+        max_value = positive_values.max()
+
+        def color_cell(value):
+
+            if value <= 0:
+                return ""
+
+            if max_value == min_value:
+                intensity = 1.0
+            else:
+                intensity = (
+                    (value - min_value)
+                    / (max_value - min_value)
+                )
+
+            alpha = (
+                min_alpha
+                + (max_alpha - min_alpha) * intensity
+            )
+
+            return (
+                f"background-color: rgba({rgb}, {alpha:.3f}); "
+                "color: #ffffff; "
+                "font-weight: 600;"
+            )
+
+        return color_cell
+
+
+    # --------------------------------------------------
+    # Weight heatmap
+    # Purple
+    # --------------------------------------------------
+
+    weight_color = make_heatmap(
+        "Weight",
+        "168, 85, 247"
+    )
+
+    if weight_color is not None:
+
+        styled_df = styled_df.map(
+            weight_color,
+            subset=["Weight"]
+        )
+
+
+    # --------------------------------------------------
+    # Price heatmap
+    # Green
+    # --------------------------------------------------
+
+    price_color = make_heatmap(
+        "Price",
+        "34, 197, 94"
+    )
+
+    if price_color is not None:
+
+        styled_df = styled_df.map(
+            price_color,
+            subset=["Price"]
+        )
+
+
+    # --------------------------------------------------
+    # Quantity heatmap
+    # Blue
+    # --------------------------------------------------
+
+    quantity_color = make_heatmap(
+        "Quantity",
+        "56, 189, 248"
+    )
+
+    if quantity_color is not None:
+
+        styled_df = styled_df.map(
+            quantity_color,
+            subset=["Quantity"]
+        )
+
+
+    # --------------------------------------------------
+    # Quantity = 0
+    # Entire row red
     # --------------------------------------------------
 
     def highlight_zero_quantity(row):
@@ -135,59 +235,11 @@ def style_portfolio_table(df, use_fractional_shares):
 
         return [""] * len(row)
 
+
     styled_df = styled_df.apply(
         highlight_zero_quantity,
         axis=1
     )
-
-
-    # --------------------------------------------------
-    # Quantity heatmap
-    # --------------------------------------------------
-
-    positive_quantities = df.loc[
-        df["Quantity"] > 0,
-        "Quantity"
-    ]
-
-    if not positive_quantities.empty:
-
-        min_quantity = positive_quantities.min()
-        max_quantity = positive_quantities.max()
-
-        def quantity_color(value):
-
-            if value == 0:
-
-                return (
-                    "background-color: rgba(239, 68, 68, 0.13); "
-                    "color: #ffb4b4; "
-                    "font-weight: 600;"
-                )
-
-            if max_quantity == min_quantity:
-
-                intensity = 1.0
-
-            else:
-
-                intensity = (
-                    (value - min_quantity)
-                    / (max_quantity - min_quantity)
-                )
-
-            alpha = 0.08 + (0.30 * intensity)
-
-            return (
-                f"background-color: rgba(34, 197, 94, {alpha:.3f}); "
-                "color: #ffffff; "
-                "font-weight: 600;"
-            )
-
-        styled_df = styled_df.map(
-            quantity_color,
-            subset=["Quantity"]
-        )
 
 
     # --------------------------------------------------
