@@ -1600,31 +1600,9 @@ def display_backtest_results(
         legend_title="Strategy",
     )
 
-    portfolio_fig.update_xaxes(
-        title_text="Date",
-        showline=True,
-        linecolor="rgba(255, 255, 255, 0.45)",
-        linewidth=1,
-        zeroline=False,
-    )
-
     portfolio_fig.update_yaxes(
-        title_text="Portfolio Value (€)",
         tickprefix="€",
         tickformat=",.0f",
-        showline=True,
-        linecolor="rgba(255, 255, 255, 0.45)",
-        linewidth=1,
-        zeroline=False,
-    )
-
-    portfolio_fig.add_hline(
-        y=result["capital"],
-        line_dash="dash",
-        line_width=1,
-        line_color="rgba(255, 255, 255, 0.45)",
-        annotation_text=f"Initial Capital · €{result['capital']:,.0f}",
-        annotation_position="top left",
     )
 
     st.plotly_chart(
@@ -1747,25 +1725,11 @@ def display_backtest_results(
     )
 
     drawdown_fig.update_layout(
+        xaxis_title="Date",
+        yaxis_title="Drawdown",
         hovermode="x unified",
+        yaxis_tickformat=".0%",
         legend_title="Strategy",
-    )
-
-    drawdown_fig.update_xaxes(
-        title_text="Date",
-        showline=True,
-        linecolor="rgba(255, 255, 255, 0.45)",
-        linewidth=1,
-        zeroline=False,
-    )
-
-    drawdown_fig.update_yaxes(
-        title_text="Drawdown",
-        tickformat=".0%",
-        showline=True,
-        linecolor="rgba(255, 255, 255, 0.45)",
-        linewidth=1,
-        zeroline=False,
     )
 
     st.plotly_chart(
@@ -2083,15 +2047,6 @@ if "optimization_results" not in st.session_state:
     st.session_state.optimization_results = None
 
 if "factor_model_results" not in st.session_state:
-    st.session_state.factor_model_results = None
-
-if (
-    st.session_state.factor_model_results is not None
-    and (
-        "asset_returns" not in st.session_state.factor_model_results
-        or "market_returns" not in st.session_state.factor_model_results
-    )
-):
     st.session_state.factor_model_results = None
 
 if "standard_backtest_results" not in st.session_state:
@@ -3150,24 +3105,6 @@ with optimization_tab:
             r["risk_free_rate"],
         )
 
-        # Assi visibili, coerenti con i grafici CAPM.
-        fig.update_xaxes(
-            title_text="Volatility",
-            tickformat=".0%",
-            showline=True,
-            linecolor="rgba(255, 255, 255, 0.45)",
-            linewidth=1,
-            zeroline=False,
-        )
-        fig.update_yaxes(
-            title_text="Expected Return",
-            tickformat=".1%",
-            showline=True,
-            linecolor="rgba(255, 255, 255, 0.45)",
-            linewidth=1,
-            zeroline=False,
-        )
-
         st.plotly_chart(
             fig,
             use_container_width=True,
@@ -3289,21 +3226,6 @@ with factor_models_tab:
                     max_weight=max_weight,
                 )
 
-                # Frontiera efficiente costruita usando i rendimenti
-                # attesi impliciti del CAPM e la covarianza storica.
-                capm_min_weights = optimize_minimum_volatility(
-                    capm_mu,
-                    capm_covariance,
-                    max_weight=max_weight,
-                )
-
-                capm_frontier = efficient_frontier(
-                    capm_mu,
-                    capm_covariance,
-                    max_weight=max_weight,
-                    points=100,
-                )
-
                 capm_portfolio_return = portfolio_return(
                     capm_weights.values, capm_mu
                 )
@@ -3324,10 +3246,6 @@ with factor_models_tab:
                 st.session_state.factor_model_results = {
                     "period": capm_period,
                     "stats": capm_stats,
-                    "expected_returns": capm_mu,
-                    "covariance": capm_covariance,
-                    "frontier": capm_frontier,
-                    "min_weights": capm_min_weights,
                     "weights": capm_weights,
                     "prices": capm_prices,
                     "table": capm_table,
@@ -3338,8 +3256,6 @@ with factor_models_tab:
                     "cash": capital - capm_total_invested,
                     "use_fractional_shares": use_fractional_shares,
                     "market_expected_return": float(market_returns.mean() * 252),
-                    "asset_returns": asset_returns,
-                    "market_returns": market_returns,
                 }
         except Exception as e:
             st.error(f"CAPM analysis failed: {e}")
@@ -3359,7 +3275,57 @@ with factor_models_tab:
             "and FTSE MIB as the market proxy."
         )
 
+        stats_display = cr["stats"].copy()
+        stats_display.insert(
+            0,
+            "Instrument",
+            [get_company_name(t) for t in stats_display.index],
+        )
+        st.markdown("#### CAPM Asset Statistics")
+        st.dataframe(
+            stats_display.style.format({
+                "Beta": "{:.2f}",
+                "Alpha": "{:.2%}",
+                "R Squared": "{:.2%}",
+                "Market Correlation": "{:.2f}",
+                "Historical Return": "{:.2%}",
+                "CAPM Expected Return": "{:.2%}",
+            }),
+            use_container_width=True,
+        )
 
+        st.markdown("#### Security Market Line")
+        sml_stats = cr["stats"].sort_values("Beta")
+        beta_min = min(0.0, float(sml_stats["Beta"].min()))
+        beta_max = max(1.0, float(sml_stats["Beta"].max()))
+        beta_line = pd.Series(
+            [beta_min + (beta_max - beta_min) * i / 100 for i in range(101)]
+        )
+        sml_return = (
+            risk_free_rate
+            + beta_line * (cr["market_expected_return"] - risk_free_rate)
+        )
+        sml_fig = go.Figure()
+        sml_fig.add_trace(go.Scatter(
+            x=beta_line, y=sml_return, mode="lines", name="Security Market Line"
+        ))
+        sml_fig.add_trace(go.Scatter(
+            x=sml_stats["Beta"],
+            y=sml_stats["CAPM Expected Return"],
+            mode="markers+text",
+            text=[get_company_name(t) for t in sml_stats.index],
+            textposition="top center",
+            name="Assets",
+        ))
+        sml_fig.update_layout(
+            xaxis_title="Beta",
+            yaxis_title="Expected Return",
+            yaxis_tickformat=".1%",
+            hovermode="closest",
+        )
+        st.plotly_chart(sml_fig, use_container_width=True)
+
+        st.divider()
         st.subheader("CAPM Maximum Sharpe Portfolio")
         st.caption(
             "Maximum Sharpe allocation using CAPM expected returns "
@@ -3384,353 +3350,6 @@ with factor_models_tab:
             )
         with s2:
             colored_metric("Residual Cash", f"€{cr['cash']:,.2f}", "yellow")
-
-
-        st.divider()
-        stats_display = cr["stats"].copy()
-        stats_display.insert(
-            0,
-            "Instrument",
-            [get_company_name(t) for t in stats_display.index],
-        )
-        st.markdown("#### CAPM Asset Statistics")
-        st.dataframe(
-            stats_display.style.format({
-                "Beta": "{:.2f}",
-                "Alpha": "{:.2%}",
-                "R Squared": "{:.2%}",
-                "Market Correlation": "{:.2f}",
-                "Historical Return": "{:.2%}",
-                "CAPM Expected Return": "{:.2%}",
-            }),
-            use_container_width=True,
-        )
-
-        # =================================================
-        # CAPM REGRESSION
-        # =================================================
-
-        st.markdown("#### CAPM Regression")
-
-        st.caption(
-            "Each point represents one trading day. The horizontal axis shows "
-            "the FTSE MIB excess return and the vertical axis shows the selected "
-            "asset's excess return. The fitted line is the CAPM regression: "
-            "its slope is Beta and its intercept is Alpha."
-        )
-
-        regression_ticker = st.selectbox(
-            "Select an asset",
-            options=list(cr["asset_returns"].columns),
-            format_func=get_company_name,
-            key="capm_regression_asset",
-        )
-
-        # Il CAPM è stimato sui rendimenti in eccesso.
-        # Convertiamo quindi il risk-free annuale in giornaliero.
-        daily_risk_free_rate = (1.0 + risk_free_rate) ** (1.0 / 252.0) - 1.0
-
-        regression_x = (
-            cr["market_returns"] - daily_risk_free_rate
-        ).rename("Market Excess Return")
-
-        regression_y = (
-            cr["asset_returns"][regression_ticker] - daily_risk_free_rate
-        ).rename("Asset Excess Return")
-
-        regression_data = pd.concat(
-            [regression_x, regression_y],
-            axis=1,
-        ).dropna()
-
-        regression_alpha_annual = float(
-            cr["stats"].loc[regression_ticker, "Alpha"]
-        )
-        regression_beta = float(
-            cr["stats"].loc[regression_ticker, "Beta"]
-        )
-        regression_r_squared = float(
-            cr["stats"].loc[regression_ticker, "R Squared"]
-        )
-
-        # calculate_capm espone Alpha annualizzato.
-        # Per disegnare la retta sui rendimenti giornalieri
-        # riconvertiamo l'intercetta alla scala giornaliera.
-        regression_alpha_daily = regression_alpha_annual / 252.0
-
-        x_min = float(regression_data["Market Excess Return"].min())
-        x_max = float(regression_data["Market Excess Return"].max())
-
-        regression_line_x = [x_min, x_max]
-        regression_line_y = [
-            regression_alpha_daily + regression_beta * x_min,
-            regression_alpha_daily + regression_beta * x_max,
-        ]
-
-        regression_fig = go.Figure()
-
-        regression_fig.add_trace(
-            go.Scatter(
-                x=regression_data["Market Excess Return"],
-                y=regression_data["Asset Excess Return"],
-                mode="markers",
-                name="Daily Returns",
-                marker=dict(
-                    size=6,
-                    opacity=0.55,
-                ),
-                customdata=regression_data.index.strftime("%d/%m/%Y"),
-                hovertemplate=(
-                    "Date: %{customdata}"
-                    "<br>FTSE MIB Excess Return: %{x:.2%}"
-                    "<br>Asset Excess Return: %{y:.2%}"
-                    "<extra></extra>"
-                ),
-            )
-        )
-
-        regression_fig.add_trace(
-            go.Scatter(
-                x=regression_line_x,
-                y=regression_line_y,
-                mode="lines",
-                name="CAPM Regression",
-                hovertemplate=(
-                    "FTSE MIB Excess Return: %{x:.2%}"
-                    "<br>Fitted Asset Excess Return: %{y:.2%}"
-                    "<extra>CAPM Regression</extra>"
-                ),
-            )
-        )
-
-        regression_fig.update_layout(
-            hovermode="closest",
-            legend_title="Series",
-        )
-
-        regression_fig.update_xaxes(
-            title_text="FTSE MIB Excess Return",
-            tickformat=".1%",
-            showline=True,
-            linecolor="rgba(255, 255, 255, 0.45)",
-            linewidth=1,
-            zeroline=True,
-            zerolinecolor="rgba(255, 255, 255, 0.18)",
-        )
-
-        regression_fig.update_yaxes(
-            title_text=f"{get_company_name(regression_ticker)} Excess Return",
-            tickformat=".1%",
-            showline=True,
-            linecolor="rgba(255, 255, 255, 0.45)",
-            linewidth=1,
-            zeroline=True,
-            zerolinecolor="rgba(255, 255, 255, 0.18)",
-        )
-
-        st.plotly_chart(
-            regression_fig,
-            use_container_width=True,
-            key="capm_regression_chart",
-        )
-
-        regression_col1, regression_col2, regression_col3 = st.columns(3)
-
-        regression_col1.metric(
-            "Beta",
-            f"{regression_beta:.2f}",
-        )
-
-        regression_col2.metric(
-            "Alpha (annualized)",
-            f"{regression_alpha_annual:.2%}",
-        )
-
-        regression_col3.metric(
-            "R²",
-            f"{regression_r_squared:.2%}",
-        )
-
-        st.divider()
-
-        st.markdown("#### Security Market Line")
-        st.caption(
-            "The Security Market Line (SML) shows the relationship between "
-            "systematic risk, measured by Beta, and the expected return implied "
-            "by CAPM. Assets with higher Beta require a higher expected return "
-            "as compensation for greater exposure to market risk."
-        )
-
-        sml_stats = cr["stats"].sort_values("Beta")
-        beta_min = min(0.0, float(sml_stats["Beta"].min()))
-        beta_max = max(1.0, float(sml_stats["Beta"].max()))
-        beta_line = pd.Series(
-            [beta_min + (beta_max - beta_min) * i / 100 for i in range(101)]
-        )
-        sml_return = (
-            risk_free_rate
-            + beta_line * (cr["market_expected_return"] - risk_free_rate)
-        )
-        sml_fig = go.Figure()
-        sml_fig.add_trace(go.Scatter(
-            x=beta_line, y=sml_return, mode="lines", name="Security Market Line"
-        ))
-        sml_fig.add_trace(go.Scatter(
-            x=sml_stats["Beta"],
-            y=sml_stats["CAPM Expected Return"],
-            mode="markers+text",
-            text=[get_company_name(t) for t in sml_stats.index],
-            textposition="top center",
-            name="Assets",
-        ))
-        sml_fig.update_layout(
-            hovermode="closest",
-        )
-        sml_fig.update_xaxes(
-            title_text="Beta",
-            showline=True,
-            linecolor="rgba(255, 255, 255, 0.45)",
-            linewidth=1,
-            zeroline=False,
-        )
-        sml_fig.update_yaxes(
-            title_text="Expected Return",
-            tickformat=".1%",
-            showline=True,
-            linecolor="rgba(255, 255, 255, 0.45)",
-            linewidth=1,
-            zeroline=False,
-        )
-        st.plotly_chart(sml_fig, use_container_width=True)
-
-        # =================================================
-        # CAPM EFFICIENT FRONTIER + CAPITAL MARKET LINE
-        # =================================================
-
-        st.divider()
-        st.markdown("#### CAPM Efficient Frontier & Capital Market Line")
-        st.caption(
-            "The Efficient Frontier represents the portfolios offering the "
-            "highest expected return for each level of volatility. The Capital "
-            "Market Line (CML) starts from the risk-free asset and is tangent "
-            "to the frontier at the CAPM Maximum Sharpe portfolio, representing "
-            "combinations of the risk-free asset and the tangency portfolio."
-        )
-
-        capm_frontier_fig = plot_efficient_frontier(
-            cr["frontier"],
-            cr["expected_returns"],
-            cr["covariance"],
-            cr["min_weights"],
-            cr["weights"],
-            risk_free_rate,
-        )
-
-        # Il Maximum Sharpe della frontiera CAPM è il portafoglio
-        # di tangenza della Capital Market Line.
-        tangency_volatility = cr["volatility"]
-        tangency_return = cr["return"]
-
-        # Estendiamo la CML oltre il portafoglio di tangenza, come nella
-        # rappresentazione teorica classica. L'estensione è puramente
-        # grafica e non modifica i pesi del portafoglio.
-        frontier_max_volatility = max(
-            float(cr["frontier"]["volatility"].max()),
-            float(cr["expected_returns"].index.to_series().map(
-                lambda ticker: cr["covariance"].loc[ticker, ticker] ** 0.5
-            ).max()),
-            float(tangency_volatility),
-        )
-        cml_max_volatility = frontier_max_volatility * 1.08
-
-        if tangency_volatility > 0:
-            cml_slope = (
-                (tangency_return - risk_free_rate)
-                / tangency_volatility
-            )
-            cml_end_return = (
-                risk_free_rate
-                + cml_slope * cml_max_volatility
-            )
-
-            capm_frontier_fig.add_trace(
-                go.Scatter(
-                    x=[0.0, cml_max_volatility],
-                    y=[risk_free_rate, cml_end_return],
-                    mode="lines",
-                    name="Capital Market Line",
-                    line=dict(
-                        color="rgba(56, 189, 248, 0.95)",
-                        width=2,
-                    ),
-                    hovertemplate=(
-                        "Capital Market Line<br>"
-                        "Volatility: %{x:.2%}<br>"
-                        "Expected Return: %{y:.2%}"
-                        "<extra></extra>"
-                    ),
-                )
-            )
-
-        # Risk-free asset: volatilità zero e rendimento pari al tasso
-        # privo di rischio impostato nella sidebar.
-        capm_frontier_fig.add_trace(
-            go.Scatter(
-                x=[0.0],
-                y=[risk_free_rate],
-                mode="markers+text",
-                text=["Risk-Free Asset"],
-                textposition="top right",
-                name="Risk-Free Asset",
-                marker=dict(
-                    size=10,
-                    symbol="diamond",
-                    color="rgba(245, 158, 11, 1.0)",
-                ),
-                hovertemplate=(
-                    "Risk-Free Asset<br>"
-                    "Volatility: 0.00%<br>"
-                    "Expected Return: %{y:.2%}"
-                    "<extra></extra>"
-                ),
-            )
-        )
-
-        # Rinominiamo il punto Maximum Sharpe già prodotto dalla funzione
-        # standard per chiarire che qui è il portafoglio CAPM di tangenza.
-        for trace in capm_frontier_fig.data:
-            if trace.name == "Maximum Sharpe":
-                trace.name = "CAPM Maximum Sharpe"
-
-        # Il titolo è già mostrato da Streamlit sopra il grafico:
-        # evitiamo quindi di duplicarlo dentro Plotly.
-        capm_frontier_fig.update_layout(
-            title=None,
-            hovermode="closest",
-        )
-        capm_frontier_fig.update_xaxes(
-            title_text="Volatility",
-            tickformat=".0%",
-            showline=True,
-            linecolor="rgba(255, 255, 255, 0.45)",
-            linewidth=1,
-            zeroline=False,
-            rangemode="tozero",
-        )
-        capm_frontier_fig.update_yaxes(
-            title_text="Expected Return",
-            tickformat=".1%",
-            showline=True,
-            linecolor="rgba(255, 255, 255, 0.45)",
-            linewidth=1,
-            zeroline=False,
-        )
-
-        st.plotly_chart(
-            capm_frontier_fig,
-            use_container_width=True,
-        )
-
 
 
 # =========================================================
