@@ -1,6 +1,9 @@
 import streamlit as st
 import pandas as pd
+import numpy as np
 import plotly.graph_objects as go
+import json
+from datetime import datetime
 from pathlib import Path
 
 from src.data import get_prices
@@ -50,6 +53,7 @@ st.set_page_config(
 
 PROJECT_DIR = Path(__file__).resolve().parent
 INSTRUMENTS_FILE = PROJECT_DIR / "data" / "instruments.csv"
+EXPERIMENTS_DIR = PROJECT_DIR / "saved_experiments"
 
 instruments = pd.read_csv(INSTRUMENTS_FILE)
 
@@ -59,6 +63,701 @@ FTSE_MIB_TICKER = "FTSEMIB.MI"
 # =========================================================
 # HELPERS
 # =========================================================
+
+
+def _json_safe(value):
+    """
+    Converte gli oggetti usati dall'app in una struttura JSON serializzabile.
+    Mantiene esplicitamente DataFrame e Series così che ogni esperimento
+    conservi anche tabelle, curve, matrici e storici dei pesi.
+
+    NaN, +inf e -inf vengono convertiti in None perché non sono valori
+    JSON validi quando allow_nan=False.
+    """
+    if value is None:
+        return None
+
+    if isinstance(value, (float, np.floating)):
+        return float(value) if np.isfinite(value) else None
+
+    if isinstance(value, (str, int, bool)):
+        return value
+
+    if isinstance(value, (pd.Timestamp, datetime)):
+        return value.isoformat()
+
+    if isinstance(value, Path):
+        return str(value)
+
+    if isinstance(value, np.generic):
+        return _json_safe(value.item())
+
+    if isinstance(value, np.ndarray):
+        return {
+            "__type__": "ndarray",
+            "data": value.tolist(),
+        }
+
+    if isinstance(value, pd.Series):
+        return {
+            "__type__": "series",
+            "name": _json_safe(value.name),
+            "index": [_json_safe(x) for x in value.index.tolist()],
+            "data": [_json_safe(x) for x in value.tolist()],
+        }
+
+    if isinstance(value, pd.DataFrame):
+        return {
+            "__type__": "dataframe",
+            "index": [_json_safe(x) for x in value.index.tolist()],
+            "columns": [_json_safe(x) for x in value.columns.tolist()],
+            "data": [
+                [_json_safe(cell) for cell in row]
+                for row in value.to_numpy(dtype=object).tolist()
+            ],
+        }
+
+    if isinstance(value, dict):
+        return {
+            str(key): _json_safe(item)
+            for key, item in value.items()
+        }
+
+    if isinstance(value, (list, tuple, set)):
+        return [_json_safe(item) for item in value]
+
+    if pd.isna(value):
+        return None
+
+    return str(value)
+
+
+def _experiment_id():
+    return datetime.now().strftime("EXP-%Y%m%d-%H%M%S-%f")
+
+
+def build_experiment_snapshot(
+    experiment_name,
+    market,
+    selection_mode,
+    tickers,
+    risk_free_rate,
+    capital,
+    use_fractional_shares,
+    use_max_weight,
+    max_weight,
+):
+    """
+    Crea una fotografia immutabile del run corrente.
+
+    Il file contiene i cinque blocchi richiesti:
+    Asset Selection, Portfolio Parameters, Portfolio Optimization,
+    Factor Models e Backtesting.
+    """
+    now = datetime.now()
+    experiment_id = _experiment_id()
+
+    screening_state = st.session_state.get("screening_results")
+    optimization_state = st.session_state.get("optimization_results")
+    factor_state = st.session_state.get("factor_model_results")
+    standard_state = st.session_state.get("standard_backtest_results")
+    fixed_state = st.session_state.get("fixed_backtest_results")
+
+    selected_assets = []
+    for ticker in tickers:
+        match = instruments[instruments["ticker"] == ticker]
+        selected_assets.append(
+            {
+                "ticker": ticker,
+                "name": (
+                    match.iloc[0]["name"]
+                    if not match.empty
+                    else ticker
+                ),
+            }
+        )
+
+    snapshot = {
+        "experiment": {
+            "id": experiment_id,
+            "name": (
+                experiment_name.strip()
+                if experiment_name.strip()
+                else experiment_id
+            ),
+            "saved_at": now.isoformat(),
+            "app": "Quant Portfolio Optimizer",
+            "schema_version": 1,
+        },
+
+        "asset_selection": {
+            "market": market,
+            "selection_mode": selection_mode,
+            "selected_assets": selected_assets,
+            "selected_tickers": list(tickers),
+            "screening_results": screening_state,
+        },
+
+        "portfolio_parameters": {
+            "market": market,
+            "selection_mode": selection_mode,
+            "risk_free_rate": risk_free_rate,
+            "capital": capital,
+            "use_fractional_shares": use_fractional_shares,
+            "use_max_weight": use_max_weight,
+            "max_weight": max_weight,
+            "number_of_selected_assets": len(tickers),
+        },
+
+        "portfolio_optimization": optimization_state,
+
+        "factor_models": factor_state,
+
+        "backtesting": {
+            "standard_walk_forward": standard_state,
+            "fixed_horizon": fixed_state,
+        },
+    }
+
+    return _json_safe(snapshot)
+
+
+def save_experiment_snapshot(snapshot):
+    EXPERIMENTS_DIR.mkdir(parents=True, exist_ok=True)
+
+    experiment = snapshot["experiment"]
+    experiment_id = experiment["id"]
+    file_path = EXPERIMENTS_DIR / f"{experiment_id}.json"
+
+    with file_path.open("w", encoding="utf-8") as f:
+        json.dump(
+            snapshot,
+            f,
+            ensure_ascii=False,
+            indent=2,
+            allow_nan=False,
+        )
+
+    return file_path
+
+
+def list_saved_experiments():
+    if not EXPERIMENTS_DIR.exists():
+        return []
+
+    experiments = []
+
+    for file_path in sorted(
+        EXPERIMENTS_DIR.glob("EXP-*.json"),
+        reverse=True,
+    ):
+        try:
+            with file_path.open("r", encoding="utf-8") as f:
+                payload = json.load(f)
+
+            meta = payload.get("experiment", {})
+            params = payload.get("portfolio_parameters", {})
+            asset_selection = payload.get("asset_selection", {})
+            backtesting = payload.get("backtesting", {})
+
+            standard = backtesting.get("standard_walk_forward")
+            fixed = backtesting.get("fixed_horizon")
+
+            experiments.append(
+                {
+                    "ID": meta.get("id", file_path.stem),
+                    "Name": meta.get("name", file_path.stem),
+                    "Saved At": meta.get("saved_at", ""),
+                    "Market": params.get("market", ""),
+                    "Selection": params.get("selection_mode", ""),
+                    "Assets": params.get(
+                        "number_of_selected_assets",
+                        len(asset_selection.get("selected_tickers", [])),
+                    ),
+                    "Optimization": (
+                        "Saved"
+                        if payload.get("portfolio_optimization") is not None
+                        else "—"
+                    ),
+                    "Factor Models": (
+                        "Saved"
+                        if payload.get("factor_models") is not None
+                        else "—"
+                    ),
+                    "Standard BT": (
+                        "Saved"
+                        if standard is not None
+                        else "—"
+                    ),
+                    "Fixed BT": (
+                        "Saved"
+                        if fixed is not None
+                        else "—"
+                    ),
+                    "_path": str(file_path),
+                }
+            )
+
+        except Exception:
+            continue
+
+    return experiments
+
+
+
+def _json_restore(value):
+    """Ricostruisce DataFrame, Series e ndarray salvati da _json_safe()."""
+    if isinstance(value, list):
+        return [_json_restore(item) for item in value]
+
+    if not isinstance(value, dict):
+        return value
+
+    value_type = value.get("__type__")
+
+    if value_type == "ndarray":
+        return np.array(value.get("data", []))
+
+    if value_type == "series":
+        index = [_json_restore(x) for x in value.get("index", [])]
+        data = [_json_restore(x) for x in value.get("data", [])]
+        return pd.Series(
+            data,
+            index=index,
+            name=_json_restore(value.get("name")),
+        )
+
+    if value_type == "dataframe":
+        index = [_json_restore(x) for x in value.get("index", [])]
+        columns = [_json_restore(x) for x in value.get("columns", [])]
+        data = [
+            [_json_restore(cell) for cell in row]
+            for row in value.get("data", [])
+        ]
+        return pd.DataFrame(data, index=index, columns=columns)
+
+    return {
+        key: _json_restore(item)
+        for key, item in value.items()
+    }
+
+
+def load_saved_experiment(file_path):
+    with Path(file_path).open("r", encoding="utf-8") as f:
+        return _json_restore(json.load(f))
+
+
+def _saved_pct(value):
+    try:
+        return f"{float(value):.2%}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _saved_num(value, digits=2):
+    try:
+        return f"{float(value):.{digits}f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _saved_money(value):
+    try:
+        return f"€{float(value):,.2f}"
+    except (TypeError, ValueError):
+        return "—"
+
+
+def _saved_table(df, percentage_columns=None, money_columns=None):
+    if not isinstance(df, pd.DataFrame) or df.empty:
+        st.info("No saved table is available for this section.")
+        return
+
+    fmt = {}
+    for column in percentage_columns or []:
+        if column in df.columns:
+            fmt[column] = "{:.2%}"
+    for column in money_columns or []:
+        if column in df.columns:
+            fmt[column] = "€{:,.2f}"
+
+    if fmt:
+        st.dataframe(df.style.format(fmt, na_rep="—"), use_container_width=True)
+    else:
+        st.dataframe(df, use_container_width=True)
+
+
+def _render_saved_backtest_summary(result, title):
+    if not isinstance(result, dict):
+        st.info(f"No saved {title} results.")
+        return
+
+    st.markdown(f"#### {title}")
+
+    meta_cols = st.columns(4)
+    meta_cols[0].metric(
+        "Estimation Window",
+        result.get("lookback_label", "—"),
+    )
+    meta_cols[1].metric(
+        "Backtest Period",
+        result.get("period_label", "—"),
+    )
+    meta_cols[2].metric(
+        "Rebalancing",
+        result.get("rebalance_label", "—"),
+    )
+    meta_cols[3].metric(
+        "Initial Capital",
+        _saved_money(result.get("capital")),
+    )
+
+    comparison = {}
+    metric_map = [
+        ("Maximum Sharpe", "max_bt_metrics"),
+        ("CAPM Maximum Sharpe", "capm_bt_metrics"),
+        ("Minimum Volatility", "min_bt_metrics"),
+        ("Risk Parity", "risk_parity_bt_metrics"),
+        ("HRP", "hrp_bt_metrics"),
+        ("Equal Weight", "equal_bt_metrics"),
+        ("FTSE MIB", "ftse_bt_metrics"),
+    ]
+
+    for label, key in metric_map:
+        metrics = result.get(key)
+        if isinstance(metrics, dict):
+            comparison[label] = metrics
+
+    if comparison:
+        comparison_df = pd.DataFrame(comparison).T
+
+        formatters = {}
+        for column in comparison_df.columns:
+            if (
+                "Return" in str(column)
+                or "Volatility" in str(column)
+                or "Drawdown" in str(column)
+                or str(column) == "CAGR"
+            ):
+                formatters[column] = "{:.2%}"
+            elif "Sharpe" in str(column) or "Sortino" in str(column):
+                formatters[column] = "{:.2f}"
+            elif str(column) == "Final Value":
+                formatters[column] = "€{:,.2f}"
+
+        st.dataframe(
+            comparison_df.style.format(formatters, na_rep="—"),
+            use_container_width=True,
+        )
+
+    growth_map = [
+        ("Maximum Sharpe", "max_sharpe_bt"),
+        ("CAPM Maximum Sharpe", "capm_bt"),
+        ("Minimum Volatility", "min_vol_bt"),
+        ("Risk Parity", "risk_parity_bt"),
+        ("HRP", "hrp_bt"),
+        ("Equal Weight", "equal_weight_bt"),
+        ("FTSE MIB", "ftse_mib_bt"),
+    ]
+
+    growth = pd.DataFrame()
+
+    for label, key in growth_map:
+        backtest_data = result.get(key)
+
+        # I motori di backtest salvano le curve come DataFrame
+        # con la colonna "Portfolio Value". Supportiamo anche
+        # Series per compatibilità con eventuali esperimenti legacy.
+        if isinstance(backtest_data, pd.DataFrame) and not backtest_data.empty:
+            if "Portfolio Value" in backtest_data.columns:
+                s = backtest_data["Portfolio Value"].copy()
+            elif backtest_data.shape[1] == 1:
+                s = backtest_data.iloc[:, 0].copy()
+            else:
+                continue
+
+        elif isinstance(backtest_data, pd.Series) and not backtest_data.empty:
+            s = backtest_data.copy()
+
+        else:
+            continue
+
+        try:
+            s.index = pd.to_datetime(s.index)
+        except Exception:
+            pass
+
+        growth[label] = s
+
+    if not growth.empty:
+        st.markdown("##### Portfolio Growth")
+
+        # Ricostruisce il solo grafico Growth del backtest salvato.
+        # I dati sono già persistiti nello snapshot JSON come equity curves,
+        # quindi il grafico resta disponibile anche riaprendo l'esperimento.
+        growth_fig = go.Figure()
+
+        for column in growth.columns:
+            growth_fig.add_trace(
+                go.Scatter(
+                    x=growth.index,
+                    y=growth[column],
+                    mode="lines",
+                    name=column,
+                )
+            )
+
+        initial_capital = result.get("capital")
+        if initial_capital is not None:
+            growth_fig.add_hline(
+                y=initial_capital,
+                line_dash="dash",
+                line_width=1,
+                line_color="rgba(255, 255, 255, 0.45)",
+                annotation_text=(
+                    f"Initial Capital · €{float(initial_capital):,.0f}"
+                ),
+                annotation_position="top left",
+            )
+
+        growth_fig.update_layout(
+            title="Portfolio Growth",
+            xaxis_title="Date",
+            yaxis_title="Portfolio Value (€)",
+            hovermode="x unified",
+            legend_title_text="Strategy",
+        )
+
+        st.plotly_chart(
+            growth_fig,
+            use_container_width=True,
+            key=f"saved_growth_{title}",
+        )
+
+
+def render_saved_experiment(payload):
+    meta = payload.get("experiment", {})
+    selection = payload.get("asset_selection", {})
+    params = payload.get("portfolio_parameters", {})
+    optimization = payload.get("portfolio_optimization")
+    factors = payload.get("factor_models")
+    backtesting = payload.get("backtesting", {})
+
+    st.subheader(meta.get("name", meta.get("id", "Saved Experiment")))
+    st.caption(
+        f"{meta.get('id', '')} · Saved "
+        f"{str(meta.get('saved_at', ''))[:19].replace('T', ' ')}"
+    )
+
+    # =========================================================
+    # ASSET SELECTION
+    # =========================================================
+    with st.expander("Asset Selection", expanded=True):
+        cols = st.columns(4)
+        cols[0].metric("Market", selection.get("market", "—"))
+        cols[1].metric("Mode", selection.get("selection_mode", "—"))
+        cols[2].metric(
+            "Selected Assets",
+            len(selection.get("selected_tickers", [])),
+        )
+
+        screening = selection.get("screening_results")
+        top_n = screening.get("top_n") if isinstance(screening, dict) else None
+        cols[3].metric("Top N", top_n if top_n is not None else "—")
+
+        assets = selection.get("selected_assets", [])
+        if assets:
+            asset_df = pd.DataFrame(assets)
+            asset_df.columns = [
+                "Ticker" if c == "ticker" else
+                "Company" if c == "name" else c
+                for c in asset_df.columns
+            ]
+            st.markdown("##### Selected Assets")
+            st.dataframe(asset_df, use_container_width=True, hide_index=True)
+
+        if isinstance(screening, dict):
+            screening_table = screening.get("table")
+            if isinstance(screening_table, pd.DataFrame):
+                st.markdown("##### Screening Ranking")
+                st.dataframe(screening_table, use_container_width=True)
+
+    # =========================================================
+    # PORTFOLIO PARAMETERS
+    # =========================================================
+    with st.expander("Portfolio Parameters", expanded=True):
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Capital", _saved_money(params.get("capital")))
+        c2.metric(
+            "Risk-Free Rate",
+            _saved_pct(params.get("risk_free_rate")),
+        )
+        c3.metric(
+            "Max Weight",
+            _saved_pct(params.get("max_weight"))
+            if params.get("use_max_weight")
+            else "No cap",
+        )
+        c4.metric(
+            "Fractional Shares",
+            "Yes" if params.get("use_fractional_shares") else "No",
+        )
+
+    # =========================================================
+    # PORTFOLIO OPTIMIZATION
+    # =========================================================
+    with st.expander("Portfolio Optimization", expanded=True):
+        if not isinstance(optimization, dict):
+            st.info("Portfolio Optimization had not been run when this experiment was saved.")
+        else:
+            st.caption(
+                f"Historical period: {optimization.get('period', '—')}"
+            )
+
+            summary = pd.DataFrame(
+                {
+                    "Minimum Volatility": {
+                        "Expected Return": optimization.get("min_return"),
+                        "Volatility": optimization.get("min_volatility"),
+                        "Sharpe": optimization.get("min_sharpe"),
+                    },
+                    "Maximum Sharpe": {
+                        "Expected Return": optimization.get("max_return"),
+                        "Volatility": optimization.get("max_volatility"),
+                        "Sharpe": optimization.get("max_sharpe"),
+                    },
+                    "Risk Parity": {
+                        "Expected Return": optimization.get("risk_parity_return"),
+                        "Volatility": optimization.get("risk_parity_volatility"),
+                        "Sharpe": optimization.get("risk_parity_sharpe"),
+                    },
+                    "HRP": {
+                        "Expected Return": optimization.get("hrp_return"),
+                        "Volatility": optimization.get("hrp_volatility"),
+                        "Sharpe": optimization.get("hrp_sharpe"),
+                    },
+                }
+            ).T
+
+            st.markdown("##### Strategy Summary")
+            st.dataframe(
+                summary.style.format(
+                    {
+                        "Expected Return": "{:.2%}",
+                        "Volatility": "{:.2%}",
+                        "Sharpe": "{:.2f}",
+                    },
+                    na_rep="—",
+                ),
+                use_container_width=True,
+            )
+
+            allocation_tabs = st.tabs(
+                [
+                    "Maximum Sharpe",
+                    "Minimum Volatility",
+                    "Risk Parity",
+                    "HRP",
+                ]
+            )
+            allocation_keys = [
+                "max_table",
+                "min_table",
+                "risk_parity_table",
+                "hrp_table",
+            ]
+
+            for tab, key in zip(allocation_tabs, allocation_keys):
+                with tab:
+                    table = optimization.get(key)
+                    if isinstance(table, pd.DataFrame):
+                        st.dataframe(table, use_container_width=True)
+                    else:
+                        st.info("No saved allocation table.")
+
+    # =========================================================
+    # FACTOR MODELS
+    # =========================================================
+    with st.expander("Factor Models", expanded=True):
+        if not isinstance(factors, dict):
+            st.info("Factor Models had not been run when this experiment was saved.")
+        else:
+            c1, c2, c3, c4 = st.columns(4)
+            c1.metric("Model", "CAPM")
+            c2.metric(
+                "Expected Return",
+                _saved_pct(factors.get("return")),
+            )
+            c3.metric(
+                "Volatility",
+                _saved_pct(factors.get("volatility")),
+            )
+            c4.metric(
+                "Sharpe",
+                _saved_num(factors.get("sharpe")),
+            )
+
+            capm_table = factors.get("table")
+            if isinstance(capm_table, pd.DataFrame):
+                st.markdown("##### CAPM Maximum Sharpe Allocation")
+                st.dataframe(capm_table, use_container_width=True)
+
+            stats = factors.get("stats")
+            if isinstance(stats, pd.DataFrame):
+                st.markdown("##### CAPM Asset Statistics")
+                st.dataframe(
+                    stats.style.format(
+                        {
+                            "Beta": "{:.2f}",
+                            "Alpha": "{:.2%}",
+                            "R Squared": "{:.2f}",
+                            "Market Correlation": "{:.2f}",
+                            "Historical Return": "{:.2%}",
+                            "CAPM Expected Return": "{:.2%}",
+                        },
+                        na_rep="—",
+                    ),
+                    use_container_width=True,
+                )
+
+    # =========================================================
+    # BACKTESTING
+    # =========================================================
+    with st.expander("Backtesting", expanded=True):
+        standard = backtesting.get("standard_walk_forward")
+        fixed = backtesting.get("fixed_horizon")
+
+        if standard is None and fixed is None:
+            st.info("Backtesting had not been run when this experiment was saved.")
+        else:
+            if isinstance(standard, dict):
+                # New format: {"fixed": result, "dynamic": result}
+                if "max_sharpe_bt" not in standard:
+                    for policy, result in standard.items():
+                        if isinstance(result, dict):
+                            policy_label = result.get(
+                                "selection_policy_label",
+                                "Fixed at Backtest Start"
+                                if policy == "fixed"
+                                else "Re-screen at Every Rebalance",
+                            )
+                            _render_saved_backtest_summary(
+                                result,
+                                f"Standard Walk-Forward · {policy_label}",
+                            )
+                else:
+                    _render_saved_backtest_summary(
+                        standard,
+                        "Standard Walk-Forward",
+                    )
+
+            if isinstance(fixed, dict):
+                st.divider()
+                _render_saved_backtest_summary(
+                    fixed,
+                    "Fixed Horizon",
+                )
+
 
 def get_company_name(ticker):
     match = instruments[instruments["ticker"] == ticker]
@@ -2153,14 +2852,45 @@ if (
 ):
     st.session_state.optimization_results = None
 
-if (
-    st.session_state.standard_backtest_results is not None
-    and (
-        "hrp_bt" not in st.session_state.standard_backtest_results
-        or "capm_bt" not in st.session_state.standard_backtest_results
-    )
-):
-    st.session_state.standard_backtest_results = None
+# Standard Walk-Forward può avere due formati:
+# 1) legacy/singola policy: risultato flat con "hrp_bt" e "capm_bt"
+# 2) Fixed/Dynamic: dict {"fixed": result, "dynamic": result}
+#
+# Non bisogna invalidare il secondo formato: altrimenti al rerun causato
+# da "Save Experiment" i risultati Standard vengono cancellati prima
+# di essere inseriti nello snapshot.
+if st.session_state.standard_backtest_results is not None:
+    _standard_state = st.session_state.standard_backtest_results
+
+    if isinstance(_standard_state, dict):
+        _is_flat_standard_result = (
+            "hrp_bt" in _standard_state
+            and "capm_bt" in _standard_state
+        )
+
+        _policy_results = [
+            result
+            for policy, result in _standard_state.items()
+            if policy in ("fixed", "dynamic")
+            and isinstance(result, dict)
+        ]
+
+        _is_policy_standard_result = (
+            len(_policy_results) > 0
+            and all(
+                "hrp_bt" in result
+                and "capm_bt" in result
+                for result in _policy_results
+            )
+        )
+
+        if not (
+            _is_flat_standard_result
+            or _is_policy_standard_result
+        ):
+            st.session_state.standard_backtest_results = None
+    else:
+        st.session_state.standard_backtest_results = None
 
 if (
     st.session_state.fixed_backtest_results is not None
@@ -2386,16 +3116,123 @@ else:
     max_weight = 1.0
 
 
+
+# =========================================================
+# EXPERIMENT LAB — SAVE COMPLETE RUN
+# =========================================================
+
+st.sidebar.markdown("---")
+st.sidebar.subheader("Experiment Lab")
+
+experiment_name = st.sidebar.text_input(
+    "Experiment name",
+    placeholder="e.g. 3Y · Dynamic + Fixed · Quarterly",
+    key="experiment_name",
+)
+
+save_experiment = st.sidebar.button(
+    "Save Experiment",
+    use_container_width=True,
+    type="primary",
+)
+
+if save_experiment:
+    has_any_result = any(
+        st.session_state.get(key) is not None
+        for key in (
+            "screening_results",
+            "optimization_results",
+            "factor_model_results",
+            "standard_backtest_results",
+            "fixed_backtest_results",
+        )
+    )
+
+    if not has_any_result:
+        st.sidebar.error(
+            "Run at least one analysis before saving the experiment."
+        )
+    else:
+        try:
+            snapshot = build_experiment_snapshot(
+                experiment_name=experiment_name,
+                market=market,
+                selection_mode=selection_mode,
+                tickers=tickers,
+                risk_free_rate=risk_free_rate,
+                capital=capital,
+                use_fractional_shares=use_fractional_shares,
+                use_max_weight=use_max_weight,
+                max_weight=max_weight,
+            )
+
+            saved_path = save_experiment_snapshot(snapshot)
+
+            st.session_state["last_saved_experiment"] = {
+                "id": snapshot["experiment"]["id"],
+                "name": snapshot["experiment"]["name"],
+                "path": str(saved_path),
+            }
+
+            st.sidebar.success(
+                f"Saved: {snapshot['experiment']['name']}"
+            )
+
+        except Exception as e:
+            st.sidebar.error(
+                f"Experiment save failed: {e}"
+            )
+
+saved_experiments = list_saved_experiments()
+
+with st.sidebar.expander(
+    f"Saved Experiments ({len(saved_experiments)})",
+    expanded=False,
+):
+    if not saved_experiments:
+        st.caption("No saved experiments yet.")
+    else:
+        for saved in saved_experiments[:10]:
+            st.markdown(
+                f"**{saved['Name']}**  \n"
+                f"{saved['Saved At'][:19].replace('T', ' ')} · "
+                f"{saved['Assets']} assets"
+            )
+
+            saved_file = Path(saved["_path"])
+            if saved_file.exists():
+                st.download_button(
+                    "Download JSON",
+                    data=saved_file.read_bytes(),
+                    file_name=saved_file.name,
+                    mime="application/json",
+                    key=f"download_{saved['ID']}",
+                    use_container_width=True,
+                )
+
+            st.caption(
+                " · ".join(
+                    [
+                        f"Optimization: {saved['Optimization']}",
+                        f"Factors: {saved['Factor Models']}",
+                        f"Standard BT: {saved['Standard BT']}",
+                        f"Fixed BT: {saved['Fixed BT']}",
+                    ]
+                )
+            )
+
+
 # =========================================================
 # MAIN NAVIGATION
 # =========================================================
 
-asset_selection_tab, optimization_tab, factor_models_tab, backtest_tab = st.tabs(
+asset_selection_tab, optimization_tab, factor_models_tab, backtest_tab, saved_experiments_tab = st.tabs(
     [
         "Asset Selection",
         "Portfolio Optimization",
         "Factor Models",
         "Backtesting",
+        "Saved Experiments",
     ]
 )
 
@@ -4595,4 +5432,104 @@ with backtest_tab:
             "Configure Standard Walk-Forward, "
             "Fixed Horizon, or both, then click "
             "**Run Backtests**."
+        )
+
+# =========================================================
+# SAVED EXPERIMENTS TAB
+# =========================================================
+
+with saved_experiments_tab:
+
+    st.header("Saved Experiments")
+
+    st.caption(
+        "Open previously saved quantitative experiments and review the complete "
+        "snapshot: Asset Selection, Portfolio Parameters, Portfolio Optimization, "
+        "Factor Models and Backtesting."
+    )
+
+    saved_experiments_page = list_saved_experiments()
+
+    if not saved_experiments_page:
+        st.info(
+            "No saved experiments yet. Run the analyses and use "
+            "**Save Experiment** in the sidebar."
+        )
+
+    else:
+        experiment_options = {
+            (
+                f"{item['Name']} · "
+                f"{item['Saved At'][:19].replace('T', ' ')} · "
+                f"{item['Assets']} assets"
+            ): item
+            for item in saved_experiments_page
+        }
+
+        selected_experiment_label = st.selectbox(
+            "Open experiment",
+            options=list(experiment_options.keys()),
+            key="saved_experiment_selector",
+        )
+
+        selected_experiment = experiment_options[
+            selected_experiment_label
+        ]
+
+        action_col1, action_col2 = st.columns([1, 4])
+
+        with action_col1:
+            if st.button(
+                "Delete Experiment",
+                key=f"delete_{selected_experiment['ID']}",
+                use_container_width=True,
+            ):
+                try:
+                    Path(selected_experiment["_path"]).unlink(missing_ok=True)
+                    st.success("Experiment deleted.")
+                    st.rerun()
+                except Exception as e:
+                    st.error(f"Delete failed: {e}")
+
+        with action_col2:
+            st.caption(
+                "The saved snapshot is immutable: opening it does not overwrite "
+                "the current live analysis."
+            )
+
+        try:
+            saved_payload = load_saved_experiment(
+                selected_experiment["_path"]
+            )
+            render_saved_experiment(saved_payload)
+
+        except Exception as e:
+            st.error(
+                f"Could not open the saved experiment: {e}"
+            )
+
+        st.divider()
+        st.subheader("Experiment Archive")
+
+        archive_df = pd.DataFrame(
+            [
+                {
+                    "Name": item["Name"],
+                    "Saved At": item["Saved At"][:19].replace("T", " "),
+                    "Market": item["Market"],
+                    "Selection": item["Selection"],
+                    "Assets": item["Assets"],
+                    "Optimization": item["Optimization"],
+                    "Factor Models": item["Factor Models"],
+                    "Standard BT": item["Standard BT"],
+                    "Fixed BT": item["Fixed BT"],
+                }
+                for item in saved_experiments_page
+            ]
+        )
+
+        st.dataframe(
+            archive_df,
+            use_container_width=True,
+            hide_index=True,
         )
