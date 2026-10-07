@@ -604,7 +604,7 @@ def efficient_frontier(
                 )
             )
 
-            frontier.append(
+            frontier.append( 
                 {
                     "return":
                         target_return,
