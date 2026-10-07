@@ -22,6 +22,7 @@ from src.optimization import (
     efficient_frontier,
 )
 from src.visualization import plot_efficient_frontier
+from src.screening import screen_universe
 from src.backtest import (
     backtest_portfolio,
     calculate_backtest_metrics,
@@ -1618,15 +1619,6 @@ def display_backtest_results(
         zeroline=False,
     )
 
-    portfolio_fig.add_hline(
-        y=result["capital"],
-        line_dash="dash",
-        line_width=1,
-        line_color="rgba(255, 255, 255, 0.45)",
-        annotation_text=f"Initial Capital · €{result['capital']:,.0f}",
-        annotation_position="top left",
-    )
-
     st.plotly_chart(
         portfolio_fig,
         use_container_width=True,
@@ -2144,6 +2136,17 @@ st.write(
 
 
 # =========================================================
+# ASSET SELECTION STATE
+# =========================================================
+
+if "screening_results" not in st.session_state:
+    st.session_state.screening_results = None
+
+if "quant_selected_tickers" not in st.session_state:
+    st.session_state.quant_selected_tickers = []
+
+
+# =========================================================
 # SIDEBAR — ONLY COMMON PORTFOLIO PARAMETERS
 # =========================================================
 
@@ -2175,48 +2178,59 @@ market_instruments = (
 
 
 # ---------------------------------------------------------
-# INSTRUMENTS
+# ASSET SELECTION MODE
 # ---------------------------------------------------------
 
-selected_names = (
-    st.sidebar.multiselect(
+selection_mode = st.sidebar.radio(
+    "Asset selection",
+    ["Manual Selection", "Quant Selection"],
+    horizontal=True,
+)
+
+if selection_mode == "Manual Selection":
+
+    selected_names = st.sidebar.multiselect(
         "Select instruments",
-        options=market_instruments[
-            "name"
-        ].tolist(),
+        options=market_instruments["name"].tolist(),
         default=[],
-        placeholder=(
-            "Type to search a company..."
-        ),
+        placeholder="Type to search a company...",
     )
-)
 
-selected_instruments = (
-    market_instruments[
-        market_instruments[
-            "name"
-        ].isin(selected_names)
+    selected_instruments = market_instruments[
+        market_instruments["name"].isin(selected_names)
     ]
-)
 
-tickers = (
-    selected_instruments[
-        "ticker"
-    ].tolist()
-)
+    tickers = selected_instruments["ticker"].tolist()
 
-if selected_instruments.empty:
-
-    st.sidebar.caption(
-        "Nessuno strumento selezionato."
-    )
+    if selected_instruments.empty:
+        st.sidebar.caption("No instruments selected.")
+    else:
+        st.sidebar.caption(
+            f"{len(selected_instruments)} instruments selected"
+        )
 
 else:
 
-    st.sidebar.caption(
-        f"{len(selected_instruments)} "
-        f"strumenti selezionati"
-    )
+    quant_tickers = [
+        ticker
+        for ticker in st.session_state.quant_selected_tickers
+        if ticker in set(market_instruments["ticker"])
+    ]
+
+    selected_instruments = market_instruments[
+        market_instruments["ticker"].isin(quant_tickers)
+    ]
+
+    tickers = selected_instruments["ticker"].tolist()
+
+    if not tickers:
+        st.sidebar.caption(
+            "Run the Asset Selection screener to generate the portfolio universe."
+        )
+    else:
+        st.sidebar.caption(
+            f"{len(tickers)} instruments selected by the quant screener"
+        )
 
 
 # ---------------------------------------------------------
@@ -2323,13 +2337,234 @@ else:
 # MAIN NAVIGATION
 # =========================================================
 
-optimization_tab, factor_models_tab, backtest_tab = st.tabs(
+asset_selection_tab, optimization_tab, factor_models_tab, backtest_tab = st.tabs(
     [
+        "Asset Selection",
         "Portfolio Optimization",
         "Factor Models",
         "Backtesting",
     ]
 )
+
+
+# =========================================================
+# ASSET SELECTION TAB
+# =========================================================
+
+with asset_selection_tab:
+
+    st.header("Asset Selection")
+
+    st.caption(
+        "Screen the full selected market universe using transparent quantitative "
+        "rules before portfolio construction. Invalid or unavailable tickers are "
+        "excluded automatically and never stop the analysis."
+    )
+
+    st.markdown("### Quantitative Screener")
+
+    st.caption(
+        "The current model combines four equally weighted signal families: "
+        "Momentum, Risk, Value and Quality. Each available component is converted "
+        "to a cross-sectional percentile score from 0 to 100."
+    )
+
+    screener_col1, screener_col2, screener_col3 = st.columns(
+        [2, 2, 1],
+        vertical_alignment="bottom",
+    )
+
+    with screener_col1:
+        screening_period = st.selectbox(
+            "Screening history",
+            ["1y", "2y", "5y"],
+            index=1,
+            key="screening_period",
+        )
+
+    with screener_col2:
+        max_top_n = max(2, min(30, len(market_instruments)))
+        default_top_n = min(10, max_top_n)
+
+        screening_top_n = st.number_input(
+            "Number of assets to select",
+            min_value=2,
+            max_value=max_top_n,
+            value=default_top_n,
+            step=1,
+            key="screening_top_n",
+        )
+
+    with screener_col3:
+        run_screening = st.button(
+            "Run Screening",
+            type="primary",
+            use_container_width=True,
+        )
+
+    st.info(
+        "Ticker validation is fault-tolerant: instruments with missing, invalid "
+        "or unavailable Yahoo Finance price data are marked as Excluded. "
+        "The remaining universe continues to be analysed normally."
+    )
+
+    if run_screening:
+
+        with st.spinner(
+            f"Screening {len(market_instruments)} instruments..."
+        ):
+            try:
+                screening_results, quant_selected = screen_universe(
+                    market_instruments,
+                    period=screening_period,
+                    top_n=int(screening_top_n),
+                    min_components=2,
+                )
+
+                st.session_state.screening_results = {
+                    "market": market,
+                    "period": screening_period,
+                    "top_n": int(screening_top_n),
+                    "table": screening_results,
+                }
+
+                st.session_state.quant_selected_tickers = quant_selected
+
+            except Exception as e:
+                st.error(f"Asset screening failed: {e}")
+
+    screening_state = st.session_state.screening_results
+
+    if screening_state is None:
+        st.info(
+            "Run the screener to rank the current market universe and "
+            "automatically select the Top N assets."
+        )
+
+    elif screening_state["market"] != market:
+        st.warning(
+            "The current screening results belong to another market. "
+            "Run the screener again for the selected market."
+        )
+
+    else:
+
+        screening_table = screening_state["table"].copy()
+
+        selected_count = int(screening_table["Selected"].sum())
+        excluded_count = int(
+            screening_table["Status"].eq("Excluded").sum()
+        )
+        eligible_count = int(
+            screening_table["Rank"].notna().sum()
+        )
+
+        q1, q2, q3 = st.columns(3)
+
+        with q1:
+            colored_metric(
+                "Selected Assets",
+                f"{selected_count}",
+                "green",
+            )
+
+        with q2:
+            colored_metric(
+                "Eligible Assets",
+                f"{eligible_count}",
+                "blue",
+            )
+
+        with q3:
+            colored_metric(
+                "Excluded Assets",
+                f"{excluded_count}",
+                "red",
+            )
+
+        st.markdown("#### Quant Ranking")
+
+        display_columns = [
+            "Rank",
+            "Instrument",
+            "Ticker",
+            "Momentum Score",
+            "Risk Score",
+            "Value Score",
+            "Quality Score",
+            "Quant Score",
+            "Status",
+            "Reason",
+        ]
+
+        st.dataframe(
+            screening_table[display_columns].style.format({
+                "Rank": "{:.0f}",
+                "Momentum Score": "{:.1f}",
+                "Risk Score": "{:.1f}",
+                "Value Score": "{:.1f}",
+                "Quality Score": "{:.1f}",
+                "Quant Score": "{:.1f}",
+            }),
+            use_container_width=True,
+            hide_index=True,
+        )
+
+        selected_rows = screening_table[
+            screening_table["Selected"]
+        ].copy()
+
+        if not selected_rows.empty:
+            st.markdown("#### Selected Universe")
+            st.caption(
+                "These instruments become the active universe when "
+                "'Quant Selection' is enabled in the sidebar."
+            )
+
+            st.dataframe(
+                selected_rows[
+                    [
+                        "Rank",
+                        "Instrument",
+                        "Ticker",
+                        "Quant Score",
+                    ]
+                ].style.format({
+                    "Rank": "{:.0f}",
+                    "Quant Score": "{:.1f}",
+                }),
+                use_container_width=True,
+                hide_index=True,
+            )
+
+        excluded_rows = screening_table[
+            screening_table["Status"].eq("Excluded")
+        ]
+
+        if not excluded_rows.empty:
+            with st.expander(
+                f"Excluded instruments ({len(excluded_rows)})"
+            ):
+                st.dataframe(
+                    excluded_rows[
+                        [
+                            "Instrument",
+                            "Ticker",
+                            "Reason",
+                        ]
+                    ],
+                    use_container_width=True,
+                    hide_index=True,
+                )
+
+        st.caption(
+            "Scoring methodology: Momentum uses 12-1 momentum when enough "
+            "history is available (with shorter-history fallbacks); Risk rewards "
+            "lower volatility and less severe drawdowns; Value uses Earnings "
+            "Yield and Book-to-Market; Quality uses ROE and lower leverage. "
+            "Missing fundamental fields are not imputed: the composite score "
+            "uses only available signal families, with at least two required."
+        )
 
 
 # =========================================================

@@ -26,7 +26,8 @@ def get_prices(tickers: list[str], period: str = "5y") -> pd.DataFrame:
             ticker,
             period=period,
             auto_adjust=True,
-            progress=False
+            progress=False,
+            threads=False
         )
 
         if data.empty:
