@@ -1619,6 +1619,15 @@ def display_backtest_results(
         zeroline=False,
     )
 
+    portfolio_fig.add_hline(
+        y=result["capital"],
+        line_dash="dash",
+        line_width=1,
+        line_color="rgba(255, 255, 255, 0.45)",
+        annotation_text=f"Initial Capital · €{result['capital']:,.0f}",
+        annotation_position="top left",
+    )
+
     st.plotly_chart(
         portfolio_fig,
         use_container_width=True,
@@ -3762,6 +3771,8 @@ with factor_models_tab:
             zeroline=True,
             zerolinecolor="rgba(255, 255, 255, 0.18)",
         )
+
+
 
         st.plotly_chart(
             regression_fig,
