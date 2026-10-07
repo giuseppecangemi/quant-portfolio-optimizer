@@ -811,7 +811,7 @@ def screen_prices_point_in_time(
         ranked["Max Drawdown"], higher_is_better=True
     )
     ranked["Risk Score"] = pd.concat(
-        [volatility_score, drawdown_score], axis=1
+        [volatility_score, drawdown_score], axis=1 
     ).mean(axis=1, skipna=True)
 
     ranked["Quant Score"] = ranked[[

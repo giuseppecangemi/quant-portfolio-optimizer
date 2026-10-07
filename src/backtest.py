@@ -1240,7 +1240,7 @@ def calculate_backtest_metrics(
 
 
 
-        "Sortino Ratio":
+        "Sortino Ratio": 
 
             float(sortino_ratio),
 
