@@ -22,7 +22,11 @@ from src.optimization import (
     efficient_frontier,
 )
 from src.visualization import plot_efficient_frontier
-from src.screening import screen_universe
+from src.screening import (
+    screen_universe,
+    screen_prices_point_in_time,
+    build_price_matrix,
+)
 from src.backtest import (
     backtest_portfolio,
     calculate_backtest_metrics,
@@ -527,6 +531,8 @@ def run_fixed_horizon_engine(
     max_weight,
     capital,
     benchmark_period="10y",
+    selection_top_n=None,
+    selection_policy="fixed",
 ):
     """
     Fixed-Horizon Backtest.
@@ -538,11 +544,9 @@ def run_fixed_horizon_engine(
     tutto il periodo di backtest.
     """
 
-    prices = (
-        prices
-        .sort_index()
-        .dropna()
-    )
+    prices = prices.sort_index().copy()
+    prices = prices.loc[~prices.index.duplicated(keep="last")]
+    prices = prices.dropna(axis=1, how="all")
 
     required_rows = (
         estimation_days
@@ -580,6 +584,37 @@ def run_fixed_horizon_engine(
             "Not enough observations for the "
             "Fixed-Horizon backtest."
         )
+
+    # =====================================================
+    # POINT-IN-TIME ASSET SELECTION AT T0
+    # =====================================================
+    if selection_top_n is not None:
+        _, selected_tickers = screen_prices_point_in_time(
+            estimation_prices,
+            top_n=int(selection_top_n),
+            min_observations=min(estimation_days + 1, 253),
+        )
+
+        first_test_prices = test_prices.iloc[0]
+        selected_tickers = [
+            ticker for ticker in selected_tickers
+            if ticker in first_test_prices.index
+            and pd.notna(first_test_prices[ticker])
+            and first_test_prices[ticker] > 0
+        ]
+
+        if len(selected_tickers) < 2:
+            raise ValueError(
+                "Point-in-time screening produced fewer than two "
+                "tradable assets at the Fixed-Horizon start."
+            )
+
+        estimation_prices = estimation_prices[selected_tickers].dropna()
+        test_prices = test_prices[selected_tickers].ffill()
+        tickers = selected_tickers
+    else:
+        estimation_prices = estimation_prices.dropna()
+        test_prices = test_prices.dropna()
 
     # =====================================================
     # PORTFOLIO OPTIMIZATION AT T0
@@ -1027,6 +1062,8 @@ def run_backtest_engine(
     capital,
     fixed_backtest_days=None,
     benchmark_period="10y",
+    selection_top_n=None,
+    selection_policy="fixed",
 ):
 
     # Market proxy usato dal CAPM e dal benchmark.
@@ -1046,6 +1083,8 @@ def run_backtest_engine(
         rebalance_days=rebalance_days,
         risk_free_rate=risk_free_rate,
         max_weight=max_weight,
+        selection_top_n=selection_top_n,
+        selection_policy=selection_policy,
     )
 
     (
@@ -1060,6 +1099,8 @@ def run_backtest_engine(
         risk_free_rate=risk_free_rate,
         max_weight=max_weight,
         market_prices=market_prices,
+        selection_top_n=selection_top_n,
+        selection_policy=selection_policy,
     )
 
     (
@@ -1073,6 +1114,8 @@ def run_backtest_engine(
         rebalance_days=rebalance_days,
         risk_free_rate=risk_free_rate,
         max_weight=max_weight,
+        selection_top_n=selection_top_n,
+        selection_policy=selection_policy,
     )
 
     (
@@ -1086,6 +1129,8 @@ def run_backtest_engine(
         rebalance_days=rebalance_days,
         risk_free_rate=risk_free_rate,
         max_weight=max_weight,
+        selection_top_n=selection_top_n,
+        selection_policy=selection_policy,
     )
 
     (
@@ -1099,6 +1144,8 @@ def run_backtest_engine(
         rebalance_days=rebalance_days,
         risk_free_rate=risk_free_rate,
         max_weight=max_weight,
+        selection_top_n=selection_top_n,
+        selection_policy=selection_policy,
     )
 
     (
@@ -1112,6 +1159,8 @@ def run_backtest_engine(
         rebalance_days=rebalance_days,
         risk_free_rate=risk_free_rate,
         max_weight=max_weight,
+        selection_top_n=selection_top_n,
+        selection_policy=selection_policy,
     )
 
     # -----------------------------------------------------
@@ -1213,14 +1262,9 @@ def run_backtest_engine(
     # FTSE MIB
     # -----------------------------------------------------
 
-    ftse_prices = get_prices(
-        [FTSE_MIB_TICKER],
-        period=benchmark_period,
-    )
-
     ftse_mib_bt = (
         build_benchmark_backtest(
-            ftse_prices,
+            market_prices,
             effective_start,
             effective_end,
             capital,
@@ -3995,6 +4039,14 @@ with backtest_tab:
         "methodology separately or run both together."
     )
 
+    if selection_mode == "Quant Selection":
+        st.info(
+            "Point-in-time Quant Selection is enabled for backtesting. "
+            "Historical screening uses only price information available at each "
+            "decision date (Momentum + Risk). Current Value and Quality fundamentals "
+            "are intentionally excluded to avoid look-ahead bias."
+        )
+
 
     # =====================================================
     # BACKTEST CONFIGURATION COLUMNS
@@ -4093,6 +4145,26 @@ with backtest_tab:
                 standard_rebalance_label
             ]
         )
+
+        if selection_mode == "Quant Selection":
+            standard_selection_policy_labels = st.multiselect(
+                "Asset selection policy",
+                [
+                    "Fixed at Backtest Start",
+                    "Re-screen at Every Rebalance",
+                ],
+                default=["Fixed at Backtest Start"],
+                key="standard_selection_policies",
+                help=(
+                    "You can run either policy or both. Fixed selects assets "
+                    "once at the beginning of the out-of-sample period and "
+                    "subsequent rebalances update weights only. Dynamic "
+                    "rebuilds the Momentum + Risk ranking at every rebalance, "
+                    "so both constituents and weights may change."
+                ),
+            )
+        else:
+            standard_selection_policy_labels = ["Manual universe"]
 
         st.info(
             "Example\n\n"
@@ -4244,12 +4316,22 @@ with backtest_tab:
                         "Running Standard Walk-Forward backtest..."
                     ):
 
-                        standard_prices = (
-                            get_prices(
+                        backtest_selection_top_n = (
+                            len(tickers)
+                            if selection_mode == "Quant Selection"
+                            else None
+                        )
+
+                        if selection_mode == "Quant Selection":
+                            standard_prices = build_price_matrix(
+                                market_instruments,
+                                period=standard_period,
+                            )
+                        else:
+                            standard_prices = get_prices(
                                 tickers,
                                 period=standard_period,
                             )
-                        )
 
                         if (
                             len(standard_prices)
@@ -4263,54 +4345,44 @@ with backtest_tab:
                                 "window."
                             )
 
-                        standard_result = (
-                            run_backtest_engine(
+                        if not standard_selection_policy_labels:
+                            raise ValueError(
+                                "Select at least one Asset Selection Policy."
+                            )
+
+                        standard_results = {}
+
+                        for policy_label in standard_selection_policy_labels:
+                            policy = (
+                                "dynamic"
+                                if policy_label == "Re-screen at Every Rebalance"
+                                else "fixed"
+                            )
+
+                            standard_result = run_backtest_engine(
                                 tickers=tickers,
                                 prices=standard_prices,
-                                lookback_days=
-                                    standard_lookback_days,
-                                rebalance_days=
-                                    standard_rebalance_days,
-                                risk_free_rate=
-                                    risk_free_rate,
-                                max_weight=
-                                    max_weight,
-                                capital=
-                                    capital,
-                                fixed_backtest_days=
-                                    None,
-                                benchmark_period=
-                                    standard_period,
+                                lookback_days=standard_lookback_days,
+                                rebalance_days=standard_rebalance_days,
+                                risk_free_rate=risk_free_rate,
+                                max_weight=max_weight,
+                                capital=capital,
+                                fixed_backtest_days=None,
+                                benchmark_period=standard_period,
+                                selection_top_n=backtest_selection_top_n,
+                                selection_policy=policy,
                             )
-                        )
 
-                        standard_result[
-                            "lookback_label"
-                        ] = (
-                            standard_lookback_label
-                        )
+                            standard_result["lookback_label"] = standard_lookback_label
+                            standard_result["period_label"] = "Remaining historical period"
+                            standard_result["rebalance_label"] = standard_rebalance_label
+                            standard_result["historical_dataset"] = standard_period
+                            standard_result["selection_policy"] = policy
+                            standard_result["selection_policy_label"] = policy_label
 
-                        standard_result[
-                            "period_label"
-                        ] = (
-                            "Remaining historical period"
-                        )
+                            standard_results[policy] = standard_result
 
-                        standard_result[
-                            "rebalance_label"
-                        ] = (
-                            standard_rebalance_label
-                        )
-
-                        standard_result[
-                            "historical_dataset"
-                        ] = (
-                            standard_period
-                        )
-
-                        st.session_state[
-                            "standard_backtest_results"
-                        ] = standard_result
+                        st.session_state["standard_backtest_results"] = standard_results
 
                 except Exception as e:
 
@@ -4332,13 +4404,35 @@ with backtest_tab:
                         "Running Fixed-Horizon backtest..."
                     ):
 
-                        fixed_prices = (
-                            get_fixed_horizon_prices(
+                        backtest_selection_top_n = (
+                            len(tickers)
+                            if selection_mode == "Quant Selection"
+                            else None
+                        )
+
+                        if selection_mode == "Quant Selection":
+                            fixed_prices = build_price_matrix(
+                                market_instruments,
+                                period="10y",
+                            )
+
+                            required_days = (
+                                fixed_lookback_days
+                                + fixed_backtest_days
+                                + 2
+                            )
+                            if len(fixed_prices) < required_days:
+                                raise ValueError(
+                                    "Not enough historical universe data for "
+                                    "the selected Fixed-Horizon configuration."
+                                )
+                            fixed_prices = fixed_prices.tail(required_days)
+                        else:
+                            fixed_prices = get_fixed_horizon_prices(
                                 tickers,
                                 fixed_lookback_days,
                                 fixed_backtest_days,
                             )
-                        )
 
                         fixed_result = (
                             run_fixed_horizon_engine(
@@ -4356,6 +4450,8 @@ with backtest_tab:
                                     capital,
                                 benchmark_period=
                                     "10y",
+                                selection_top_n=
+                                    backtest_selection_top_n,
                             )
                         )
 
@@ -4409,39 +4505,37 @@ with backtest_tab:
 
     if standard_result is not None:
 
-        display_backtest_results(
-            result=standard_result,
+        # Backward compatibility with results saved by older app versions.
+        if "max_sharpe_bt" in standard_result:
+            standard_results_to_display = {"fixed": standard_result}
+        else:
+            standard_results_to_display = standard_result
 
-            title=(
-                "Standard Walk-Forward Backtest"
-            ),
+        for policy_key, policy_result in standard_results_to_display.items():
+            policy_label = policy_result.get(
+                "selection_policy_label",
+                "Fixed at Backtest Start" if policy_key == "fixed"
+                else "Re-screen at Every Rebalance",
+            )
 
-            description=(
-                "The historical dataset contains both "
-                "the initial estimation window and the "
-                "subsequent out-of-sample simulation. "
-                "At every rebalance the estimation "
-                "window rolls forward using only "
-                "information available at that date."
-            ),
-
-            lookback_label=
-                standard_result[
-                    "lookback_label"
-                ],
-
-            backtest_period_label=
-                standard_result[
-                    "period_label"
-                ],
-
-            rebalance_label=
-                standard_result[
-                    "rebalance_label"
-                ],
-
-            result_key="standard",
-        )
+            display_backtest_results(
+                result=policy_result,
+                title=f"Standard Walk-Forward Backtest · {policy_label}",
+                description=(
+                    "The historical dataset contains both the initial "
+                    "estimation window and the subsequent out-of-sample "
+                    "simulation. At every rebalance the estimation window "
+                    "rolls forward using only information available at that "
+                    "date. With Fixed selection, constituents are frozen at "
+                    "t0 and only weights are rebalanced; with Dynamic "
+                    "selection, the Momentum + Risk ranking is recomputed "
+                    "at every rebalance."
+                ),
+                lookback_label=policy_result["lookback_label"],
+                backtest_period_label=policy_result["period_label"],
+                rebalance_label=policy_result["rebalance_label"],
+                result_key=f"standard_{policy_key}",
+            )
 
 
     # =====================================================
