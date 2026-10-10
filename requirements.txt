@@ -5,3 +5,4 @@ numpy==2.5.3
 scipy==1.18.1
 matplotlib==3.11.2
 plotly==7.1.0
+arch==8.0.0
