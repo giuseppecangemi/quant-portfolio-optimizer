@@ -89,6 +89,11 @@ def _login_screen() -> None:
       @keyframes k-cml-glow {50%{stroke:#d4c9ff;opacity:1}}
       @keyframes k-point-pulse {50%{transform:scale(1.7);opacity:.5}}
       @keyframes k-matrix-pulse {50%{opacity:.16}}
+
+      .k-hero-frontier-drift {animation:k-hero-frontier-float 9s ease-in-out infinite alternate;transform-box:fill-box;transform-origin:center;filter:blur(.18px)}
+      .k-hero-frontier-line {stroke-dasharray:530;stroke-dashoffset:530;animation:k-hero-frontier-draw 8s ease-in-out infinite}
+      @keyframes k-hero-frontier-float {0%{transform:translate(-12px,8px)}50%{transform:translate(13px,-9px)}100%{transform:translate(-5px,-14px)}}
+      @keyframes k-hero-frontier-draw {0%{stroke-dashoffset:530;opacity:.1}42%,78%{stroke-dashoffset:0;opacity:1}100%{stroke-dashoffset:-530;opacity:.2}}
       .k-brand {font-size:clamp(1.25rem,2.2vw,2.05rem);letter-spacing:.10em;font-weight:850;color:#dce0ff;text-transform:uppercase;line-height:1.3;text-shadow:0 2px 22px rgba(103,115,227,.28)}
       .k-brand span {color:#9da9c9;font-weight:650}
       .k-eyebrow {font-size:.73rem;letter-spacing:.18em;color:#71d8d6;text-transform:uppercase;margin-top:10vh}
@@ -376,6 +381,74 @@ def _login_screen() -> None:
 <text x="153" y="-5.4" fill="#b4f4e7" font-family="monospace" font-size="9">MAX SHARPE</text>
 <text x="252" y="166" fill="#7a92b0" font-family="monospace" font-size="9">σ →</text>
 </g></g>
+
+<!-- Ambient efficient frontier beside the hero typography, deliberately behind the foreground content. -->
+<g transform="translate(660 310)" opacity=".64">
+  <g class="k-hero-frontier-drift">
+    <rect x="-13" y="-30" width="291" height="221" rx="15" fill="#0a1425" fill-opacity=".19" stroke="#526a9d" stroke-opacity=".27"/>
+    <text x="0" y="-12" fill="#8caaca" font-family="monospace" font-size="10" letter-spacing="1.3">EFFICIENT FRONTIER / CML</text>
+    <path d="M0 173H258 M0 0V173" stroke="#6980a4" stroke-opacity=".34" fill="none" stroke-width=".8"/>
+    <path d="M0 100 L250 -37.5" stroke="#b2a7ff" stroke-width="1.5" stroke-dasharray="5 5" fill="none" class="k-cml"/>
+    <polyline points="0,155.0 3,135.9 6,128.1 9,122.0 12,116.9 15,112.4 18,108.3 21,104.6 24,101.1 27,97.8 30,94.8 33,91.8 36,89.0 39,86.3 42,83.7 45,81.2 48,78.8 51,76.4 54,74.2 57,72.0 60,69.8 63,67.7 66,65.6 69,63.6 72,61.7 75,59.7 78,57.9 81,56.0 84,54.2 87,52.4 90,50.6 93,48.9 96,47.2 99,45.6 102,43.9 105,42.3 108,40.7 111,39.1 114,37.6 117,36.0 120,34.5 123,33.0 126,31.5 129,30.1 132,28.6 135,27.2 138,25.8 141,24.4 144,23.0 147,21.6 150,20.3 153,18.9 156,17.6 159,16.3 162,15.0 165,13.7 168,12.4 171,11.2 174,9.9 177,8.7 180,7.4 183,6.2 186,5.0 189,3.8 192,2.6 195,1.4 198,0.2 201,-1.0 204,-2.1 207,-3.3 210,-4.4 213,-5.5 216,-6.7 219,-7.8 222,-8.9 225,-10.0 228,-11.1 231,-12.2 234,-13.3 237,-14.3 240,-15.4 243,-16.5 246,-17.5 249,-18.6" stroke="#68ded7" stroke-width="2.3" fill="none" class="k-hero-frontier-line"/>
+    <circle cx="17" cy="117.6" r="1.00" fill="#72dcd6" opacity=".53"/>
+    <circle cx="64" cy="104.0" r="1.24" fill="#9d8cff" opacity=".53"/>
+    <circle cx="111" cy="105.1" r="1.48" fill="#71a9e5" opacity=".53"/>
+    <circle cx="158" cy="46.7" r="1.00" fill="#72dcd6" opacity=".53"/>
+    <circle cx="205" cy="56.5" r="1.24" fill="#9d8cff" opacity=".53"/>
+    <circle cx="24" cy="124.1" r="1.48" fill="#71a9e5" opacity=".53"/>
+    <circle cx="71" cy="114.3" r="1.00" fill="#72dcd6" opacity=".53"/>
+    <circle cx="118" cy="51.5" r="1.24" fill="#9d8cff" opacity=".53"/>
+    <circle cx="165" cy="58.7" r="1.48" fill="#71a9e5" opacity=".53"/>
+    <circle cx="212" cy="3.8" r="1.00" fill="#72dcd6" opacity=".53"/>
+    <circle cx="31" cy="131.8" r="1.24" fill="#9d8cff" opacity=".53"/>
+    <circle cx="78" cy="124.9" r="1.48" fill="#71a9e5" opacity=".53"/>
+    <circle cx="125" cy="63.0" r="1.00" fill="#72dcd6" opacity=".53"/>
+    <circle cx="172" cy="70.7" r="1.24" fill="#9d8cff" opacity=".53"/>
+    <circle cx="219" cy="16.2" r="1.48" fill="#71a9e5" opacity=".53"/>
+    <circle cx="38" cy="140.2" r="1.00" fill="#72dcd6" opacity=".53"/>
+    <circle cx="85" cy="70.6" r="1.24" fill="#9d8cff" opacity=".53"/>
+    <circle cx="132" cy="74.6" r="1.48" fill="#71a9e5" opacity=".53"/>
+    <circle cx="179" cy="17.8" r="1.00" fill="#72dcd6" opacity=".53"/>
+    <circle cx="226" cy="28.6" r="1.24" fill="#9d8cff" opacity=".53"/>
+    <circle cx="45" cy="149.2" r="1.48" fill="#71a9e5" opacity=".53"/>
+    <circle cx="92" cy="81.5" r="1.00" fill="#72dcd6" opacity=".53"/>
+    <circle cx="139" cy="86.3" r="1.24" fill="#9d8cff" opacity=".53"/>
+    <circle cx="186" cy="30.0" r="1.48" fill="#71a9e5" opacity=".53"/>
+    <circle cx="233" cy="41.1" r="1.00" fill="#72dcd6" opacity=".53"/>
+    <circle cx="52" cy="93.7" r="1.24" fill="#9d8cff" opacity=".53"/>
+    <circle cx="99" cy="92.6" r="1.48" fill="#71a9e5" opacity=".53"/>
+    <circle cx="146" cy="33.1" r="1.00" fill="#72dcd6" opacity=".53"/>
+    <circle cx="193" cy="42.2" r="1.24" fill="#9d8cff" opacity=".53"/>
+    <circle cx="240" cy="53.6" r="1.48" fill="#71a9e5" opacity=".53"/>
+    <circle cx="59" cy="103.5" r="1.00" fill="#72dcd6" opacity=".53"/>
+    <circle cx="106" cy="103.7" r="1.24" fill="#9d8cff" opacity=".53"/>
+    <circle cx="153" cy="44.9" r="1.48" fill="#71a9e5" opacity=".53"/>
+    <circle cx="200" cy="54.4" r="1.00" fill="#72dcd6" opacity=".53"/>
+    <circle cx="19" cy="126.1" r="1.24" fill="#9d8cff" opacity=".53"/>
+    <circle cx="66" cy="113.6" r="1.48" fill="#71a9e5" opacity=".53"/>
+    <circle cx="113" cy="50.1" r="1.00" fill="#72dcd6" opacity=".53"/>
+    <circle cx="160" cy="56.9" r="1.24" fill="#9d8cff" opacity=".53"/>
+    <circle cx="207" cy="66.7" r="1.48" fill="#71a9e5" opacity=".53"/>
+    <circle cx="26" cy="132.9" r="1.00" fill="#72dcd6" opacity=".53"/>
+    <circle cx="73" cy="124.0" r="1.24" fill="#9d8cff" opacity=".53"/>
+    <circle cx="120" cy="61.5" r="1.48" fill="#71a9e5" opacity=".53"/>
+    <circle cx="167" cy="68.8" r="1.00" fill="#72dcd6" opacity=".53"/>
+    <circle cx="214" cy="14.1" r="1.24" fill="#9d8cff" opacity=".53"/>
+    <circle cx="33" cy="140.8" r="1.48" fill="#71a9e5" opacity=".53"/>
+    <circle cx="80" cy="69.6" r="1.00" fill="#72dcd6" opacity=".53"/>
+    <circle cx="127" cy="73.0" r="1.24" fill="#9d8cff" opacity=".53"/>
+    <circle cx="174" cy="80.9" r="1.48" fill="#71a9e5" opacity=".53"/>
+    <circle cx="221" cy="26.5" r="1.00" fill="#72dcd6" opacity=".53"/>
+    <circle cx="40" cy="149.4" r="1.24" fill="#9d8cff" opacity=".53"/>
+    <circle cx="87" cy="80.4" r="1.48" fill="#71a9e5" opacity=".53"/>
+    <circle cx="134" cy="84.7" r="1.00" fill="#72dcd6" opacity=".53"/>
+    <circle cx="181" cy="28.0" r="1.24" fill="#9d8cff" opacity=".53"/>
+    <circle cx="228" cy="38.9" r="1.48" fill="#71a9e5" opacity=".53"/>
+    <circle cx="100" cy="45" r="4" fill="#b5a9ff" class="k-tangent"/>
+    <text x="109" y="34" fill="#b9c6ef" font-family="monospace" font-size="9">MAX SHARPE</text>
+    <text x="235" y="168" fill="#8ba4c3" font-family="monospace" font-size="9">σ →</text>
+  </g>
+</g>
 <g transform="translate(60 620)" opacity=".68"><g class="k-fin-viz">
 <rect x="-10" y="-21" width="300" height="185" rx="12" fill="#0a1425" fill-opacity=".25" stroke="#456486" stroke-opacity=".2"/>
 <text x="0" y="-6" fill="#a5c9e4" font-family="monospace" font-size="10" letter-spacing="1.4">GAUSSIAN DISTRIBUTION / N(μ,σ²)</text>
@@ -474,10 +547,13 @@ def _login_screen() -> None:
         st.markdown(re.sub(r">\s+<", "><", """
         <div class="k-eyebrow">Research · Portfolio Engineering · Risk Intelligence</div>
         <div class="k-title">Invest with<br><em>quantitative<br>clarity.</em></div>
-        <div class="k-sub">Dalla ricerca quantitativa alla costruzione del portafoglio: un ambiente integrato per analizzare i mercati, sviluppare strategie di investimento e valutare opportunità, performance e rischi attraverso modelli finanziari avanzati.</div>
+        <div class="k-sub">Dalla ricerca quantitativa alla costruzione del portafoglio: una piattaforma
+          integrata per analizzare i mercati, sviluppare strategie di investimento
+          e valutarne rischi e performance attraverso modelli econometrici,
+          statistici e di ottimizzazione.</div>
         <div class="k-chips">
-          <span class="k-chip">MARKOWITZ</span> <span class="k-chip">CAPM</span> <span class="k-chip">FAMA–FRENCH</span>
-          <span class="k-chip">GARCH</span><span class="k-chip">MONTE CARLO</span> <span class="k-chip">BACKTESTING</span> <span class="k-chip">ROBUSTNESS CHECK</span>
+          <span class="k-chip">MARKOWITZ</span><span class="k-chip">FAMA–FRENCH</span>
+          <span class="k-chip">GARCH</span><span class="k-chip">MONTE CARLO</span>
         </div>
         """).strip(), unsafe_allow_html=True)
     with right:
