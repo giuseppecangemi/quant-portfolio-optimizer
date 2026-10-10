@@ -474,13 +474,10 @@ def _login_screen() -> None:
         st.markdown(re.sub(r">\s+<", "><", """
         <div class="k-eyebrow">Research · Portfolio Engineering · Risk Intelligence</div>
         <div class="k-title">Invest with<br><em>quantitative<br>clarity.</em></div>
-        <div class="k-sub">Una suite di investimento e analisi quantitativa per costruire
-          portafogli, ottimizzare le allocazioni, valutare rischio e rendimento
-          e simulare strategie sui mercati finanziari attraverso modelli avanzati,
-          dati e backtesting.</div>
+        <div class="k-sub">Dalla ricerca quantitativa alla costruzione del portafoglio: un ambiente integrato per analizzare i mercati, sviluppare strategie di investimento e valutare opportunità, performance e rischi attraverso modelli finanziari avanzati.</div>
         <div class="k-chips">
-          <span class="k-chip">MARKOWITZ</span><span class="k-chip">FAMA–FRENCH</span>
-          <span class="k-chip">GARCH</span><span class="k-chip">MONTE CARLO</span>
+          <span class="k-chip">MARKOWITZ</span> <span class="k-chip">CAPM</span> <span class="k-chip">FAMA–FRENCH</span>
+          <span class="k-chip">GARCH</span><span class="k-chip">MONTE CARLO</span> <span class="k-chip">BACKTESTING</span> <span class="k-chip">ROBUSTNESS CHECK</span>
         </div>
         """).strip(), unsafe_allow_html=True)
     with right:
