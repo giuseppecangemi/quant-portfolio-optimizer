@@ -89,8 +89,8 @@ def _login_screen() -> None:
       @keyframes k-cml-glow {50%{stroke:#d4c9ff;opacity:1}}
       @keyframes k-point-pulse {50%{transform:scale(1.7);opacity:.5}}
       @keyframes k-matrix-pulse {50%{opacity:.16}}
-      .k-brand {font-size:.77rem;letter-spacing:.23em;font-weight:800;color:#c6cbff;text-transform:uppercase}
-      .k-brand span {color:#8b9bb9}
+      .k-brand {font-size:clamp(1.25rem,2.2vw,2.05rem);letter-spacing:.10em;font-weight:850;color:#dce0ff;text-transform:uppercase;line-height:1.3;text-shadow:0 2px 22px rgba(103,115,227,.28)}
+      .k-brand span {color:#9da9c9;font-weight:650}
       .k-eyebrow {font-size:.73rem;letter-spacing:.18em;color:#71d8d6;text-transform:uppercase;margin-top:10vh}
       .k-title {font-size:clamp(3.2rem,6.2vw,6.5rem);line-height:1.05;font-weight:780;letter-spacing:-.055em;
         color:#f3f6ff;margin:.9rem 0 1.25rem;text-shadow:0 8px 38px #050916}
@@ -112,15 +112,11 @@ def _login_screen() -> None:
       .stForm button {width:100%;background:linear-gradient(95deg,#6659d8,#318bba)!important;
         color:white!important;border:0!important;border-radius:10px!important;font-weight:650!important}
       .stForm button:hover {filter:brightness(1.14)}
-      .k-footer {color:#7183a4;font-size:.7rem;letter-spacing:.08em;text-align:center;margin-top:13vh}
-      .k-hint {display:inline-flex;align-items:center;gap:9px;color:#7ae2d8;font-size:.68rem;letter-spacing:.13em}
-      .k-hint:before {content:"";height:6px;width:6px;border-radius:50%;background:#70daca;box-shadow:0 0 15px #70daca;animation:k-spark 3s infinite}
       @media(max-width:800px){
         .block-container{padding:1.2rem 5vw 2rem!important}
         .k-eyebrow{margin-top:3rem}
         .k-title{font-size:clamp(2.9rem,11vw,4.8rem)}
         .k-world{opacity:.65}
-        .k-footer{margin-top:3rem}
       }
       @media(prefers-reduced-motion:reduce){
         .k-stage *, .k-hint:before {animation:none!important}
@@ -478,14 +474,14 @@ def _login_screen() -> None:
         st.markdown(re.sub(r">\s+<", "><", """
         <div class="k-eyebrow">Research · Portfolio Engineering · Risk Intelligence</div>
         <div class="k-title">Invest with<br><em>quantitative<br>clarity.</em></div>
-        <div class="k-sub">Un ambiente riservato per esplorare la teoria di portafoglio,
-          confrontare strategie quantitative e studiare il rischio attraverso modelli,
-          dati e simulazioni.</div>
+        <div class="k-sub">Una suite di investimento e analisi quantitativa per costruire
+          portafogli, ottimizzare le allocazioni, valutare rischio e rendimento
+          e simulare strategie sui mercati finanziari attraverso modelli avanzati,
+          dati e backtesting.</div>
         <div class="k-chips">
           <span class="k-chip">MARKOWITZ</span><span class="k-chip">FAMA–FRENCH</span>
           <span class="k-chip">GARCH</span><span class="k-chip">MONTE CARLO</span>
         </div>
-        <div class="k-hint">QUANTITATIVE RESEARCH · ANIMATED ENVIRONMENT</div>
         """).strip(), unsafe_allow_html=True)
     with right:
         st.markdown('<div class="k-mini">◉ &nbsp; PRIVATE RESEARCH ENVIRONMENT</div>', unsafe_allow_html=True)
@@ -500,7 +496,6 @@ def _login_screen() -> None:
                 else:
                     st.error("Password non corretta.")
         st.markdown('<p class="k-muted" style="font-size:.76rem">Accesso consentito esclusivamente agli utenti autorizzati. Le credenziali non sono memorizzate nel codice sorgente.</p>', unsafe_allow_html=True)
-    st.markdown('<div class="k-footer">KANGEMI EDU — QUANTITATIVE BOUTIQUE · QUANT PORTFOLIO OPTIMIZER<br>ANIMAZIONI ILLUSTRATIVE · NON SONO DATI DI MERCATO IN TEMPO REALE</div>', unsafe_allow_html=True)
 
 
 if not _authenticated():
