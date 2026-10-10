@@ -1,4 +1,6 @@
-"""Volatility estimation and rolling-origin evaluation, independent of portfolio backtesting."""
+"""Stima della volatilità e valutazione mediante finestre temporali
+mobili con origine progressiva (rolling-origin), indipendenti
+dal backtesting del portafoglio."""
 import warnings
 import numpy as np
 import pandas as pd
@@ -55,12 +57,14 @@ def _predict_variance(returns, horizon, model, window, decay):
         raise ValueError("At least 150 return observations are needed for GARCH")
     p, o = (1, 1) if model == "GJR-GARCH" else (1, 0)
     kwargs = {"vol": "EGARCH" if model == "EGARCH" else "GARCH", "p": p, "o": o, "q": 1, "dist": "t", "mean": "Zero", "rescale": False}
-    # Fit in percentage returns for numerical stability.
+    # Eseguiamo la stima utilizzando i rendimenti espressi in percentuale
+    # per garantire una maggiore stabilità numerica.
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         fit = arch_model(r.to_numpy()*100, **kwargs).fit(disp="off", show_warning=False)
         if model == "EGARCH" and horizon > 1:
-            # EGARCH multi-step analytic variance is unsupported: reproducible simulations.
+            # Il calcolo analitico della varianza su più periodi non è supportato
+            # dal modello EGARCH: utilizziamo simulazioni riproducibili.
             f = fit.forecast(horizon=horizon, method="simulation", simulations=1000, random_state=np.random.RandomState(42), reindex=False)
         else:
             f = fit.forecast(horizon=horizon, method="analytic", reindex=False)
@@ -108,9 +112,11 @@ def backtest_volatility(returns, model, horizon=21, train=500, stride=21, window
     df.attrs["mse"] = {m: float(np.mean((df[m]-df["Realized daily variance"])**2)) for m in methods}
     return df
 
-# Additional portfolio analytics; existing asset functions remain unchanged.
+# Analisi aggiuntive del portafoglio; le funzioni esistenti
+# relative ai singoli asset rimangono invariate.
 def portfolio_log_returns(prices, weights):
-    """Fixed-weight, daily-rebalanced proxy; does not simulate trades or costs."""
+    """Approssimazione del portafoglio con pesi fissi e ribilanciamento giornaliero;
+    non simula le operazioni di trading né i relativi costi di transazione."""
     w = pd.Series(weights, dtype=float)
     w = w[w > 1e-10]
     available = w.index.intersection(prices.columns)
@@ -127,7 +133,8 @@ def portfolio_log_returns(prices, weights):
 
 
 def filtered_garch_volatility(returns, model="GARCH(1,1)"):
-    """In-sample fitted conditional sigma; not a historical OOS forecast."""
+    """Volatilità condizionata (sigma) stimata in-sample mediante il modello;
+    non rappresenta una previsione storica out-of-sample (OOS)."""
     r = pd.Series(returns).dropna().astype(float)
     if not ARCH_AVAILABLE or len(r) < 150:
         return pd.Series(dtype=float)
@@ -139,7 +146,8 @@ def filtered_garch_volatility(returns, model="GARCH(1,1)"):
 
 
 def forecast_volatility_path(returns, horizon=21, model="GARCH(1,1)", window=63, decay=0.94):
-    """Annualized conditional volatility at each forecast step, not price forecasts."""
+    """Volatilità condizionata annualizzata per ciascun passo di previsione;
+    non rappresenta una previsione dei prezzi futuri."""
     r = pd.Series(returns).dropna().astype(float)
     horizon = int(horizon)
     if model == "Rolling":
@@ -166,7 +174,8 @@ def forecast_volatility_path(returns, horizon=21, model="GARCH(1,1)", window=63,
 
 
 def compare_volatility_models(returns, horizon=21, train=500, stride=21, window=63, decay=0.94, models=None):
-    """Same rolling origins and realized windows for every model."""
+    """Stesse origini delle finestre mobili e stessi periodi di osservazione
+    dei valori effettivamente realizzati per tutti i modelli."""
     models = models or ["Rolling", "EWMA", "GARCH(1,1)", "GJR-GARCH", "EGARCH"]
     r = pd.Series(returns).dropna().astype(float)
     records, errors = [], {}
@@ -183,7 +192,8 @@ def compare_volatility_models(returns, horizon=21, train=500, stride=21, window=
     df = pd.DataFrame(records)
     if df.empty:
         return df, pd.DataFrame(), errors
-    # Paired evaluation: same forecast origins for all models that have forecasts.
+    # Valutazione appaiata: utilizziamo le stesse date di origine delle previsioni
+    # per tutti i modelli che dispongono di previsioni.
     valid_models = [m for m in models if m in df and df[m].notna().all()]
     scores = []
     eps = 1e-12
@@ -195,7 +205,9 @@ def compare_volatility_models(returns, horizon=21, train=500, stride=21, window=
 
 
 def portfolio_risk_contributions(prices, weights):
-    """Annualized covariance and Euler risk contributions for fixed target weights."""
+    """Calcola la matrice di covarianza annualizzata e i contributi al rischio
+    secondo la decomposizione di Eulero, utilizzando pesi target fissi
+    del portafoglio."""
     w = pd.Series(weights, dtype=float)
     w = w[w > 1e-10]
     px = prices.loc[:, list(w.index)].dropna()

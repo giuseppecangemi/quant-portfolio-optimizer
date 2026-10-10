@@ -1,6 +1,8 @@
-"""Fama-French European five-factor model, daily USD factors and EUR assets.
+"""Modello europeo Fama-French a cinque fattori, con fattori giornalieri
+    espressi in USD e asset denominati in EUR.
 
-Independent of FF3. No future information is used in rolling estimation.
+    Indipendente dal modello FF3. La stima su finestre mobili
+    non utilizza informazioni future.
 """
 from io import BytesIO
 from urllib.request import Request, urlopen
@@ -17,7 +19,8 @@ FACTOR_COLUMNS = ['MKT-RF', 'SMB', 'HML', 'RMW', 'CMA']
 
 
 def load_europe_ff5() -> pd.DataFrame:
-    """Fetch daily Europe FF5 factors, converted from percent to decimals."""
+    """Scarica i fattori giornalieri del modello europeo Fama-French a cinque
+    fattori (FF5), convertendo i valori percentuali in decimali."""
     req = Request(EUROPE_FF5_URL, headers={'User-Agent': 'Mozilla/5.0'})
     with urlopen(req, timeout=30) as response:
         content = response.read()
@@ -46,7 +49,8 @@ def load_europe_ff5() -> pd.DataFrame:
 
 def fit_ff5(asset_usd_returns: pd.DataFrame, factors: pd.DataFrame,
             min_observations: int = 80) -> pd.DataFrame:
-    """OLS with intercept; expected USD return excludes estimated alpha."""
+    """Regressione OLS con intercetta; il rendimento atteso in USD
+    viene calcolato escludendo l'alpha stimato."""
     required = [*FACTOR_COLUMNS, 'RF']
     if not set(required).issubset(factors.columns):
         raise ValueError(f'Missing FF5 columns: {sorted(set(required) - set(factors.columns))}')
@@ -78,7 +82,10 @@ def fit_ff5(asset_usd_returns: pd.DataFrame, factors: pd.DataFrame,
 
 def estimate_ff5_eur_returns(historical_prices_eur, factors, eurusd_prices,
                              min_observations=80, return_stats=False):
-    """Point-in-time FF5 EUR expected returns; mirrors existing FF3 convention."""
+    """Calcola i rendimenti attesi in EUR secondo il modello Fama-French
+    a cinque fattori (FF5), utilizzando esclusivamente le informazioni
+    disponibili al momento della stima (point-in-time) e seguendo
+    la stessa convenzione adottata per il modello FF3."""
     eur = historical_prices_eur.sort_index().dropna()
     fx = eurusd_prices.iloc[:, 0] if isinstance(eurusd_prices, pd.DataFrame) else eurusd_prices
     fx = fx.sort_index().reindex(eur.index).ffill()

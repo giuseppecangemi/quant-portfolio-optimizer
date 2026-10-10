@@ -1,13 +1,17 @@
-"""Advisory-only volatility alerts. Does not place orders or alter backtests."""
+"""Genera avvisi informativi sulla volatilità, senza eseguire ordini
+di trading né modificare i risultati dei backtest."""
 import math
 
 
 def risk_alert(forecast_vol, target_vol=15.0, current_exposure=100.0,
                caution=20.0, warning=25.0, critical=30.0,
                review_gap=5.0, rebalance_gap=10.0):
-    """Return a transparent risk alert and a no-leverage volatility-targeting proposal.
+    """Restituisce un avviso trasparente sul livello di rischio e una proposta
+    di adeguamento dell'esposizione basata su un obiettivo di volatilità
+    (volatility targeting), senza ricorrere alla leva finanziaria.
 
-    All volatilities and exposures are percentages; gaps are percentage points.
+    Tutte le volatilità e le esposizioni sono espresse in percentuale,
+    mentre gli scostamenti sono espressi in punti percentuali.
     """
     vals = [forecast_vol, target_vol, current_exposure, caution, warning,
             critical, review_gap, rebalance_gap]

@@ -1,7 +1,11 @@
-"""Forward scenario simulation from aligned, historical out-of-sample portfolio returns.
+"""Simulazione di scenari futuri basata sui rendimenti storici out-of-sample
+del portafoglio, opportunamente allineati.
 
-This module is deliberately separate from the portfolio construction/backtest engines.
-Simulations are conditional on the empirical return distribution; not price forecasts.
+Questo modulo è volutamente separato dai motori di costruzione del
+portafoglio e di backtesting.
+
+Le simulazioni sono condizionate alla distribuzione empirica dei rendimenti
+e non costituiscono previsioni dei prezzi futuri.
 """
 from __future__ import annotations
 
@@ -31,7 +35,8 @@ def extract_equity(result: dict, key: str) -> pd.Series | None:
 def aligned_returns(equities: dict[str, pd.Series]) -> pd.DataFrame:
     if not equities:
         raise ValueError("Nessuna curva storica valida disponibile.")
-    # Calculate returns BEFORE matching calendars to avoid spanning missing days.
+    # Calcoliamo i rendimenti PRIMA di allineare i calendari,
+    # per evitare di calcolare variazioni su intervalli che comprendono giorni mancanti.
     daily = pd.concat({name: s.pct_change(fill_method=None) for name, s in equities.items()}, axis=1)
     daily = daily.replace([np.inf, -np.inf], np.nan).dropna(how="any")
     if len(daily) < 40:
@@ -53,10 +58,15 @@ def simulate(
     annual_drift_adjustment: float = 0.0,
     return_paths: bool = False,
 ) -> tuple:
-    """Return (metrics, percentile_paths, final_values) for all selected strategies.
+    """Restituisce (metriche, percorsi percentili, valori finali) per tutte
+    le strategie selezionate.
 
-    Same sampled historical days / multivariate shocks across all strategies.
-    The empirical mean is retained; optional drift adjustment is in annual decimal units.
+    Per tutte le strategie vengono utilizzati gli stessi giorni storici
+    campionati e gli stessi shock multivariati.
+
+    La media empirica dei rendimenti viene mantenuta; l'eventuale
+    correzione del rendimento atteso (drift) è espressa in unità
+    decimali annualizzate.
     """
     if not (1 <= years <= 10 and 100 <= n_paths <= 10000 and initial_capital > 0):
         raise ValueError("Parametri di simulazione non validi.")
@@ -83,11 +93,11 @@ def simulate(
         shocks = rng.multivariate_normal(mu, cov, size=(n_paths, n_days), check_valid="ignore")
     else:
         raise ValueError(f"Metodo sconosciuto: {method}")
-    # Approximate additive adjustment to expected daily arithmetic returns.
+    # Correzione additiva approssimativa dei rendimenti aritmetici giornalieri attesi.
     shocks = shocks + float(annual_drift_adjustment) / TRADING_DAYS
     if np.any(shocks <= -1):
         raise ValueError("Uno scenario genera una perdita giornaliera >=100%; riduci lo stress sulla media.")
-    # Include initial capital at t=0.
+    # Includiamo il capitale iniziale al tempo t=0.
     growth = np.concatenate([np.ones((n_paths, 1, hist.shape[1])), np.cumprod(1 + shocks, axis=1)], axis=1)
     values = growth * initial_capital
     final = values[:, -1, :]
@@ -117,6 +127,7 @@ def simulate(
         final_values[name] = terminal
     result = (pd.DataFrame(metrics).set_index("Strategy"), pct_paths, pd.DataFrame(final_values))
     if return_paths:
-        # Shape: (simulation, trading_day, strategy); store compactly for plotting.
+        # Struttura: (simulazione, giorno di negoziazione, strategia);
+        # memorizziamo i dati in modo compatto per la rappresentazione grafica.
         return (*result, {name: values[:, :, j].astype(np.float32) for j, name in enumerate(historical_returns.columns)})
     return result

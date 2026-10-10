@@ -1,4 +1,5 @@
-"""Fama-French European three-factor analysis (daily, USD factor series)."""
+"""Analisi del modello europeo Fama-French a tre fattori (FF3),
+con dati giornalieri dei fattori espressi in USD."""
 from io import BytesIO, StringIO
 from zipfile import ZipFile
 from urllib.request import Request, urlopen
@@ -12,7 +13,8 @@ EUROPE_FF3_URL = (
 
 
 def load_europe_ff3() -> pd.DataFrame:
-    """Download Kenneth French daily Europe factors, in decimal USD returns."""
+    """Scarica i fattori giornalieri europei di Kenneth French,
+    con rendimenti espressi in USD e convertiti in formato decimale."""
     req = Request(EUROPE_FF3_URL, headers={"User-Agent": "Mozilla/5.0"})
     with urlopen(req, timeout=30) as response:
         raw = response.read()
@@ -21,8 +23,9 @@ def load_europe_ff3() -> pd.DataFrame:
         if name is None:
             raise ValueError("Europe FF3 archive does not contain a CSV file.")
         lines = archive.read(name).decode('utf-8-sig', errors='replace').splitlines()
-    # The library includes preamble text and an annual section: retain only
-    # daily observations with eight-digit YYYYMMDD identifiers.
+    # La libreria include un testo introduttivo e una sezione con dati annuali:
+    # conserviamo esclusivamente le osservazioni giornaliere identificate
+    # da date a otto cifre nel formato YYYYMMDD.
     records = []
     for line in lines:
         cells = [v.strip() for v in line.split(',')]
@@ -43,7 +46,8 @@ def load_europe_ff3() -> pd.DataFrame:
 
 def fit_ff3(asset_usd_returns: pd.DataFrame, factors: pd.DataFrame,
             min_observations: int = 80) -> pd.DataFrame:
-    """OLS with intercept; expected USD returns from historical factor means."""
+    """Regressione OLS con intercetta; i rendimenti attesi in USD
+    vengono stimati utilizzando le medie storiche dei fattori."""
     rows = []
     for ticker in asset_usd_returns.columns:
         joined = pd.concat([asset_usd_returns[ticker].rename('Asset'), factors], axis=1,
@@ -61,7 +65,8 @@ def fit_ff3(asset_usd_returns: pd.DataFrame, factors: pd.DataFrame,
         tss = np.sum((y-y.mean())**2)
         r2 = 1 - np.sum(residual**2)/tss if tss > 0 else np.nan
         alpha, market, smb, hml = coefficients
-        # Ex-ante model return excludes regression alpha by construction.
+        # Il rendimento atteso ex-ante del modello esclude per costruzione
+        # l'alpha stimato tramite regressione.
         usd_expected_daily = float(joined['RF'].mean() + np.dot(
             coefficients[1:], joined[['MKT-RF','SMB','HML']].mean().to_numpy()))
         rows.append({'Ticker': ticker, 'Alpha (annualized)': alpha*252,
@@ -74,7 +79,8 @@ def fit_ff3(asset_usd_returns: pd.DataFrame, factors: pd.DataFrame,
 
 def convert_eur_prices_to_usd(asset_prices_eur: pd.DataFrame,
                               eurusd_prices: pd.DataFrame) -> pd.DataFrame:
-    """EURUSD=X is USD per EUR; multiplying converts EUR prices into USD."""
+    """Il tasso di cambio EURUSD=X esprime il valore di un euro in dollari USD;
+    moltiplicare i prezzi in EUR per questo tasso li converte in USD."""
     fx = eurusd_prices.iloc[:, 0].reindex(asset_prices_eur.index).ffill()
     converted = asset_prices_eur.mul(fx, axis=0).dropna()
     if converted.empty or len(converted) < 81:
@@ -84,10 +90,15 @@ def convert_eur_prices_to_usd(asset_prices_eur: pd.DataFrame,
 
 def estimate_ff3_eur_returns(historical_prices_eur, factors, eurusd_prices,
                              min_observations=80, return_stats=False):
-    """Point-in-time FF3 expected EUR returns, based solely on historical data.
+    """Calcola i rendimenti attesi in EUR secondo il modello Fama-French
+    a tre fattori (FF3), utilizzando esclusivamente i dati storici
+    disponibili al momento della stima (point-in-time).
 
-    Factor premia are USD; fit EUR securities after conversion to USD.
-    FX drift uses the same historical estimation window, never future data.
+    I premi per il rischio dei fattori sono espressi in USD; i titoli
+    denominati in EUR vengono convertiti in USD prima della stima.
+
+    La variazione attesa del tasso di cambio viene stimata utilizzando
+    la stessa finestra storica, senza ricorrere a dati futuri.
     """
     eur = historical_prices_eur.sort_index().dropna()
     fx = eurusd_prices.iloc[:, 0] if isinstance(eurusd_prices, pd.DataFrame) else eurusd_prices

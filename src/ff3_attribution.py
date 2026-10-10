@@ -1,4 +1,6 @@
-"""Ex-post FF3 attribution in EUR; no additional regressions or downloads."""
+"""Attribuzione ex-post dei rendimenti secondo il modello Fama-French
+a tre fattori (FF3), espressa in EUR, senza eseguire ulteriori
+regressioni né scaricare nuovi dati."""
 import numpy as np
 import pandas as pd
 
@@ -6,14 +8,22 @@ COMPONENTS = ('Market', 'SMB', 'HML', 'Risk-free', 'Unexplained', 'FX translatio
 MISSING_COMPONENT = 'Unattributed days'
 
 def compute_ff3_attribution(equity_eur, exposures, factors_usd, eurusd):
-    """Daily additive EUR attribution using *previously fixed* portfolio loadings.
+    """Attribuzione additiva giornaliera dei rendimenti in EUR, utilizzando
+        le esposizioni del portafoglio ai fattori fissate in precedenza.
 
-    Factor premia are in USD. For daily USD/EUR FX return f, the exact
-    EUR conversion is r_EUR = (r_USD - f)/(1+f). Thus every USD
-    component is divided by (1+f), with an additional -f/(1+f) FX term.
-    The unexplained component is the realized USD residual (not OLS alpha).
-    Contributions are linked arithmetically to initial EUR capital.
-    """
+        I premi per il rischio dei fattori sono espressi in USD. Dato un
+        rendimento giornaliero del cambio USD/EUR pari a f, la conversione
+        esatta in EUR è r_EUR = (r_USD - f)/(1+f).
+
+        Pertanto, ogni componente in USD viene divisa per (1+f), con
+        l'aggiunta di un termine valutario pari a -f/(1+f).
+
+        La componente non spiegata corrisponde al residuo effettivamente
+        realizzato in USD (non all'alpha stimato tramite regressione OLS).
+
+        I contributi vengono concatenati aritmeticamente rispetto al
+        capitale iniziale espresso in EUR.
+        """
     if not isinstance(equity_eur, (pd.Series, pd.DataFrame)) or exposures is None:
         raise ValueError('Missing FF3 portfolio or exposure history.')
     equity = equity_eur['Portfolio Value'] if isinstance(equity_eur, pd.DataFrame) else equity_eur

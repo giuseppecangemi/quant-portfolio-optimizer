@@ -1,8 +1,14 @@
-"""Risk-exposure overlay on an EXISTING strategy net backtest curve.
+"""Gestione dinamica dell'esposizione al rischio applicata alla curva
+    di un backtest netto di una strategia ESISTENTE.
 
-This is an explicitly labelled approximation, not an execution-level replay.
-The underlying strategy series already reflects its own transaction costs when enabled.
-Only ADDITIONAL exposure changes are charged here.
+    Si tratta di un'approssimazione esplicitamente dichiarata, non di
+    una simulazione delle singole operazioni di trading.
+
+    La serie storica della strategia sottostante include già i propri
+    costi di transazione, se abilitati.
+
+    In questa fase vengono addebitati esclusivamente i costi associati
+    alle variazioni AGGIUNTIVE dell'esposizione al rischio.
 """
 import warnings
 import numpy as np
@@ -18,14 +24,22 @@ def run_exposure_overlay(curve, models=MODELS, train=252, horizon=21, pretest_re
                          commission_rate=0.0005, min_commission=3.0,
                          half_spread_bps=5.0, slippage_bps=5.0,
                          estimated_holdings=20, cash_annual_yield=0.0, reentry_band_pp=None):
-    """Generate strictly lagged risk decisions using net strategy returns.
+    """Genera decisioni di gestione del rischio basate esclusivamente su dati
+        passati, utilizzando i rendimenti netti della strategia.
 
-    Signals at close t are applied starting at t+1. Forecast is fitted to data
-    available up to t. The benchmark base curve is never altered. Since only
-    aggregate portfolio returns are available, this overlay approximates cash
-    transitions and proportional trading costs; it cannot reconstruct actual
-    constituent-level orders or intraday fills.
-    """
+        I segnali generati alla chiusura del giorno t vengono applicati
+        a partire dal giorno t+1. Le previsioni sono stimate utilizzando
+        esclusivamente i dati disponibili fino al giorno t.
+
+        La curva di riferimento della strategia originale non viene mai modificata.
+
+        Poiché sono disponibili soltanto i rendimenti aggregati del portafoglio,
+        questa gestione dinamica dell'esposizione approssima i trasferimenti
+        tra liquidità e investimenti e i costi di transazione proporzionali.
+
+        Non è quindi possibile ricostruire gli ordini effettivi sui singoli
+        titoli né le esecuzioni delle operazioni durante la giornata.
+        """
     if isinstance(curve, pd.DataFrame):
         values = curve["Portfolio Value"].astype(float)
     else:
@@ -58,8 +72,10 @@ def run_exposure_overlay(curve, models=MODELS, train=252, horizon=21, pretest_re
         raise ImportError("arch is required for GARCH risk overlays")
 
     daily = values.pct_change().fillna(0.0)
-    # Pre-test proxy is estimated using the FIRST point-in-time portfolio weights.
-    # No out-of-sample sessions are discarded for volatility warm-up.
+    # La stima preliminare al periodo di test viene effettuata utilizzando
+    # i pesi del primo portafoglio costruito con i soli dati disponibili in quel momento.
+    # Nessuna giornata del periodo out-of-sample viene esclusa
+    # per la fase iniziale di calibrazione della volatilità.
     logret = pd.concat([np.log1p(pretest_returns.tail(train)), np.log1p(daily.iloc[1:])])
     test_index = values.index
     base = values / values.iloc[0] * capital
@@ -78,7 +94,8 @@ def run_exposure_overlay(curve, models=MODELS, train=252, horizon=21, pretest_re
         trades = 0
         latest_forecast = np.nan
         latest_target = 1.0
-        # Initial allocation decision uses only pre-test observations.
+        # La decisione di allocazione iniziale utilizza esclusivamente
+        # le osservazioni disponibili prima dell'inizio del periodo di test.
         initial_past = np.log1p(pretest_returns.tail(train))
         try:
             initial_var = _predict_variance(initial_past, horizon, model, window, decay)
@@ -87,7 +104,7 @@ def run_exposure_overlay(curve, models=MODELS, train=252, horizon=21, pretest_re
             initial_gap = abs(initial_target - exposure) * 100
             if initial_gap >= trade_band_pp:
                 exposure = initial_target
-                # Approximate opening exposure transaction cost.
+                # Costo approssimativo della transazione per l'esposizione iniziale del portafoglio.
                 delta = abs(initial_target - 1.0)
                 notional = delta * nav
                 cost = min(nav * 0.99, max(commission_rate * notional, max(1, int(estimated_holdings)) * min_commission)
@@ -110,11 +127,13 @@ def run_exposure_overlay(curve, models=MODELS, train=252, horizon=21, pretest_re
             logs.append({"Model": model, "Date": pretest_returns.index[-1],
                          "Action": "FORECAST ERROR", "Error": str(exc)})
         for j, date in enumerate(test_index):
-            # Daily holdings exposure set at previous close; no same-day lookahead.
+            # L'esposizione giornaliera del portafoglio viene determinata alla chiusura
+            # del giorno precedente, senza utilizzare informazioni del giorno corrente.
             r = float(daily.loc[date])
             if j > 0:
                 nav *= 1.0 + exposure * r + (1.0 - exposure) * cash_daily
-            # End-of-day decision for the FOLLOWING session only.
+            # La decisione presa alla fine della giornata viene applicata
+            # esclusivamente alla seduta di negoziazione successiva.
             if j % update_every == 0 and j < len(test_index) - 1:
                 past = logret.loc[logret.index <= date]
                 try:
@@ -122,14 +141,16 @@ def run_exposure_overlay(curve, models=MODELS, train=252, horizon=21, pretest_re
                     latest_forecast = float(np.sqrt(var * 252) * 100)
                     latest_target = min(1.0, target_vol / latest_forecast)
                     gap_pp = abs(latest_target - exposure) * 100
-                    # Asymmetric hysteresis: a smaller gap is enough to restore exposure.
+                    # Isteresi asimmetrica: è sufficiente una differenza più contenuta
+                    # per ripristinare l'esposizione del portafoglio.
                     threshold = reentry_band_pp if latest_target > exposure else trade_band_pp
                     action = "REBALANCE" if gap_pp >= threshold else ("REVIEW" if gap_pp >= review_band_pp else "HOLD")
                     cost = 0.0
                     if action == "REBALANCE":
                         delta = abs(latest_target - exposure)
                         notional = delta * nav
-                        # Approximate per-holding commissions for proportional scaling.
+                        # Stima approssimativa delle commissioni per ciascuna posizione
+                        # del portafoglio, in caso di variazione proporzionale dell'esposizione.
                         n_orders = max(1, int(estimated_holdings))
                         commission = max(commission_rate * notional, n_orders * min_commission)
                         variable = notional * (half_spread_bps + slippage_bps) / 10000

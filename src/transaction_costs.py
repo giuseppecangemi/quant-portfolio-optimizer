@@ -1,8 +1,14 @@
-"""Transparent ex-post transaction cost overlay for historical backtests.
+"""Modello trasparente di stima ex-post dei costi di transazione
+applicato ai backtest storici.
 
-The signal/portfolio optimizer is unchanged. Execution is approximated at the
-same adjusted close used by the existing backtest, not at executable quotes.
-The model uses actual target-weight changes, drifted by observed asset prices.
+I segnali e l'ottimizzatore del portafoglio rimangono invariati.
+L'esecuzione delle operazioni viene approssimata utilizzando gli stessi
+prezzi di chiusura rettificati impiegati nel backtest esistente,
+anziché quotazioni effettivamente negoziabili.
+
+Il modello utilizza le variazioni effettive dei pesi target,
+tenendo conto degli scostamenti dei pesi determinati dai movimenti
+osservati dei prezzi degli asset.
 """
 from dataclasses import dataclass
 import numpy as np
@@ -15,8 +21,11 @@ class CostAssumptions:
     min_commission: float = 3.0
     half_spread_bps: float = 5.0
     slippage_bps: float = 5.0
-    # 0 by default: Italian FTT depends on issuer, capitalization, venue, date.
-    # It must NOT be applied indiscriminately to every Italian or foreign ticker.
+    # Valore predefinito pari a 0: l'applicabilità della tassa italiana
+    # sulle transazioni finanziarie (FTT) dipende dall'emittente, dalla
+    # capitalizzazione, dalla sede di negoziazione e dalla data.
+    # NON deve essere applicata indiscriminatamente a tutti i titoli
+    # italiani o esteri.
     buy_tax_rate: float = 0.0
 
 
@@ -30,12 +39,23 @@ PRESETS = {
 def apply_transaction_costs(gross_curve: pd.DataFrame, weights: pd.DataFrame,
                             prices: pd.DataFrame, capital: float,
                             assumptions: CostAssumptions, risk_free_rate: float = 0.02):
-    """Return net metrics, execution log, net curve. No optimizer modification.
+    """Restituisce le metriche nette, il registro delle operazioni eseguite
+    e la curva del portafoglio al netto dei costi di transazione,
+    senza modificare l'ottimizzatore.
 
-    At a rebalance, drift prior target weights using prices since the previous
-    rebalance, compare with the new target, and charge on traded notional.
-    Net capital evolves with gross daily returns, minus explicit order costs.
-    Fractional shares and same-close fills are assumptions of the base engine.
+    A ogni ribilanciamento, i pesi target precedenti vengono aggiornati
+    in base alle variazioni dei prezzi osservate dall'ultimo ribilanciamento
+    e confrontati con i nuovi pesi target.
+
+    I costi di transazione vengono calcolati sul controvalore effettivamente
+    negoziato.
+
+    Il capitale netto evolve in funzione dei rendimenti giornalieri lordi,
+    al netto dei costi espliciti delle operazioni.
+
+    L'utilizzo di quote frazionarie e l'esecuzione delle operazioni
+    ai prezzi di chiusura della stessa giornata sono ipotesi
+    adottate dal motore di backtesting originale.
     """
     from src.backtest import calculate_backtest_metrics
     curve = gross_curve.sort_index().copy()
@@ -87,8 +107,9 @@ def apply_transaction_costs(gross_curve: pd.DataFrame, weights: pd.DataFrame,
         net_values.append(net)
         net_returns.append(net / before - 1 if before > 0 else 0.0)
     net_curve = pd.DataFrame({"Portfolio Value": net_values, "Daily Return": net_returns}, index=curve.index)
-    # Include first-order costs in Sharpe and max drawdown by inserting starting
-    # capital as a reference point; no artificial calendar date is introduced.
+    # Includiamo i costi delle operazioni iniziali nel calcolo dello Sharpe Ratio
+    # e del massimo drawdown, utilizzando il capitale iniziale come punto
+    # di riferimento, senza introdurre una data fittizia nel calendario.
     metric_curve = net_curve.copy()
     metric_curve.loc[metric_curve.index[0], "Daily Return"] = net_values[0] / capital - 1
     metrics = calculate_backtest_metrics(metric_curve, risk_free_rate)
@@ -99,11 +120,17 @@ def apply_transaction_costs(gross_curve: pd.DataFrame, weights: pd.DataFrame,
 
 
 def estimate_order_costs(quantity_changes, execution_prices, assumptions):
-    """Estimate costs from executed share changes at the rebalance close.
+    """Stima i costi di transazione in base alle variazioni effettive delle
+    quantità di titoli negoziate ai prezzi di chiusura del ribilanciamento.
 
-    Per-order minimum commissions, one-way half spread, and slippage are
-    applied to each nonzero order. The optional buy tax is not applied unless
-    explicitly configured. No taxes on realized capital gains are included.
+    Per ogni ordine con quantità diversa da zero vengono applicate
+    le commissioni minime previste, il semi-spread denaro-lettera
+    e i costi di slippage.
+
+    L'eventuale imposta sugli acquisti viene applicata esclusivamente
+    se configurata esplicitamente.
+
+    Non sono incluse le imposte sulle plusvalenze realizzate.
     """
     import numpy as np
     import pandas as pd
