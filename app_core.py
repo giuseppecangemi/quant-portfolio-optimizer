@@ -4053,6 +4053,22 @@ asset_selection_tab, optimization_tab, factor_models_tab, backtest_tab, monte_ca
 # ASSET SELECTION TAB
 # =========================================================
 
+@st.cache_data(ttl=3600, show_spinner=False)
+def cached_screening_correlation_prices(
+    selected_tickers: tuple[str, ...],
+    period: str,
+) -> pd.DataFrame:
+    """Load price histories for selected assets, retaining missing observations."""
+    subset = instruments[instruments["ticker"].isin(selected_tickers)].copy()
+    prices = build_price_matrix(subset, period=period)
+    if prices.empty:
+        raise ValueError("No historical prices were returned.")
+    available = [t for t in selected_tickers if t in prices.columns]
+    if len(available) < 2:
+        raise ValueError("Fewer than two selected tickers have price data.")
+    return prices.reindex(columns=list(selected_tickers))
+
+
 with asset_selection_tab:
 
     st.header("Asset Selection")
@@ -4085,7 +4101,7 @@ with asset_selection_tab:
         )
 
     with screener_col2:
-        max_top_n = max(2, len(market_instruments))
+        max_top_n = max(2, min(30, len(market_instruments)))
         default_top_n = min(10, max_top_n)
 
         screening_top_n = st.number_input(
@@ -4217,27 +4233,134 @@ with asset_selection_tab:
         ].copy()
 
         if not selected_rows.empty:
-            st.markdown("#### Selected Universe")
+            st.markdown("#### Selected Assets — Correlation Matrix")
             st.caption(
-                "These instruments become the active universe when "
-                "'Quant Selection' is enabled in the sidebar."
+                "Pearson correlations of daily returns for the assets selected "
+                "by the Quant Ranking. This is a diagnostic view: it does not "
+                "change the ranking, selected tickers, or portfolio weights."
             )
 
-            st.dataframe(
-                selected_rows[
-                    [
-                        "Rank",
-                        "Instrument",
-                        "Ticker",
-                        "Quant Score",
-                    ]
-                ].style.format({
-                    "Rank": "{:.0f}",
-                    "Quant Score": "{:.1f}",
-                }),
-                use_container_width=True,
-                hide_index=True,
+            selected_tickers_corr = (
+                selected_rows["Ticker"].dropna().astype(str).tolist()
             )
+
+            if len(selected_tickers_corr) < 2:
+                st.info("Select at least two assets to calculate correlations.")
+            else:
+                with st.spinner("Loading selected assets' price histories..."):
+                    try:
+                        correlation_prices = cached_screening_correlation_prices(
+                            tuple(selected_tickers_corr),
+                            screening_state["period"],
+                        )
+                        correlation_returns = (
+                            correlation_prices
+                            .sort_index()
+                            .pct_change(fill_method=None)
+                        )
+                        correlation_returns = correlation_returns.replace(
+                            [np.inf, -np.inf], np.nan
+                        )
+                        correlation_matrix = correlation_returns.corr(
+                            method="pearson", min_periods=60
+                        ).reindex(
+                            index=selected_tickers_corr,
+                            columns=selected_tickers_corr,
+                        )
+
+                        import plotly.express as px
+
+                        upper_triangle = np.triu(
+                            np.ones(correlation_matrix.shape, dtype=bool), k=1
+                        )
+                        pairwise = correlation_matrix.where(upper_triangle).stack()
+                        if pairwise.empty:
+                            st.warning(
+                                "Insufficient overlapping daily returns "
+                                "to estimate pairwise correlations."
+                            )
+                        else:
+                            avg_corr = float(pairwise.mean())
+                            highest_corr = float(pairwise.max())
+                            high_pairs = int((pairwise > 0.80).sum())
+                            highest_pair = pairwise.idxmax()
+
+                            kpi1, kpi2, kpi3 = st.columns(3)
+                            kpi1.metric("Avg. Pairwise Correlation", f"{avg_corr:.2f}")
+                            kpi2.metric(
+                                "Highest Correlation",
+                                f"{highest_corr:.2f}",
+                                help=f"{highest_pair[0]} / {highest_pair[1]}",
+                            )
+                            kpi3.metric("Pairs Above 0.80", str(high_pairs))
+
+                            heatmap_tickers = selected_tickers_corr
+                            if len(heatmap_tickers) > 35:
+                                st.caption(
+                                    "Large universe: the matrix can be filtered "
+                                    "for readability; KPIs above always cover "
+                                    "all selected assets."
+                                )
+                                heatmap_tickers = st.multiselect(
+                                    "Assets to display in heatmap",
+                                    options=selected_tickers_corr,
+                                    default=selected_tickers_corr[:35],
+                                    key="screening_corr_display_tickers",
+                                )
+
+                            if len(heatmap_tickers) >= 2:
+                                display_corr = correlation_matrix.loc[
+                                    heatmap_tickers, heatmap_tickers
+                                ]
+                                fig_corr = px.imshow(
+                                    display_corr,
+                                    zmin=-1,
+                                    zmax=1,
+                                    color_continuous_scale=[
+                                        [0.0, "#d97706"],
+                                        [0.5, "#161b26"],
+                                        [1.0, "#2563eb"],
+                                    ],
+                                    aspect="auto",
+                                    labels={
+                                        "color": "Correlation",
+                                        "x": "Ticker",
+                                        "y": "Ticker",
+                                    },
+                                )
+                                fig_corr.update_traces(
+                                    hovertemplate=(
+                                        "%{y} / %{x}<br>"
+                                        "Correlation: %{z:.3f}<extra></extra>"
+                                    )
+                                )
+                                fig_corr.update_layout(
+                                    template="plotly_dark",
+                                    height=max(450, min(1100, 25 * len(heatmap_tickers) + 200)),
+                                    margin=dict(l=15, r=15, t=20, b=20),
+                                    coloraxis_colorbar=dict(title="Pearson r"),
+                                )
+                                st.plotly_chart(
+                                    fig_corr,
+                                    use_container_width=True,
+                                    key="screening_selected_corr_heatmap",
+                                )
+                            else:
+                                st.info("Choose at least two assets for the heatmap.")
+
+                            st.caption(
+                                f"Period: {screening_state['period']}. "
+                                "Daily close-to-close returns; Pearson correlation; "
+                                "at least 60 overlapping return observations per pair. "
+                                "Correlation is historical, may change over time, "
+                                "and is not a measure of portfolio risk contribution."
+                            )
+
+                    except Exception as corr_exc:
+                        st.warning(
+                            "The correlation matrix could not be calculated: "
+                            f"{corr_exc}"
+                        )
 
         excluded_rows = screening_table[
             screening_table["Status"].eq("Excluded")
