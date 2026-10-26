@@ -4085,7 +4085,7 @@ with asset_selection_tab:
         )
 
     with screener_col2:
-        max_top_n = max(2, min(30, len(market_instruments)))
+        max_top_n = max(2, len(market_instruments))
         default_top_n = min(10, max_top_n)
 
         screening_top_n = st.number_input(
