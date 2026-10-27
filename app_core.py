@@ -31,6 +31,7 @@ from src.fama_french import (
 )
 from src.factors import calculate_capm, capm_expected_returns
 from src.returns import calculate_returns, annualized_returns
+from src.diversification_var import diversification_var
 from src.risk import (
     annualized_volatility,
     covariance_matrix,
@@ -4069,6 +4070,24 @@ def cached_screening_correlation_prices(
     return prices.reindex(columns=list(selected_tickers))
 
 
+
+
+def render_diversification_var_kpis(weights, covariance, portfolio_capital):
+    """Show one-day 99% parametric VaR based on theoretical optimizer weights."""
+    try:
+        metrics = diversification_var(weights, covariance, portfolio_capital)
+    except (ValueError, TypeError, KeyError) as exc:
+        st.warning(f"Diversification VaR unavailable: {exc}")
+        return
+    v1, v2, v3 = st.columns(3)
+    with v1:
+        colored_metric("Undiversified VaR · 1D 99%", f"€{metrics['undiversified']:,.2f}", "red")
+    with v2:
+        colored_metric("Diversified VaR · 1D 99%", f"€{metrics['diversified']:,.2f}", "blue")
+    with v3:
+        colored_metric("Diversification Benefit", f"{metrics['benefit_pct']:.2f}%", "green")
+
+
 with asset_selection_tab:
 
     st.header("Asset Selection")
@@ -4891,6 +4910,8 @@ with optimization_tab:
                     "blue",
                 )
 
+            render_diversification_var_kpis(r["min_weights"], r["covariance"], r["capital"])
+
             portfolio_allocation_title()
 
             display_portfolio_table(
@@ -4956,6 +4977,8 @@ with optimization_tab:
                     f"{r['max_sharpe']:.2f}",
                     "blue",
                 )
+
+            render_diversification_var_kpis(r["max_weights"], r["covariance"], r["capital"])
 
             portfolio_allocation_title()
 
@@ -5030,6 +5053,8 @@ with optimization_tab:
                 f"{r['risk_parity_sharpe']:.2f}",
                 "blue",
             )
+
+        render_diversification_var_kpis(r["risk_parity_weights"], r["covariance"], r["capital"])
 
         portfolio_allocation_title()
 
@@ -5137,6 +5162,8 @@ with optimization_tab:
                 f"{r['hrp_sharpe']:.2f}",
                 "blue",
             )
+
+        render_diversification_var_kpis(r["hrp_weights"], r["covariance"], r["capital"])
 
         portfolio_allocation_title()
 
@@ -5434,6 +5461,7 @@ with factor_models_tab:
         with m3:
             colored_metric("Sharpe Ratio", f"{cr['sharpe']:.2f}", "blue")
 
+        render_diversification_var_kpis(cr["weights"], cr["covariance"], capital)
         portfolio_allocation_title()
         display_portfolio_table(cr["table"], cr["use_fractional_shares"])
 
@@ -5854,6 +5882,7 @@ with factor_models_tab:
                 st.session_state.ff3_results = {
                     "period": ff3_period, "stats": ff3_stats,
                     "expected_returns_eur": ff3_mu_eur,
+                    "covariance": ff3_cov,
                     "weights": ff3_weights, "table": ff3_table,
                     "return": ff3_return, "volatility": ff3_vol,
                     "sharpe": (ff3_return-risk_free_rate)/ff3_vol if ff3_vol>0 else 0.0,
@@ -5880,6 +5909,7 @@ with factor_models_tab:
             colored_metric("Volatility", f"{ff3_result['volatility']:.2%}", "red")
         with ff3_m3:
             colored_metric("Sharpe Ratio", f"{ff3_result['sharpe']:.2f}", "blue")
+        render_diversification_var_kpis(ff3_result["weights"], ff3_result["covariance"], capital)
         portfolio_allocation_title()
         display_portfolio_table(ff3_result["table"], ff3_result["use_fractional_shares"])
         ff3_cash_1, ff3_cash_2 = st.columns(2)
@@ -5967,6 +5997,7 @@ with factor_models_tab:
                 st.session_state.ff5_results = {
                     "period": ff5_period, "stats": ff5_stats,
                     "expected_returns_eur": ff5_mu_eur,
+                    "covariance": ff5_cov,
                     "weights": ff5_weights, "table": ff5_table,
                     "return": ff5_return, "volatility": ff5_vol,
                     "sharpe": (ff5_return-risk_free_rate)/ff5_vol if ff5_vol>0 else 0.0,
@@ -5993,6 +6024,7 @@ with factor_models_tab:
             colored_metric("Volatility", f"{ff5_result['volatility']:.2%}", "red")
         with ff5_m3:
             colored_metric("Sharpe Ratio", f"{ff5_result['sharpe']:.2f}", "blue")
+        render_diversification_var_kpis(ff5_result["weights"], ff5_result["covariance"], capital)
         portfolio_allocation_title()
         display_portfolio_table(ff5_result["table"], ff5_result["use_fractional_shares"])
         ff5_cash_1, ff5_cash_2 = st.columns(2)
