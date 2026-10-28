@@ -52,11 +52,13 @@ def _fetch_one(symbol, period):
     return None, errors
 
 
-def get_prices(tickers: list[str], period: str = "5y") -> pd.DataFrame:
+def get_prices(tickers: list[str], period: str = "5y", *, preserve_missing: bool = False) -> pd.DataFrame:
     """Return aligned adjusted close prices, preserving requested ticker labels.
 
     FTSEMIB.MI fallback symbols refer to the index, not an ETF or proxy.
     Raises an explicit error if no source has sufficient data.
+    preserve_missing=True keeps the union of trading dates for backtests;
+    the default retains complete-case behavior for existing estimators.
     """
     if not tickers:
         raise ValueError("Ticker list is empty")
@@ -75,7 +77,9 @@ def get_prices(tickers: list[str], period: str = "5y") -> pd.DataFrame:
                 f"Tentativi: {', '.join(_INDEX_ALIASES.get(ticker, (ticker,)))}. "
                 f"Dettagli: {'; '.join(errors[-6:])}"
             )
-    result = pd.concat(prices, axis=1).sort_index().dropna(how="any")
+    result = pd.concat(prices, axis=1).sort_index()
+    if not preserve_missing:
+        result = result.dropna(how="any")
     if len(result) < 2:
         raise ValueError("Dati storici insufficienti dopo l'allineamento dei ticker")
     return result

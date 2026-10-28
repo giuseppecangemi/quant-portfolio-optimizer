@@ -1758,11 +1758,14 @@ def get_fixed_horizon_prices(
     tickers,
     estimation_days,
     backtest_days,
+    *,
+    preserve_missing=False,
 ):
 
     full_prices = get_prices(
         tickers,
         period="10y",
+        preserve_missing=preserve_missing,
     )
 
     required_days = (
@@ -1782,15 +1785,16 @@ def get_fixed_horizon_prices(
         required_days
     )
 def _cost_adjusted_metrics(curve, capital, risk_free_rate):
-    """Include the initial order cost in annual return, Sharpe and drawdown."""
-    m = calculate_backtest_metrics(curve, risk_free_rate)
-    if "Transaction Cost" not in curve.columns:
-        return m
-    values = curve["Portfolio Value"].astype(float)
-    m["Total Return"] = float(values.iloc[-1] / capital - 1)
-    wealth = np.r_[float(capital), values.to_numpy()]
-    m["Max Drawdown"] = float(np.min(wealth / np.maximum.accumulate(wealth) - 1))
-    return m
+    """Metriche coerenti con il capitale pre-trade, anche se DataFrame.attrs è perso.
+
+    La curva del portafoglio è mantenuta intatta; viene passata una copia
+    con baseline esplicita al motore centralizzato delle metriche.
+    """
+    if not np.isfinite(capital) or capital <= 0:
+        raise ValueError("Initial capital must be finite and positive")
+    metric_curve = curve.copy()
+    metric_curve.attrs["initial_capital"] = float(capital)
+    return calculate_backtest_metrics(metric_curve, risk_free_rate)
 
 
 def run_fixed_horizon_engine(
@@ -6889,6 +6893,7 @@ with backtest_tab:
                             standard_prices = get_prices(
                                 tickers,
                                 period=standard_period,
+                                preserve_missing=True,
                             )
 
                         if standard_oos_days is not None and not sync_quant_dates:
@@ -7070,6 +7075,7 @@ with backtest_tab:
                                 tickers,
                                 fixed_lookback_days,
                                 fixed_backtest_days,
+                                preserve_missing=True,
                             )
 
                         if selection_mode == "Quant Selection":
