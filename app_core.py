@@ -23,10 +23,11 @@ from datetime import datetime
 from pathlib import Path
 
 from src.ff3_attribution import compute_ff3_attribution
-from src.fama_french_5 import load_europe_ff5, fit_ff5, estimate_ff5_eur_returns
-from src.data import get_prices
+from src.fama_french_5 import load_europe_ff5, load_us_ff5, fit_ff5, estimate_ff5_eur_returns
+from src.factor_currency import estimate_factor_returns
+from src.data import get_prices as _get_raw_prices
 from src.fama_french import (
-    load_europe_ff3, fit_ff3, convert_eur_prices_to_usd,
+    load_europe_ff3, load_us_ff3, fit_ff3, convert_eur_prices_to_usd,
     estimate_ff3_eur_returns,
 )
 from src.factors import calculate_capm, capm_expected_returns
@@ -48,9 +49,13 @@ from src.optimization import (
     efficient_frontier,
 )
 from src.visualization import plot_efficient_frontier
+from src.sec_historical import fetch_sec_fundamentals
 from src.screening import (
     screen_universe,
     screen_prices_point_in_time,
+    screen_tradable_point_in_time,
+    screen_quant_point_in_time,
+    load_pit_fundamentals,
     build_price_matrix,
 )
 from src.monte_carlo import extract_equity as mc_extract_equity, aligned_returns as mc_aligned_returns, simulate as mc_simulate
@@ -64,6 +69,19 @@ from src.robustness import run_rolling_robustness
 from src.transaction_costs import PRESETS, CostAssumptions
 from src.volatility_forecasting import (analyze_volatility, backtest_volatility, load_volatility_prices, ARCH_AVAILABLE, portfolio_log_returns, filtered_garch_volatility, forecast_volatility_path, compare_volatility_models, portfolio_risk_contributions)
 
+
+@st.cache_data(ttl=86400, show_spinner=False)
+def _cached_sec_historical(tickers, decision_dates):
+    return fetch_sec_fundamentals(tickers, decision_dates)
+
+def _fetch_historical_quant_fundamentals(market, universe, dates):
+    if market != "USA":
+        raise ValueError("SEC EDGAR supports US issuers only. Historical Italian Value/Quality requires a separate PIT provider; no substitute is used.")
+    tickers = tuple(sorted(universe['ticker'].dropna().astype(str).unique()))
+    dates = tuple(sorted({str(pd.Timestamp(x).date()) for x in dates}))
+    with st.spinner(f"Downloading historical SEC fundamentals for {len(tickers)} US tickers at {len(dates)} selection dates..."):
+        panel = _cached_sec_historical(tickers, dates)
+    return panel
 
 # =========================================================
 # PAGE CONFIG
@@ -90,7 +108,17 @@ EXPERIMENTS_DIR = PROJECT_DIR / "saved_experiments"
 
 instruments = pd.read_csv(INSTRUMENTS_FILE)
 
-FTSE_MIB_TICKER = "FTSEMIB.MI"
+FTSE_MIB_TICKER = "FTSEMIB.MI"  # Legacy identifier, dynamically updated below.
+ACTIVE_MARKETS = []
+ACTIVE_BENCHMARK = "FTSEMIB.MI"
+
+def get_prices(tickers, period="5y"):
+    """Adjusted prices in the selected market's native quotation currency.
+
+    USA equities and ^GSPC remain USD; Borsa Italiana remains EUR.
+    No implicit EUR conversion is performed.
+    """
+    return _get_raw_prices(tickers, period=period)
 
 
 # =========================================================
@@ -584,7 +612,7 @@ def _render_saved_backtest_summary(result, title, saved_costs=None):
         ("Risk Parity", "risk_parity_bt_metrics"),
         ("HRP", "hrp_bt_metrics"),
         ("Equal Weight", "equal_bt_metrics"),
-        ("FTSE MIB", "ftse_bt_metrics"),
+        ("Benchmark", "ftse_bt_metrics"),
     ]
 
     for label, key in metric_map:
@@ -623,7 +651,7 @@ def _render_saved_backtest_summary(result, title, saved_costs=None):
         ("Risk Parity", "risk_parity_bt"),
         ("HRP", "hrp_bt"),
         ("Equal Weight", "equal_weight_bt"),
-        ("FTSE MIB", "ftse_mib_bt"),
+        ("Benchmark", "ftse_mib_bt"),
     ]
 
     growth = pd.DataFrame()
@@ -1780,6 +1808,10 @@ def run_fixed_horizon_engine(
     eurusd_prices=None,
     ff5_factors=None,
     transaction_costs=None,
+    historical_fundamentals=None,
+    selection_audit=None,
+    active_factors=("Momentum", "Risk"),
+    market="Italia",
 ):
     """
     Fixed-Horizon Backtest.
@@ -1836,11 +1868,14 @@ def run_fixed_horizon_engine(
     # POINT-IN-TIME ASSET SELECTION AT T0
     # =====================================================
     if selection_top_n is not None:
-        _, selected_tickers = screen_prices_point_in_time(
-            estimation_prices,
-            top_n=int(selection_top_n),
-            min_observations=min(estimation_days + 1, 253),
+        ranking, selected_tickers = screen_quant_point_in_time(
+            estimation_prices, test_prices.iloc[0], test_prices.index[0],
+            historical_fundamentals, top_n=int(selection_top_n),
+            min_observations=max(252, min(estimation_days + 1, 253)),
+            active_factors=active_factors,
         )
+        if selection_audit is not None:
+            selection_audit[str(test_prices.index[0].date())] = ranking.copy()
 
         first_test_prices = test_prices.iloc[0]
         selected_tickers = [
@@ -1915,16 +1950,16 @@ def run_fixed_horizon_engine(
     )
 
     # FF3: stima esclusivamente sulla finestra di estimation precedente al test.
-    ff3_mu, ff3_stats = estimate_ff3_eur_returns(
-        estimation_prices, ff3_factors, eurusd_prices, return_stats=True
+    ff3_mu, ff3_stats = estimate_factor_returns(
+        estimation_prices, ff3_factors, eurusd_prices, market=market, model="ff3", return_stats=True
     )
     ff3_mu = ff3_mu.reindex(covariance.index)
     ff3_weights = optimize_maximum_sharpe(
         ff3_mu, covariance, risk_free_rate=risk_free_rate, max_weight=max_weight
     )
 
-    ff5_mu, ff5_stats = estimate_ff5_eur_returns(
-        estimation_prices, ff5_factors, eurusd_prices, return_stats=True
+    ff5_mu, ff5_stats = estimate_factor_returns(
+        estimation_prices, ff5_factors, eurusd_prices, market=market, model="ff5", return_stats=True
     )
     ff5_mu = ff5_mu.reindex(covariance.index)
     ff5_weights = optimize_maximum_sharpe(
@@ -2401,6 +2436,10 @@ def run_backtest_engine(
     eurusd_prices=None,
     ff5_factors=None,
     transaction_costs=None,
+    historical_fundamentals=None,
+    selection_audit=None,
+    active_factors=("Momentum", "Risk"),
+    market="Italia",
 ):
 
     # Il benchmark viene condiviso tra le politiche e le strategie.
@@ -2423,7 +2462,11 @@ def run_backtest_engine(
         selection_top_n=selection_top_n,
         selection_policy=selection_policy,
         shared_window_cache=shared_window_cache,
+        historical_fundamentals=historical_fundamentals,
+        selection_audit=selection_audit,
+        active_factors=active_factors,
         transaction_costs=transaction_costs,
+            market=market,
     )
 
     (
@@ -2441,7 +2484,11 @@ def run_backtest_engine(
         selection_top_n=selection_top_n,
         selection_policy=selection_policy,
         shared_window_cache=shared_window_cache,
+        historical_fundamentals=historical_fundamentals,
+        selection_audit=selection_audit,
+        active_factors=active_factors,
         transaction_costs=transaction_costs,
+            market=market,
     )
 
     ff3_exposure_records = []
@@ -2449,11 +2496,14 @@ def run_backtest_engine(
         ff3_bt,
         ff3_weights_history,
     ) = backtest_portfolio(
-        prices, strategy="ff3_max_sharpe", initial_capital=capital,
+        prices, strategy="ff3_max_sharpe", market=market, initial_capital=capital,
         lookback_days=lookback_days, rebalance_days=rebalance_days,
         risk_free_rate=risk_free_rate, max_weight=max_weight,
         selection_top_n=selection_top_n, selection_policy=selection_policy,
         shared_window_cache=shared_window_cache,
+        historical_fundamentals=historical_fundamentals,
+        selection_audit=selection_audit,
+        active_factors=active_factors,
         transaction_costs=transaction_costs,
         ff3_factors=ff3_factors, eurusd_prices=eurusd_prices,
         ff3_exposure_records=ff3_exposure_records,
@@ -2464,11 +2514,14 @@ def run_backtest_engine(
 
     ff5_exposure_records = []
     ff5_bt, ff5_weights_history = backtest_portfolio(
-        prices, strategy="ff5_max_sharpe", initial_capital=capital,
+        prices, strategy="ff5_max_sharpe", market=market, initial_capital=capital,
         lookback_days=lookback_days, rebalance_days=rebalance_days,
         risk_free_rate=risk_free_rate, max_weight=max_weight,
         selection_top_n=selection_top_n, selection_policy=selection_policy,
         shared_window_cache=shared_window_cache,
+        historical_fundamentals=historical_fundamentals,
+        selection_audit=selection_audit,
+        active_factors=active_factors,
         transaction_costs=transaction_costs,
         ff5_factors=ff5_factors, eurusd_prices=eurusd_prices,
         ff5_exposure_records=ff5_exposure_records,
@@ -2491,7 +2544,11 @@ def run_backtest_engine(
         selection_top_n=selection_top_n,
         selection_policy=selection_policy,
         shared_window_cache=shared_window_cache,
+        historical_fundamentals=historical_fundamentals,
+        selection_audit=selection_audit,
+        active_factors=active_factors,
         transaction_costs=transaction_costs,
+            market=market,
     )
 
     (
@@ -2508,7 +2565,11 @@ def run_backtest_engine(
         selection_top_n=selection_top_n,
         selection_policy=selection_policy,
         shared_window_cache=shared_window_cache,
+        historical_fundamentals=historical_fundamentals,
+        selection_audit=selection_audit,
+        active_factors=active_factors,
         transaction_costs=transaction_costs,
+            market=market,
     )
 
     (
@@ -2525,7 +2586,11 @@ def run_backtest_engine(
         selection_top_n=selection_top_n,
         selection_policy=selection_policy,
         shared_window_cache=shared_window_cache,
+        historical_fundamentals=historical_fundamentals,
+        selection_audit=selection_audit,
+        active_factors=active_factors,
         transaction_costs=transaction_costs,
+            market=market,
     )
 
     (
@@ -2542,7 +2607,11 @@ def run_backtest_engine(
         selection_top_n=selection_top_n,
         selection_policy=selection_policy,
         shared_window_cache=shared_window_cache,
+        historical_fundamentals=historical_fundamentals,
+        selection_audit=selection_audit,
+        active_factors=active_factors,
         transaction_costs=transaction_costs,
+            market=market,
     )
 
     # -----------------------------------------------------
@@ -2915,7 +2984,7 @@ def display_backtest_results(
             "Equal Weight":
                 result["equal_bt_metrics"],
 
-            "FTSE MIB":
+            "Benchmark":
                 result["ftse_bt_metrics"],
         }
     ).T
@@ -2961,7 +3030,7 @@ def display_backtest_results(
     )
 
     st.caption(
-        "FTSE MIB is shown as a passive buy-and-hold "
+        "The selected benchmark is shown as a passive buy-and-hold "
         "benchmark starting from the same date and "
         "capital as the portfolio strategies."
     )
@@ -3069,7 +3138,7 @@ def display_backtest_results(
                 "ftse_mib_bt"
             ]["Portfolio Value"],
             mode="lines",
-            name="FTSE MIB",
+            name="Benchmark",
         )
     )
 
@@ -3235,7 +3304,7 @@ def display_backtest_results(
             x=ftse_drawdown.index,
             y=ftse_drawdown,
             mode="lines",
-            name="FTSE MIB",
+            name="Benchmark",
         )
     )
 
@@ -3605,7 +3674,7 @@ def display_backtest_results(
     )
 
     final_col7.metric(
-        "FTSE MIB",
+        "Benchmark",
         f"€{final_ftse:,.2f}",
         delta=(
             f"{final_ftse / capital - 1:.2%}"
@@ -3751,22 +3820,42 @@ st.sidebar.header(
 # MARKET
 # ---------------------------------------------------------
 
+available_markets = sorted(instruments["market"].dropna().unique().tolist())
+if not available_markets:
+    st.error("No investment markets found in data/instruments.csv.")
+    st.stop()
+# A single market is deliberately selected at a time. Existing multiselect
+# session state is ignored so older sessions cannot combine markets.
+default_market = "Borsa Italiana" if "Borsa Italiana" in available_markets else available_markets[0]
 market = st.sidebar.selectbox(
-    "Market",
-    sorted(
-        instruments[
-            "market"
-        ].unique()
-    ),
+    "Investment market",
+    options=available_markets,
+    index=available_markets.index(default_market),
+    key="investment_market_single",
 )
-
+ACTIVE_MARKETS = [market]  # Keep compatibility with get_prices and existing engines.
 market_instruments = (
-    instruments[
-        instruments["market"]
-        == market
-    ]
+    instruments.loc[instruments["market"] == market]
+    .drop_duplicates(subset="ticker")
     .sort_values("name")
+    .copy()
 )
+benchmark_by_market = {
+    "Borsa Italiana": ("FTSE MIB (Italy)", "FTSEMIB.MI"),
+    "USA": ("S&P 500 (USA)", "^GSPC"),
+}
+benchmark_label, ACTIVE_BENCHMARK = benchmark_by_market.get(
+    market, (f"Benchmark for {market}", "FTSEMIB.MI")
+)
+FTSE_MIB_TICKER = ACTIVE_BENCHMARK  # Legacy name used by existing engines.
+st.sidebar.caption(
+    f"Universe: {len(market_instruments)} securities | Benchmark: {benchmark_label}"
+)
+if market == "USA":
+    st.sidebar.caption(
+        "US stock prices and S&P 500 benchmark remain in USD. "
+        "FF3/FF5 use US factors in USD; no FX conversion."
+    )
 
 
 # ---------------------------------------------------------
@@ -3783,13 +3872,14 @@ if selection_mode == "Manual Selection":
 
     selected_names = st.sidebar.multiselect(
         "Select instruments",
-        options=market_instruments["name"].tolist(),
+        options=market_instruments["ticker"].tolist(),
         default=[],
+        format_func=lambda t: f"{market_instruments.loc[market_instruments['ticker'] == t, 'name'].iloc[0]} ({t})",
         placeholder="Type to search a company...",
     )
 
     selected_instruments = market_instruments[
-        market_instruments["name"].isin(selected_names)
+        market_instruments["ticker"].isin(selected_names)
     ]
 
     tickers = selected_instruments["ticker"].tolist()
@@ -4099,10 +4189,19 @@ with asset_selection_tab:
     )
 
     st.markdown("### Quantitative Screener")
+    quant_factors = st.multiselect(
+        "Active Quant factors",
+        options=["Momentum", "Risk", "Value", "Quality"],
+        default=["Momentum", "Risk"],
+        key="quant_active_factors",
+        help="Default: Momentum and Risk only. Value/Quality require fundamentals."
+    )
+    if not quant_factors:
+        st.warning("Select at least one Quant factor before running screening.")
 
     st.caption(
-        "The current model combines four equally weighted signal families: "
-        "Momentum, Risk, Value and Quality. Each available component is converted "
+        "The model equally weights the selected signal families. "
+        "By default, only Momentum and Risk are active. Each component is converted "
         "to a cross-sectional percentile score from 0 to 100."
     )
 
@@ -4145,7 +4244,7 @@ with asset_selection_tab:
         "The remaining universe continues to be analysed normally."
     )
 
-    if run_screening:
+    if run_screening and quant_factors:
 
         with st.spinner(
             f"Screening {len(market_instruments)} instruments..."
@@ -4155,13 +4254,15 @@ with asset_selection_tab:
                     market_instruments,
                     period=screening_period,
                     top_n=int(screening_top_n),
-                    min_components=2,
+                    min_components=len(quant_factors),
+                    active_factors=quant_factors,
                 )
 
                 st.session_state.screening_results = {
                     "market": market,
                     "period": screening_period,
                     "top_n": int(screening_top_n),
+                    "active_factors": list(quant_factors),
                     "table": screening_results,
                 }
 
@@ -4178,6 +4279,9 @@ with asset_selection_tab:
             "automatically select the Top N assets."
         )
 
+    elif screening_state.get("active_factors", ["Momentum", "Risk"]) != list(quant_factors):
+        st.warning("Factor configuration changed: run screening again before backtesting.")
+        st.session_state.quant_selected_tickers = []
     elif screening_state["market"] != market:
         st.warning(
             "The current screening results belong to another market. "
@@ -5502,7 +5606,7 @@ with factor_models_tab:
 
         st.caption(
             "Each point represents one trading day. The horizontal axis shows "
-            "the FTSE MIB excess return and the vertical axis shows the selected "
+            "the selected benchmark excess return and the vertical axis shows the selected "
             "asset's excess return. The fitted line is the CAPM regression: "
             "its slope is Beta and its intercept is Alpha."
         )
@@ -5830,7 +5934,7 @@ with factor_models_tab:
     st.divider()
     st.subheader("Fama–French Three-Factor Model (FF3)")
     st.caption(
-        "European daily MKT−RF, SMB and HML factors from the Kenneth French Data Library. "
+        "Region-specific daily MKT−RF, SMB and HML factors from the Kenneth French Data Library. "
         "Assets are converted from EUR to USD before estimating factor exposures."
     )
     ff3_col1, ff3_col2 = st.columns([3, 1], vertical_alignment="bottom")
@@ -5844,31 +5948,15 @@ with factor_models_tab:
 
     if run_ff3 and validate_portfolio(tickers, max_weight):
         try:
-            with st.spinner("Estimating European Fama–French factors..."):
+            with st.spinner("Estimating regional Fama–French factors..."):
                 ff3_eur_prices = get_prices(tickers, period=ff3_period)
-                ff3_fx_prices = get_prices(["EURUSD=X"], period=ff3_period)
-                ff3_usd_prices = convert_eur_prices_to_usd(
-                    ff3_eur_prices, ff3_fx_prices
+                ff3_factors = load_us_ff3() if market == "USA" else load_europe_ff3()
+                ff3_fx_prices = None if market == "USA" else get_prices(["EURUSD=X"], period=ff3_period)
+                ff3_mu_eur, ff3_stats = estimate_factor_returns(
+                    ff3_eur_prices, ff3_factors, ff3_fx_prices,
+                    market=market, model="ff3", return_stats=True,
                 )
-                ff3_usd_returns = calculate_returns(ff3_usd_prices)
-                ff3_factors = load_europe_ff3()
-                ff3_factors = ff3_factors.loc[
-                    (ff3_factors.index >= ff3_usd_returns.index.min())
-                    & (ff3_factors.index <= ff3_usd_returns.index.max())
-                ]
-                ff3_stats = fit_ff3(ff3_usd_returns, ff3_factors)
-                # Approximate EUR expected return using the historical
-                # EURUSD arithmetic drift, while keeping EUR covariance.
-                fx_daily = ff3_fx_prices.iloc[:, 0].pct_change().dropna()
-                aligned_fx = fx_daily.reindex(ff3_usd_returns.index).dropna()
-                if len(aligned_fx) < 80:
-                    raise ValueError("Not enough aligned FX observations.")
-                fx_drift = float(aligned_fx.mean())
-                mu_usd_daily = ff3_stats["FF3 Expected Return USD"] / 252.0
-                ff3_mu_eur = ((1.0 + mu_usd_daily) / (1.0 + fx_drift) - 1.0) * 252.0
-                ff3_mu_eur.name = "FF3 Expected Return EUR"
-                ff3_eur_returns = calculate_returns(ff3_eur_prices)
-                ff3_cov = covariance_matrix(ff3_eur_returns)
+                ff3_cov = covariance_matrix(calculate_returns(ff3_eur_prices))
                 ff3_mu_eur = ff3_mu_eur.reindex(ff3_cov.index)
                 ff3_weights = optimize_maximum_sharpe(
                     ff3_mu_eur, ff3_cov,
@@ -5962,27 +6050,12 @@ with factor_models_tab:
         try:
             with st.spinner("Estimating European FF5 factors..."):
                 ff5_eur_prices = get_prices(tickers, period=ff5_period)
-                ff5_fx_prices = get_prices(["EURUSD=X"], period=ff5_period)
-                ff5_usd_prices = convert_eur_prices_to_usd(
-                    ff5_eur_prices, ff5_fx_prices
+                ff5_factors = load_us_ff5() if market == "USA" else load_europe_ff5()
+                ff5_fx_prices = None if market == "USA" else get_prices(["EURUSD=X"], period=ff5_period)
+                ff5_mu_eur, ff5_stats = estimate_factor_returns(
+                    ff5_eur_prices, ff5_factors, ff5_fx_prices,
+                    market=market, model="ff5", return_stats=True,
                 )
-                ff5_usd_returns = calculate_returns(ff5_usd_prices)
-                ff5_factors = load_europe_ff5()
-                ff5_factors = ff5_factors.loc[
-                    (ff5_factors.index >= ff5_usd_returns.index.min())
-                    & (ff5_factors.index <= ff5_usd_returns.index.max())
-                ]
-                ff5_stats = fit_ff5(ff5_usd_returns, ff5_factors)
-                ff5_fx_daily = ff5_fx_prices.iloc[:, 0].pct_change().dropna()
-                ff5_aligned_fx = ff5_fx_daily.reindex(ff5_usd_returns.index).dropna()
-                if len(ff5_aligned_fx) < 80:
-                    raise ValueError("Not enough aligned FX observations.")
-                ff5_fx_drift = float(ff5_aligned_fx.mean())
-                ff5_mu_usd_daily = ff5_stats["FF5 Expected Return USD"] / 252.0
-                ff5_mu_eur = (
-                    (1.0 + ff5_mu_usd_daily) / (1.0 + ff5_fx_drift) - 1.0
-                ) * 252.0
-                ff5_mu_eur.name = "FF5 Expected Return EUR"
                 ff5_cov = covariance_matrix(calculate_returns(ff5_eur_prices))
                 ff5_mu_eur = ff5_mu_eur.reindex(ff5_cov.index)
                 ff5_weights = optimize_maximum_sharpe(
@@ -6095,7 +6168,7 @@ with robustness_tab:
         "re-estimates CAPM, FF3 and FF5 using the existing backtesting engine."
     )
     st.info(
-        "Historical Quant Selection uses point-in-time Momentum + Risk only. "
+        "Historical Quant Selection uses the active factors; default is Momentum + Risk. "
         "Today's instrument list may still introduce survivorship bias. "
         "Overlapping windows are not independent observations."
     )
@@ -6178,7 +6251,7 @@ with robustness_tab:
                 "rebalance. FTSE MIB remains an index reference without simulated ETF fees or tracking error. "
                 "All figures are historical scenario estimates, not executable trade confirmations."
             )
-            rb_cost_rows = rb_results[rb_results["Model"] != "FTSE MIB"].copy()
+            rb_cost_rows = rb_results[rb_results["Model"] != "Benchmark"].copy()
             rb_cost_rows["Return drag (pp)"] = (
                 rb_cost_rows["Total Return"] - rb_cost_rows["Net Total Return"]
             ) * 100
@@ -6209,7 +6282,7 @@ with robustness_tab:
         if not rb_results.empty:
             # The benchmark is an explicit fifth strategy, not a portfolio model.
             # Keep only OOS dates shared by all five strategies for the primary comparison.
-            rb_models = ["CAPM", "FF3", "FF5", "Equal Weight", "FTSE MIB"]
+            rb_models = ["CAPM", "FF3", "FF5", "Equal Weight", "Benchmark"]
             rb_available = rb_results[rb_results["Model"].isin(rb_models)].copy()
             rb_complete_dates = (
                 rb_available.groupby("OOS Start")["Model"]
@@ -6233,7 +6306,7 @@ with robustness_tab:
                     Worst_Drawdown=("Max Drawdown", "min"),
                 )
                 benchmark_returns = rb_common.loc[
-                    rb_common["Model"] == "FTSE MIB", ["OOS Start", "Total Return"]
+                    rb_common["Model"] == "Benchmark", ["OOS Start", "Total Return"]
                 ].set_index("OOS Start")["Total Return"]
                 rb_common["Benchmark OOS Return"] = rb_common["OOS Start"].map(benchmark_returns)
                 rb_common["Outperformance"] = rb_common["Total Return"] > rb_common["Benchmark OOS Return"]
@@ -6304,7 +6377,7 @@ with robustness_tab:
                 rb_sharpe_wide = rb_common.pivot(index="OOS Start", columns="Model", values="Sharpe Ratio")
                 rb_drawdown_wide = rb_common.pivot(index="OOS Start", columns="Model", values="Max Drawdown")
                 rb_pairs = []
-                for rb_model in ["CAPM", "FF3", "FF5", "FTSE MIB"]:
+                for rb_model in ["CAPM", "FF3", "FF5", "Benchmark"]:
                     rb_valid = (
                         rb_return_wide[[rb_model, "Equal Weight"]].notna().all(axis=1)
                         & rb_sharpe_wide[[rb_model, "Equal Weight"]].notna().all(axis=1)
@@ -6339,13 +6412,13 @@ with robustness_tab:
                         "a negative difference means a deeper loss."
                     )
 
-                st.subheader("Stress windows — weakest FTSE MIB returns")
+                st.subheader("Stress windows — weakest benchmark returns")
                 st.caption(
                     "The three lowest-return benchmark windows among the common dates. "
                     "These are selected mechanically, not predefined crisis labels. "
                     "With overlapping windows, observations are not independent."
                 )
-                rb_stress_dates = rb_return_wide["FTSE MIB"].nsmallest(3).index
+                rb_stress_dates = rb_return_wide["Benchmark"].nsmallest(3).index
                 rb_stress = rb_common[rb_common["OOS Start"].isin(rb_stress_dates)].copy()
                 rb_stress["OOS Start"] = rb_stress["OOS Start"].astype(str)
                 rb_stress = rb_stress[["OOS Start", "Model", "Total Return", "Sharpe Ratio", "Max Drawdown"]]
@@ -6368,8 +6441,8 @@ with robustness_tab:
                     index="OOS Start", columns="Model", values="Total Return"
                 ).reindex(columns=rb_models)
                 st.line_chart(chart_data * 100, y_label="Total Return (%)")
-                st.subheader("Excess return vs FTSE MIB — common windows")
-                excess_chart = rb_common[rb_common["Model"] != "FTSE MIB"].pivot_table(
+                st.subheader("Excess return vs benchmark — common windows")
+                excess_chart = rb_common[rb_common["Model"] != "Benchmark"].pivot_table(
                     index="OOS Start", columns="Model", values="Excess OOS Return"
                 ).reindex(columns=rb_models[:-1])
                 st.bar_chart(excess_chart * 100, y_label="Excess Return (percentage points)")
@@ -6735,6 +6808,55 @@ with backtest_tab:
             shared_ff5_factors = None
             shared_eurusd = None
 
+            # Shared point-in-time calendar for comparable Quant Selection runs.
+            # Fixed uses estimation_days + 1 historical prices, while Standard
+            # previously used estimation_days. Both now use the same 253-price
+            # estimation sample and the same first execution date when aligned.
+            sync_quant_dates = (
+                selection_mode == "Quant Selection"
+                and run_standard and run_fixed
+                and standard_lookback_days == fixed_lookback_days
+                and (standard_oos_days is None
+                     or standard_oos_days == fixed_backtest_days)
+            )
+            synced_quant_prices = None
+            effective_standard_lookback_days = standard_lookback_days
+            if sync_quant_dates:
+                synced_quant_prices = build_price_matrix(
+                    market_instruments, period="10y"
+                )
+                synced_required_rows = (
+                    fixed_lookback_days + fixed_backtest_days + 2
+                )
+                if len(synced_quant_prices) < synced_required_rows:
+                    st.error("Insufficient shared history to synchronize the backtests.")
+                    sync_quant_dates = False
+                else:
+                    synced_quant_prices = synced_quant_prices.tail(
+                        synced_required_rows
+                    )
+                    effective_standard_lookback_days = standard_lookback_days + 1
+                    shared_t0 = synced_quant_prices.index[
+                        effective_standard_lookback_days
+                    ]
+                    st.info(
+                        "Quant Selection comparison synchronized: "
+                        f"both backtests start on {shared_t0.date()} "
+                        f"with {effective_standard_lookback_days} identical "
+                        "historical price observations and "
+                        f"{fixed_backtest_days} OOS trading intervals. "
+                        "The Standard 'Remaining historical period' setting "
+                        "is restricted to the Fixed-Horizon OOS period for "
+                        "this paired comparison."
+                    )
+            elif selection_mode == "Quant Selection" and run_standard and run_fixed:
+                st.warning(
+                    "Backtest start dates are NOT synchronized: choose matching "
+                    "estimation windows and set Standard OOS to 'Remaining "
+                    "historical period' or the same duration as Fixed Horizon. "
+                    "The two rankings may legitimately differ."
+                )
+
             # =================================================
             # STANDARD WALK-FORWARD
             # =================================================
@@ -6754,9 +6876,14 @@ with backtest_tab:
                         )
 
                         if selection_mode == "Quant Selection":
-                            standard_prices = build_price_matrix(
-                                market_instruments,
-                                period=standard_period,
+                            selection_audit = {}
+                            standard_prices = (
+                                synced_quant_prices.copy()
+                                if sync_quant_dates
+                                else build_price_matrix(
+                                    market_instruments,
+                                    period=standard_period,
+                                )
                             )
                         else:
                             standard_prices = get_prices(
@@ -6764,7 +6891,7 @@ with backtest_tab:
                                 period=standard_period,
                             )
 
-                        if standard_oos_days is not None:
+                        if standard_oos_days is not None and not sync_quant_dates:
                             required_rows = standard_lookback_days + standard_oos_days + 1
                             if len(standard_prices) < required_rows:
                                 raise ValueError(
@@ -6777,7 +6904,7 @@ with backtest_tab:
 
                         if (
                             len(standard_prices)
-                            <= standard_lookback_days + 1
+                            <= effective_standard_lookback_days + 1
                         ):
 
                             raise ValueError(
@@ -6792,17 +6919,27 @@ with backtest_tab:
                                 "Select at least one Asset Selection Policy."
                             )
 
+                        if selection_mode == "Quant Selection":
+                            # Generate exact decision dates for the configured OOS window.
+                            # Dynamic policy requires fundamentals at every rebalance.
+                            standard_dates = [standard_prices.index[pos] for pos in range(
+                                effective_standard_lookback_days, len(standard_prices)-1,
+                                standard_rebalance_days)]
+                            historical_fundamentals = (
+                                _fetch_historical_quant_fundamentals(market, market_instruments, standard_dates)
+                                if any(f in quant_factors for f in ("Value", "Quality")) else None
+                            )
                         standard_results = {}
                         standard_market_prices = get_prices(
                             [FTSE_MIB_TICKER], period=standard_period
                         )
                         # FF3: scarica fattori e FX una sola volta per entrambe le policy.
                         if shared_ff3_factors is None:
-                            shared_ff3_factors = load_europe_ff3()
-                        if shared_eurusd is None:
+                            shared_ff3_factors = (load_us_ff3() if market == "USA" else load_europe_ff3())
+                        if market != "USA" and shared_eurusd is None:
                             shared_eurusd = get_prices(["EURUSD=X"], period="10y")
                         if shared_ff5_factors is None:
-                            shared_ff5_factors = load_europe_ff5()
+                            shared_ff5_factors = (load_us_ff5() if market == "USA" else load_europe_ff5())
                         standard_ff5_factors = shared_ff5_factors
                         standard_ff3_factors = shared_ff3_factors
                         standard_eurusd = shared_eurusd
@@ -6820,7 +6957,7 @@ with backtest_tab:
                                 tickers=tickers,
                                 transaction_costs=bt_cost_assumptions,
                                 prices=standard_prices,
-                                lookback_days=standard_lookback_days,
+                                lookback_days=effective_standard_lookback_days,
                                 rebalance_days=standard_rebalance_days,
                                 risk_free_rate=risk_free_rate,
                                 max_weight=max_weight,
@@ -6831,13 +6968,25 @@ with backtest_tab:
                                 selection_policy=policy,
                                 market_prices=standard_market_prices,
                                 shared_window_cache=standard_shared_cache,
+                                historical_fundamentals=historical_fundamentals if selection_mode == "Quant Selection" else None,
+                                selection_audit=selection_audit if selection_mode == "Quant Selection" else None,
+                                active_factors=quant_factors if selection_mode == "Quant Selection" else ("Momentum", "Risk"),
                                 ff3_factors=standard_ff3_factors,
                                 ff5_factors=standard_ff5_factors,
                                 eurusd_prices=standard_eurusd,
+                                market=market,
                             )
 
+                            if selection_mode == "Quant Selection":
+                                standard_result["historical_quant_selection_audit"] = selection_audit.copy()
+                                for audit_date, audit_table in selection_audit.items():
+                                    with st.expander(f"Historical Quant Selection ranking — {audit_date}"):
+                                        st.dataframe(audit_table, width="stretch")
+                                        st.download_button("Download historical ranking CSV", audit_table.to_csv(index=False), file_name=f"quant_selection_{audit_date}.csv", key=f"pit_standard_{audit_date}_{policy}")
                             standard_result["drbt_price_history"] = standard_prices
                             try:
+                                if market == "USA":
+                                    raise ValueError("EUR FX attribution is not applicable to USD-native USA portfolios")
                                 standard_result["ff3_performance_attribution"] = compute_ff3_attribution(
                                     standard_result["ff3_bt"],
                                     standard_result["ff3_factor_exposure_history"],
@@ -6895,9 +7044,14 @@ with backtest_tab:
                         )
 
                         if selection_mode == "Quant Selection":
-                            fixed_prices = build_price_matrix(
-                                market_instruments,
-                                period="10y",
+                            selection_audit = {}
+                            fixed_prices = (
+                                synced_quant_prices.copy()
+                                if sync_quant_dates
+                                else build_price_matrix(
+                                    market_instruments,
+                                    period="10y",
+                                )
                             )
 
                             required_days = (
@@ -6918,12 +7072,28 @@ with backtest_tab:
                                 fixed_backtest_days,
                             )
 
+                        if selection_mode == "Quant Selection":
+                            # Fixed-Horizon engine uses the first test observation as T0.
+                            fixed_t0 = fixed_prices.index[fixed_lookback_days + 1]
+                            if sync_quant_dates:
+                                standard_t0 = synced_quant_prices.index[
+                                    effective_standard_lookback_days
+                                ]
+                                if fixed_t0 != standard_t0:
+                                    raise AssertionError(
+                                        "Fixed/Standard initial dates differ after synchronization"
+                                    )
+                            historical_fundamentals = (
+                                _fetch_historical_quant_fundamentals(market, market_instruments, [fixed_t0])
+                                if any(f in quant_factors for f in ("Value", "Quality")) else None
+                            )
+
                         if shared_ff3_factors is None:
-                            shared_ff3_factors = load_europe_ff3()
-                        if shared_eurusd is None:
+                            shared_ff3_factors = (load_us_ff3() if market == "USA" else load_europe_ff3())
+                        if market != "USA" and shared_eurusd is None:
                             shared_eurusd = get_prices(["EURUSD=X"], period="10y")
                         if shared_ff5_factors is None:
-                            shared_ff5_factors = load_europe_ff5()
+                            shared_ff5_factors = (load_us_ff5() if market == "USA" else load_europe_ff5())
                         fixed_ff5_factors = shared_ff5_factors
                         fixed_ff3_factors = shared_ff3_factors
                         fixed_eurusd = shared_eurusd
@@ -6939,6 +7109,7 @@ with backtest_tab:
                                 ff3_factors=fixed_ff3_factors,
                                 ff5_factors=fixed_ff5_factors,
                                 eurusd_prices=fixed_eurusd,
+                                market=market,
                                 risk_free_rate=
                                     risk_free_rate,
                                 max_weight=
@@ -6949,10 +7120,21 @@ with backtest_tab:
                                     "10y",
                                 selection_top_n=
                                     backtest_selection_top_n,
+                                historical_fundamentals=historical_fundamentals if selection_mode == "Quant Selection" else None,
+                                selection_audit=selection_audit if selection_mode == "Quant Selection" else None,
+                                active_factors=quant_factors if selection_mode == "Quant Selection" else ("Momentum", "Risk"),
                             )
                         )
 
+                        if selection_mode == "Quant Selection":
+                            fixed_result["historical_quant_selection_audit"] = selection_audit.copy()
+                            for audit_date, audit_table in selection_audit.items():
+                                with st.expander(f"Historical Quant Selection ranking — {audit_date}"):
+                                    st.dataframe(audit_table, width="stretch")
+                                    st.download_button("Download historical ranking CSV", audit_table.to_csv(index=False), file_name=f"quant_selection_{audit_date}.csv", key=f"pit_fixed_{audit_date}")
                         try:
+                            if market == "USA":
+                                raise ValueError("EUR FX attribution is not applicable to USD-native USA portfolios")
                             fixed_result["ff3_performance_attribution"] = compute_ff3_attribution(
                                 fixed_result["ff3_bt"],
                                 fixed_result["ff3_factor_exposure_history"],

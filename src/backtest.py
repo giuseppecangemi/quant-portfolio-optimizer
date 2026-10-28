@@ -3,7 +3,8 @@ import pandas as pd
 from src.factors import capm_expected_returns
 from src.fama_french import estimate_ff3_eur_returns
 from src.fama_french_5 import estimate_ff5_eur_returns
-from src.screening import screen_prices_point_in_time
+from src.factor_currency import estimate_factor_returns
+from src.screening import screen_prices_point_in_time, screen_tradable_point_in_time, screen_quant_point_in_time
 from src.optimization import (
     optimize_minimum_volatility,
     optimize_maximum_sharpe,
@@ -29,6 +30,10 @@ def backtest_portfolio(
     ff5_exposure_records=None,
     transaction_costs=None,
     transaction_log=None,
+    historical_fundamentals=None,
+    selection_audit=None,
+    active_factors=("Momentum", "Risk"),
+    market="Italia",
 ):
     """
     Esegue un backtest walk-forward realistico.
@@ -121,11 +126,14 @@ def backtest_portfolio(
             start_position - lookback_days:
             start_position
         ]
-        fixed_key = ("fixed_selection", start_position, lookback_days, int(selection_top_n))
+        fixed_key = ("fixed_selection_v3", tuple(prices.columns), prices.index[start_position], lookback_days, int(selection_top_n), tuple(active_factors))
         if fixed_key not in shared_window_cache:
-            _, selected = screen_prices_point_in_time(initial_historical_universe, top_n=int(selection_top_n), min_observations=min(lookback_days, 253))
-            shared_window_cache[fixed_key] = list(selected)
-        fixed_selected_tickers = shared_window_cache[fixed_key].copy()
+            ranking, selected = screen_quant_point_in_time(initial_historical_universe, prices.iloc[start_position], prices.index[start_position], historical_fundamentals, top_n=int(selection_top_n), min_observations=max(252, min(lookback_days, 253)), active_factors=active_factors)
+            shared_window_cache[fixed_key] = (list(selected), ranking.copy())
+        cached_selection = shared_window_cache[fixed_key]
+        fixed_selected_tickers = list(cached_selection[0])
+        if selection_audit is not None:
+            selection_audit[str(prices.index[start_position].date())] = cached_selection[1].copy()
         initial_rebalance_row = prices.iloc[start_position]
         fixed_selected_tickers = [
             ticker for ticker in fixed_selected_tickers
@@ -163,11 +171,13 @@ def backtest_portfolio(
             if selection_policy == "fixed":
                 selected_tickers = fixed_selected_tickers.copy()
             else:
-                selection_key = ("dynamic_selection", rebalance_start, lookback_days, int(selection_top_n))
+                selection_key = ("dynamic_selection_v3", tuple(prices.columns), prices.index[rebalance_start], lookback_days, int(selection_top_n), tuple(active_factors))
                 if selection_key not in shared_window_cache:
-                    _, selected = screen_prices_point_in_time(historical_universe, top_n=int(selection_top_n), min_observations=min(lookback_days, 253))
-                    shared_window_cache[selection_key] = list(selected)
-                selected_tickers = shared_window_cache[selection_key].copy()
+                    ranking, selected = screen_quant_point_in_time(historical_universe, prices.iloc[rebalance_start], prices.index[rebalance_start], historical_fundamentals, top_n=int(selection_top_n), min_observations=max(252, min(lookback_days, 253)), active_factors=active_factors)
+                    shared_window_cache[selection_key] = (list(selected), ranking.copy())
+                selected_tickers = list(shared_window_cache[selection_key][0])
+                if selection_audit is not None:
+                    selection_audit[str(prices.index[rebalance_start].date())] = shared_window_cache[selection_key][1].copy()
             # I titoli devono avere un prezzo disponibile alla data
             # di rebalance. In modalità fixed questo controllo non
             # modifica la selezione economica: protegge soltanto da
@@ -260,13 +270,14 @@ def backtest_portfolio(
                 )
             )
         elif strategy == "ff3_max_sharpe":
-            if ff3_factors is None or eurusd_prices is None:
+            if ff3_factors is None or (market != "USA" and eurusd_prices is None):
                 raise ValueError("FF3 factors and EUR/USD prices are required.")
             ff3_key = ("ff3_expected_returns", rebalance_start,
                        tuple(historical_prices.columns), len(historical_prices))
             if ff3_key not in shared_window_cache:
-                shared_window_cache[ff3_key] = estimate_ff3_eur_returns(
-                    historical_prices, ff3_factors, eurusd_prices, return_stats=True
+                shared_window_cache[ff3_key] = estimate_factor_returns(
+                    historical_prices, ff3_factors, eurusd_prices,
+                    market=market, model="ff3", return_stats=True
                 )
             ff3_expected, ff3_stats = shared_window_cache[ff3_key]
             ff3_mu = ff3_expected.reindex(covariance.index)
@@ -277,13 +288,14 @@ def backtest_portfolio(
                 max_weight=max_weight
             )
         elif strategy == "ff5_max_sharpe":
-            if ff5_factors is None or eurusd_prices is None:
+            if ff5_factors is None or (market != "USA" and eurusd_prices is None):
                 raise ValueError("FF5 factors and EUR/USD prices are required.")
             ff5_key = ("ff5_expected_returns", rebalance_start,
                        tuple(historical_prices.columns), len(historical_prices))
             if ff5_key not in shared_window_cache:
-                shared_window_cache[ff5_key] = estimate_ff5_eur_returns(
-                    historical_prices, ff5_factors, eurusd_prices, return_stats=True
+                shared_window_cache[ff5_key] = estimate_factor_returns(
+                    historical_prices, ff5_factors, eurusd_prices,
+                    market=market, model="ff5", return_stats=True
                 )
             ff5_expected, ff5_stats = shared_window_cache[ff5_key]
             ff5_mu = ff5_expected.reindex(covariance.index)

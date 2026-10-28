@@ -10,10 +10,10 @@ EUROPE_FF3_URL = (
 )
 
 
-def load_europe_ff3() -> pd.DataFrame:
+def load_europe_ff3(url=EUROPE_FF3_URL) -> pd.DataFrame:
     """Scarica i fattori giornalieri europei di Kenneth French,
     con rendimenti espressi in USD e convertiti in formato decimale."""
-    req = Request(EUROPE_FF3_URL, headers={"User-Agent": "Mozilla/5.0"})
+    req = Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urlopen(req, timeout=30) as response:
         raw = response.read()
     with ZipFile(BytesIO(raw)) as archive:
@@ -114,3 +114,10 @@ def estimate_ff3_eur_returns(historical_prices_eur, factors, eurusd_prices,
     mu_eur = ((1.0 + mu_usd_daily) / (1.0 + float(fx_returns.mean())) - 1.0) * 252.0
     expected = mu_eur.reindex(eur.columns)
     return (expected, stats) if return_stats else expected
+
+
+US_FF3_URL = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_Factors_daily_CSV.zip"
+
+def load_us_ff3():
+    """US daily FF3, USD returns, decimals; same date parser as Europe."""
+    return load_europe_ff3(url=US_FF3_URL)

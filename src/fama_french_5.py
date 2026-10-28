@@ -18,10 +18,10 @@ EUROPE_FF5_URL = (
 FACTOR_COLUMNS = ['MKT-RF', 'SMB', 'HML', 'RMW', 'CMA']
 
 
-def load_europe_ff5() -> pd.DataFrame:
+def load_europe_ff5(url=EUROPE_FF5_URL) -> pd.DataFrame:
     """Scarica i fattori giornalieri del modello europeo Fama-French a cinque
     fattori (FF5), convertendo i valori percentuali in decimali."""
-    req = Request(EUROPE_FF5_URL, headers={'User-Agent': 'Mozilla/5.0'})
+    req = Request(url, headers={'User-Agent': 'Mozilla/5.0'})
     with urlopen(req, timeout=30) as response:
         content = response.read()
     with ZipFile(BytesIO(content)) as archive:
@@ -102,3 +102,10 @@ def estimate_ff5_eur_returns(historical_prices_eur, factors, eurusd_prices,
     mu_eur = ((1 + mu_usd_daily) / (1 + float(fx_returns.mean())) - 1) * 252
     expected = mu_eur.reindex(eur.columns)
     return (expected, stats) if return_stats else expected
+
+
+US_FF5_URL = "https://mba.tuck.dartmouth.edu/pages/faculty/ken.french/ftp/F-F_Research_Data_5_Factors_2x3_daily_CSV.zip"
+
+def load_us_ff5():
+    """US daily FF5, USD returns, decimals; same date parser as Europe."""
+    return load_europe_ff5(url=US_FF5_URL)

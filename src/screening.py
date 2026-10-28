@@ -348,9 +348,14 @@ def _calculate_price_signals(close: pd.Series) -> dict:
     close = close.dropna().astype(float)
     returns = close.pct_change().dropna()
 
-    if len(close) >= 253:
-        momentum = close.iloc[-22] / close.iloc[-253] - 1.0
-        momentum_window = "12-1"
+    if len(close) >= 252:
+        # 252 observations represent the conventional 1Y trading window.
+        # Use the oldest available price rather than switching the ENTIRE
+        # strategy to 6-1 when a 252-row training slice is supplied.
+        # With 253+ observations, preserve the original 12-1 definition.
+        anchor = -253 if len(close) >= 253 else -252
+        momentum = close.iloc[-22] / close.iloc[anchor] - 1.0
+        momentum_window = "12-1" if len(close) >= 253 else "12-1 (252 obs)"
 
     elif len(close) >= 127:
         momentum = close.iloc[-22] / close.iloc[-127] - 1.0
@@ -379,148 +384,17 @@ def _calculate_price_signals(close: pd.Series) -> dict:
 # SCREENING
 # =========================================================
 
-def screen_universe(
-    universe: pd.DataFrame,
-    period: str = "2y",
-    top_n: int = 10,
-    min_components: int = 2,
-) -> tuple[pd.DataFrame, list[str]]:
-    """
-    Screening quantitativo robusto.
 
-    ELIGIBILITY
-    -----------
-    Un titolo è price-eligible se:
-    - il ticker è presente;
-    - Yahoo restituisce uno storico prezzi;
-    - lo storico contiene almeno MIN_PRICE_OBSERVATIONS.
-
-    La mancanza di fondamentali NON rende il ticker invalido.
-
-    SCORE
-    -----
-    Momentum:
-        momentum 12-1, con fallback 6-1.
-
-    Risk:
-        low volatility + drawdown meno severo.
-
-    Value:
-        Earnings Yield + Book-to-Market, quando disponibili.
-
-    Quality:
-        ROE + basso Debt-to-Equity, quando disponibili.
-
-    Quant Score:
-        media delle famiglie di segnali disponibili.
-
-    Per default servono almeno 2 componenti, quindi un titolo con
-    prezzi validi dispone già di Momentum + Risk e può essere
-    classificato anche se Yahoo non restituisce i fondamentali.
-    """
-    cleaned = _clean_universe(universe)
-
-    if cleaned.empty:
-        return pd.DataFrame(), []
-
-    # -----------------------------------------------------
-    # 1. PREZZI: download batch dell'intero universo
-    # -----------------------------------------------------
-    prices, price_status = download_universe_prices(
-        cleaned,
-        period=period,
-    )
-
-    rows = []
-
-    # -----------------------------------------------------
-    # 2. Costruzione dataset base
-    # -----------------------------------------------------
-    for _, instrument in cleaned.iterrows():
-        name = instrument["name"]
-        ticker = instrument["ticker"]
-
-        row = {
-            "Instrument": name,
-            "Ticker": ticker,
-            "Status": "Excluded",
-            "Reason": "",
-            "Price Data Status": price_status.get(
-                ticker,
-                "Not downloaded",
-            ),
-            "Fundamental Data Status": "Not requested",
-            "Observations": np.nan,
-            "Momentum Window": "",
-            "Momentum": np.nan,
-            "Volatility": np.nan,
-            "Max Drawdown": np.nan,
-            "Earnings Yield": np.nan,
-            "Book-to-Market": np.nan,
-            "ROE": np.nan,
-            "Debt-to-Equity": np.nan,
-        }
-
-        close = prices.get(ticker)
-
-        if close is None:
-            row["Reason"] = row["Price Data Status"]
-            rows.append(row)
-            continue
-
-        try:
-            signals = _calculate_price_signals(close)
-
-        except Exception as exc:
-            row["Reason"] = (
-                f"Price signal calculation failed: {type(exc).__name__}"
-            )
-            rows.append(row)
-            continue
-
-        fundamentals, fundamental_status = _safe_fundamentals(ticker)
-
-        row.update({
-            "Status": "Candidate",
-            "Reason": "",
-            "Fundamental Data Status": fundamental_status,
-            "Observations": signals["observations"],
-            "Momentum Window": signals["momentum_window"],
-            "Momentum": signals["momentum"],
-            "Volatility": signals["volatility"],
-            "Max Drawdown": signals["max_drawdown"],
-            "Earnings Yield": fundamentals["earnings_yield"],
-            "Book-to-Market": fundamentals["book_to_market"],
-            "ROE": fundamentals["roe"],
-            "Debt-to-Equity": fundamentals["debt_to_equity"],
-        })
-
-        rows.append(row)
-
-        if FUNDAMENTAL_PAUSE_SECONDS > 0:
-            time.sleep(FUNDAMENTAL_PAUSE_SECONDS)
-
-    result = pd.DataFrame(rows)
-
-    if result.empty:
-        return result, []
-
-    # Tipi espliciti: evita l'errore pandas float64 <- False.
-    result["Momentum Score"] = np.nan
-    result["Risk Score"] = np.nan
-    result["Value Score"] = np.nan
-    result["Quality Score"] = np.nan
-    result["Components Available"] = 0
-    result["Quant Score"] = np.nan
-    result["Selected"] = False
-    result["Rank"] = np.nan
-
-    valid_mask = result["Status"].eq("Candidate")
-    valid = result.loc[valid_mask].copy()
-
-    if valid.empty:
-        return result, []
-
+def score_quant_candidates(valid: pd.DataFrame, top_n: int, min_components: int = 2, active_factors=("Momentum", "Risk")):
+    """Single scoring/ranking engine used by live and point-in-time screening."""
+    active_factors = tuple(active_factors)
+    if not active_factors or len(set(active_factors)) != len(active_factors) or any(f not in ("Momentum", "Risk", "Value", "Quality") for f in active_factors):
+        raise ValueError("Select one or more distinct valid Quant factors")
+    valid = valid.copy()
+    for col in ("Momentum Score", "Risk Score", "Value Score", "Quality Score", "Quant Score", "Rank"):
+        valid[col] = np.nan
+    valid["Selected"] = False
+    valid["Components Available"] = 0
     # -----------------------------------------------------
     # 3. MOMENTUM SCORE
     # -----------------------------------------------------
@@ -605,6 +479,7 @@ def screen_universe(
         "Quality Score",
     ]
 
+    component_columns = [f"{factor} Score" for factor in active_factors]
     valid["Components Available"] = (
         valid[component_columns]
         .notna()
@@ -668,6 +543,163 @@ def screen_universe(
 
     rank_map = eligible.set_index("Ticker")["Rank"]
     valid["Rank"] = valid["Ticker"].map(rank_map)
+
+    return valid, eligible, selected_tickers
+
+def screen_universe(
+    universe: pd.DataFrame,
+    period: str = "2y",
+    top_n: int = 10,
+    min_components: int = 2,
+    active_factors=("Momentum", "Risk"),
+) -> tuple[pd.DataFrame, list[str]]:
+    """
+    Screening quantitativo robusto.
+
+    ELIGIBILITY
+    -----------
+    Un titolo è price-eligible se:
+    - il ticker è presente;
+    - Yahoo restituisce uno storico prezzi;
+    - lo storico contiene almeno MIN_PRICE_OBSERVATIONS.
+
+    La mancanza di fondamentali NON rende il ticker invalido.
+
+    SCORE
+    -----
+    Momentum:
+        momentum 12-1, con fallback 6-1.
+
+    Risk:
+        low volatility + drawdown meno severo.
+
+    Value:
+        Earnings Yield + Book-to-Market, quando disponibili.
+
+    Quality:
+        ROE + basso Debt-to-Equity, quando disponibili.
+
+    Quant Score:
+        media delle famiglie di segnali disponibili.
+
+    Per default servono almeno 2 componenti, quindi un titolo con
+    prezzi validi dispone già di Momentum + Risk e può essere
+    classificato anche se Yahoo non restituisce i fondamentali.
+    """
+    active_factors = tuple(active_factors)
+    if not active_factors or any(f not in ("Momentum", "Risk", "Value", "Quality") for f in active_factors):
+        raise ValueError("Invalid Quant factors")
+    cleaned = _clean_universe(universe)
+
+    if cleaned.empty:
+        return pd.DataFrame(), []
+
+    # -----------------------------------------------------
+    # 1. PREZZI: download batch dell'intero universo
+    # -----------------------------------------------------
+    prices, price_status = download_universe_prices(
+        cleaned,
+        period=period,
+    )
+
+    rows = []
+
+    # -----------------------------------------------------
+    # 2. Costruzione dataset base
+    # -----------------------------------------------------
+    for _, instrument in cleaned.iterrows():
+        name = instrument["name"]
+        ticker = instrument["ticker"]
+
+        row = {
+            "Instrument": name,
+            "Ticker": ticker,
+            "Status": "Excluded",
+            "Reason": "",
+            "Price Data Status": price_status.get(
+                ticker,
+                "Not downloaded",
+            ),
+            "Fundamental Data Status": "Not requested",
+            "Observations": np.nan,
+            "Momentum Window": "",
+            "Momentum": np.nan,
+            "Volatility": np.nan,
+            "Max Drawdown": np.nan,
+            "Earnings Yield": np.nan,
+            "Book-to-Market": np.nan,
+            "ROE": np.nan,
+            "Debt-to-Equity": np.nan,
+        }
+
+        close = prices.get(ticker)
+
+        if close is None:
+            row["Reason"] = row["Price Data Status"]
+            rows.append(row)
+            continue
+
+        try:
+            signals = _calculate_price_signals(close)
+
+        except Exception as exc:
+            row["Reason"] = (
+                f"Price signal calculation failed: {type(exc).__name__}"
+            )
+            rows.append(row)
+            continue
+
+        if "Value" in active_factors or "Quality" in active_factors:
+            fundamentals, fundamental_status = _safe_fundamentals(ticker)
+        else:
+            fundamentals = {"earnings_yield": np.nan, "book_to_market": np.nan,
+                            "roe": np.nan, "debt_to_equity": np.nan}
+            fundamental_status = "Not requested (Momentum + Risk)"
+
+        row.update({
+            "Status": "Candidate",
+            "Reason": "",
+            "Fundamental Data Status": fundamental_status,
+            "Observations": signals["observations"],
+            "Momentum Window": signals["momentum_window"],
+            "Momentum": signals["momentum"],
+            "Volatility": signals["volatility"],
+            "Max Drawdown": signals["max_drawdown"],
+            "Earnings Yield": fundamentals["earnings_yield"],
+            "Book-to-Market": fundamentals["book_to_market"],
+            "ROE": fundamentals["roe"],
+            "Debt-to-Equity": fundamentals["debt_to_equity"],
+        })
+
+        rows.append(row)
+
+        if FUNDAMENTAL_PAUSE_SECONDS > 0:
+            time.sleep(FUNDAMENTAL_PAUSE_SECONDS)
+
+    result = pd.DataFrame(rows)
+
+    if result.empty:
+        return result, []
+
+    # Tipi espliciti: evita l'errore pandas float64 <- False.
+    result["Momentum Score"] = np.nan
+    result["Risk Score"] = np.nan
+    result["Value Score"] = np.nan
+    result["Quality Score"] = np.nan
+    result["Components Available"] = 0
+    result["Quant Score"] = np.nan
+    result["Selected"] = False
+    result["Rank"] = np.nan
+
+    valid_mask = result["Status"].eq("Candidate")
+    valid = result.loc[valid_mask].copy()
+
+    if valid.empty:
+        return result, []
+
+    valid, eligible, selected_tickers = score_quant_candidates(
+        valid, top_n=top_n, min_components=min_components, active_factors=active_factors
+    )
 
     # -----------------------------------------------------
     # 9. MERGE NEL RISULTATO COMPLETO
@@ -757,75 +789,221 @@ def build_price_matrix(
     return matrix.sort_index()
 
 
-def screen_prices_point_in_time(
-    historical_prices: pd.DataFrame,
-    top_n: int = 10,
-    min_observations: int = MIN_PRICE_OBSERVATIONS,
-) -> tuple[pd.DataFrame, list[str]]:
-    """Ranking storico senza look-ahead basato solo su Momentum + Risk.
-
-    `historical_prices` deve terminare PRIMA della data di decisione. Non
-    vengono interrogati fondamentali correnti: Value e Quality restano fuori
-    finché non avremo dati fondamentali realmente point-in-time.
-    """
+def screen_prices_point_in_time(historical_prices, top_n=10, min_observations=252, active_factors=("Momentum", "Risk")):
+    """Price-only PIT ranking using the same scoring engine as live selection."""
     if historical_prices is None or historical_prices.empty:
         return pd.DataFrame(), []
-
+    required = max(252, int(min_observations))
     rows = []
-    minimum = max(MIN_PRICE_OBSERVATIONS, int(min_observations))
-
     for ticker in historical_prices.columns:
-        close = pd.to_numeric(
-            historical_prices[ticker], errors="coerce"
-        ).dropna()
-
-        if len(close) < minimum:
+        close = pd.to_numeric(historical_prices[ticker], errors="coerce").dropna()
+        if len(close) < required:
             continue
+        sig = _calculate_price_signals(close)
+        if not sig["momentum_window"].startswith("12-1"):
+            continue
+        rows.append({"Ticker": str(ticker), "Status": "Candidate", "Reason": "",
+                     "Observations": sig["observations"], "Momentum Window": sig["momentum_window"],
+                     "Momentum": sig["momentum"], "Volatility": sig["volatility"],
+                     "Max Drawdown": sig["max_drawdown"], "Earnings Yield": np.nan,
+                     "Book-to-Market": np.nan, "ROE": np.nan, "Debt-to-Equity": np.nan})
+    if not rows:
+        return pd.DataFrame(), []
+    ranked, _, selected = score_quant_candidates(pd.DataFrame(rows), top_n,
+                                                   min_components=2,
+                                                   active_factors=active_factors)
+    return ranked.sort_values("Rank", na_position="last").reset_index(drop=True), selected
 
+
+def screen_tradable_point_in_time(
+    historical_prices,
+    execution_prices,
+    top_n=10,
+    min_observations=80,
+):
+    """Point-in-time screening with explicit data diagnostics."""
+
+    if historical_prices is None or historical_prices.empty:
+        raise ValueError(
+            "Point-in-time screening: historical price matrix is empty."
+        )
+
+    historical_prices = historical_prices.apply(
+        pd.to_numeric, errors="coerce"
+    ).replace([np.inf, -np.inf], np.nan)
+
+    quotes = pd.to_numeric(
+        execution_prices, errors="coerce"
+    ).replace([np.inf, -np.inf], np.nan)
+
+    required = max(
+        MIN_PRICE_OBSERVATIONS,
+        int(min_observations),
+    )
+
+    counts = historical_prices.notna().sum()
+
+    valid_history = counts[
+        counts >= required
+    ].index
+
+    valid_quote = quotes.index[
+        quotes.notna() & (quotes > 0)
+    ]
+
+    eligible = (
+        historical_prices.columns
+        .intersection(valid_history)
+        .intersection(valid_quote)
+    )
+
+    raw_usable_days = int(
+        (
+            historical_prices.notna().sum(axis=1) >= 2
+        ).sum()
+    )
+
+    print("\n========== SCREENING DIAGNOSTICS ==========")
+    print("Matrix shape:", historical_prices.shape)
+    print("Date range:", historical_prices.index.min(),
+          historical_prices.index.max())
+    print("Required observations:", required)
+    print("Max observations per asset:", counts.max())
+    print("Median observations per asset:", counts.median())
+    print("Assets with sufficient history:", len(valid_history))
+    print("Assets with valid execution price:",
+          len(valid_quote))
+    print("Eligible assets:", len(eligible))
+    print("Raw days with >=2 quotes:", raw_usable_days)
+    print("Top 10 observation counts:")
+    print(counts.sort_values(ascending=False).head(10))
+    print("===========================================\n")
+
+    if len(eligible) < 2:
+        raise ValueError(
+            f"Point-in-time screening: {len(eligible)} eligible assets; "
+            f"required={required}; "
+            f"max_history={counts.max()}; "
+            f"raw_common_days={raw_usable_days}."
+        )
+
+    ranked, selected = screen_prices_point_in_time(
+        historical_prices.loc[:, eligible],
+        top_n=top_n,
+        min_observations=required,
+    )
+
+    if len(selected) < 2:
+        raise ValueError(
+            f"Point-in-time screening selected only "
+            f"{len(selected)} assets from {len(eligible)} eligible."
+        )
+
+    return ranked, selected
+
+# =========================================================
+# STRICT HISTORICAL FOUR-FACTOR SCREENING
+# =========================================================
+HISTORICAL_FUNDAMENTALS_COLUMNS = (
+    "ticker", "published_at", "earnings_yield", "book_to_market", "roe", "debt_to_equity"
+)
+
+def load_pit_fundamentals(csv_path):
+    """Load a *verified* point-in-time fundamentals panel.
+
+    Each row represents values known as of `published_at`, not today's Yahoo info.
+    A real historical dataset is REQUIRED. Missing coverage raises an error.
+    """
+    from pathlib import Path
+    path = Path(csv_path)
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Historical Value/Quality dataset not found: {path}. "
+            "Four-factor historical backtesting is disabled until point-in-time data are supplied."
+        )
+    panel = pd.read_csv(path)
+    missing = set(HISTORICAL_FUNDAMENTALS_COLUMNS) - set(panel.columns)
+    if missing:
+        raise ValueError(f"Missing point-in-time fundamentals columns: {sorted(missing)}")
+    panel['published_at'] = pd.to_datetime(panel['published_at'], errors='raise', utc=True).dt.tz_localize(None)
+    panel['ticker'] = panel['ticker'].astype(str).str.strip()
+    for field in HISTORICAL_FUNDAMENTALS_COLUMNS[2:]:
+        panel[field] = pd.to_numeric(panel[field], errors='coerce')
+    if panel.duplicated(['ticker', 'published_at']).any():
+        raise ValueError('Duplicate ticker/published_at in historical fundamentals')
+    return panel.sort_values(['ticker', 'published_at'])
+
+
+def screen_quant_point_in_time(historical_prices, execution_prices, as_of_date,
+                               fundamentals_panel=None, top_n=50, min_observations=252,
+                               min_components=None, active_factors=("Momentum", "Risk")):
+    """Historical Quant Selection with identical four-family score to live screening.
+
+    Uses the last record published strictly before the decision date; a date-only
+    publication timestamp is conservatively eligible starting the next day.
+    Fails closed if 4 families cannot be computed for enough securities.
+    """
+    active_factors = tuple(active_factors)
+    if min_components is None:
+        min_components = len(active_factors)
+    if not ("Value" in active_factors or "Quality" in active_factors):
+        # Historical execution quotes are used ONLY for tradability.
+        quotes = pd.to_numeric(execution_prices, errors="coerce")
+        eligible = [ticker for ticker in historical_prices.columns
+                    if ticker in quotes.index and pd.notna(quotes[ticker]) and quotes[ticker] > 0]
+        ranking, selected = screen_prices_point_in_time(
+            historical_prices[eligible], top_n=top_n,
+            min_observations=max(252, int(min_observations)),
+            active_factors=active_factors)
+        if len(selected) < int(top_n):
+            raise ValueError(f"Only {len(selected)} price-only PIT candidates for Top {top_n}")
+        return ranking, selected
+    if fundamentals_panel is None:
+        raise ValueError("Historical Value/Quality requires point-in-time fundamentals")
+    required = max(MIN_PRICE_OBSERVATIONS, int(min_observations))
+    as_of = pd.Timestamp(as_of_date).tz_localize(None) if pd.Timestamp(as_of_date).tzinfo else pd.Timestamp(as_of_date)
+    # Treat same-day releases as unavailable without verified release time.
+    cutoff = as_of.normalize()
+    panel = fundamentals_panel.loc[(fundamentals_panel['published_at'] < cutoff) & (fundamentals_panel['decision_date'] == cutoff)].copy()
+    panel = panel.sort_values('published_at').drop_duplicates('ticker', keep='last').set_index('ticker')
+    quotes = pd.to_numeric(execution_prices, errors='coerce')
+    rows=[]
+    for ticker in historical_prices.columns:
+        series = pd.to_numeric(historical_prices[ticker], errors='coerce').dropna()
+        if len(series) < required or ticker not in quotes.index or not np.isfinite(quotes[ticker]) or quotes[ticker] <= 0:
+            continue
+        if ticker not in panel.index:
+            continue
         try:
-            signals = _calculate_price_signals(close)
-        except Exception:
+            sig = _calculate_price_signals(series)
+        except (ValueError, TypeError, ZeroDivisionError):
             continue
-
-        rows.append({
-            "Ticker": str(ticker),
-            "Observations": signals["observations"],
-            "Momentum Window": signals["momentum_window"],
-            "Momentum": signals["momentum"],
-            "Volatility": signals["volatility"],
-            "Max Drawdown": signals["max_drawdown"],
-        })
-
-    ranked = pd.DataFrame(rows)
-
-    if ranked.empty:
-        return ranked, []
-
-    ranked["Momentum Score"] = _percentile_score(
-        ranked["Momentum"], higher_is_better=True
-    )
-
-    volatility_score = _percentile_score(
-        ranked["Volatility"], higher_is_better=False
-    )
-    drawdown_score = _percentile_score(
-        ranked["Max Drawdown"], higher_is_better=True
-    )
-    ranked["Risk Score"] = pd.concat(
-        [volatility_score, drawdown_score], axis=1 
-    ).mean(axis=1, skipna=True)
-
-    ranked["Quant Score"] = ranked[[
-        "Momentum Score", "Risk Score"
-    ]].mean(axis=1, skipna=True)
-
-    ranked = ranked.sort_values(
-        ["Quant Score", "Momentum Score", "Risk Score", "Ticker"],
-        ascending=[False, False, False, True],
-    ).reset_index(drop=True)
-
-    ranked["Rank"] = np.arange(1, len(ranked) + 1, dtype=int)
-    selected = ranked.head(max(0, int(top_n)))["Ticker"].tolist()
-    ranked["Selected"] = ranked["Ticker"].isin(selected)
-
+        f = panel.loc[ticker]
+        price = float(series.iloc[-1])
+        shares = f.get('shares', np.nan)
+        market_cap = shares * price if np.isfinite(shares) and shares > 0 else np.nan
+        equity = f.get('equity', np.nan)
+        earnings = f.get('annual_earnings', np.nan)
+        debt = f.get('debt', np.nan)
+        earnings_yield = earnings / market_cap if np.isfinite(market_cap) and market_cap > 0 and np.isfinite(earnings) else np.nan
+        book_to_market = equity / market_cap if np.isfinite(market_cap) and market_cap > 0 and np.isfinite(equity) else np.nan
+        roe = earnings / equity if np.isfinite(equity) and equity != 0 and np.isfinite(earnings) else np.nan
+        debt_to_equity = debt / equity if np.isfinite(equity) and equity != 0 and np.isfinite(debt) else np.nan
+        rows.append({'Ticker':ticker, 'Status':'Candidate', 'Reason':'',
+                     'Observations':len(series), 'Momentum Window':sig['momentum_window'],
+                     'Momentum':sig['momentum'], 'Volatility':sig['volatility'],
+                     'Max Drawdown':sig['max_drawdown'], 'Earnings Yield':earnings_yield,
+                     'Book-to-Market':book_to_market, 'ROE':roe,
+                     'Debt-to-Equity':debt_to_equity, 'Fundamentals Published At':f['published_at'],
+                     'Income Filed At':f.get('income_filed_at'), 'Equity Filed At':f.get('equity_filed_at'),
+                     'Shares Filed At':f.get('shares_filed_at'), 'Debt Filed At':f.get('debt_filed_at')})
+    if not rows:
+        raise ValueError('No historical candidates with both prices and published fundamentals; no present-day fallback permitted.')
+    ranked, eligible, selected = score_quant_candidates(pd.DataFrame(rows), top_n, min_components, active_factors=active_factors)
+    if len(selected) < int(top_n):
+        raise ValueError(f'Only {len(selected)} assets passed strict historical four-factor Quant Selection; requested {top_n}.')
+    # Return the full scored table, NOT the pre-selection `eligible` copy:
+    # `score_quant_candidates` assigns Selected/Status on `valid` after
+    # creating `eligible`, so the latter has Selected=False for every row.
+    ranked = ranked.sort_values("Rank", na_position="last").reset_index(drop=True)
     return ranked, selected
