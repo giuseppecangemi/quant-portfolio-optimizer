@@ -5976,7 +5976,7 @@ with factor_models_tab:
                     "sharpe": (ff3_return-risk_free_rate)/ff3_vol if ff3_vol>0 else 0.0,
                     "total_invested": float(ff3_table["Invested"].sum()),
                     "use_fractional_shares": use_fractional_shares,
-                    "fx_drift_annualized": fx_drift*252,
+                    "fx_drift_annualized": None,
                     "factor_observations": len(ff3_factors),
                 }
         except Exception as exc:
@@ -6076,7 +6076,7 @@ with factor_models_tab:
                     "sharpe": (ff5_return-risk_free_rate)/ff5_vol if ff5_vol>0 else 0.0,
                     "total_invested": float(ff5_table["Invested"].sum()),
                     "use_fractional_shares": use_fractional_shares,
-                    "fx_drift_annualized": ff5_fx_drift*252,
+                    "fx_drift_annualized": None,
                     "factor_observations": len(ff5_factors),
                 }
         except Exception as exc:
