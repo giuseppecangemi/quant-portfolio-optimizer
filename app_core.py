@@ -4508,119 +4508,126 @@ with asset_selection_tab:
             if len(selected_tickers_corr) < 2:
                 st.info("Select at least two assets to calculate correlations.")
             else:
-                with st.spinner("Loading selected assets' price histories..."):
-                    try:
-                        correlation_prices = cached_screening_correlation_prices(
-                            tuple(selected_tickers_corr),
-                            screening_state["period"],
-                        )
-                        correlation_returns = (
-                            correlation_prices
-                            .sort_index()
-                            .pct_change(fill_method=None)
-                        )
-                        correlation_returns = correlation_returns.replace(
-                            [np.inf, -np.inf], np.nan
-                        )
-                        correlation_matrix = correlation_returns.corr(
-                            method="pearson", min_periods=60
-                        ).reindex(
-                            index=selected_tickers_corr,
-                            columns=selected_tickers_corr,
-                        )
+                correlation_key = (tuple(selected_tickers_corr), screening_state["period"])
+                if st.button("Calculate correlation matrix", key="calculate_screening_correlation"):
+                    st.session_state.pop("screening_correlation", None)
+                    with st.spinner("Loading selected assets' price histories..."):
+                        try:
+                            correlation_prices = cached_screening_correlation_prices(
+                                tuple(selected_tickers_corr),
+                                screening_state["period"],
+                            )
+                            correlation_returns = (
+                                correlation_prices
+                                .sort_index()
+                                .pct_change(fill_method=None)
+                            )
+                            correlation_returns = correlation_returns.replace(
+                                [np.inf, -np.inf], np.nan
+                            )
+                            correlation_matrix = correlation_returns.corr(
+                                method="pearson", min_periods=60
+                            ).reindex(
+                                index=selected_tickers_corr,
+                                columns=selected_tickers_corr,
+                            )
 
-                        import plotly.express as px
-
-                        upper_triangle = np.triu(
-                            np.ones(correlation_matrix.shape, dtype=bool), k=1
-                        )
-                        pairwise = correlation_matrix.where(upper_triangle).stack()
-                        if pairwise.empty:
+                            st.session_state["screening_correlation"] = (correlation_key, correlation_matrix)
+                        except Exception as corr_exc:
                             st.warning(
-                                "Insufficient overlapping daily returns "
-                                "to estimate pairwise correlations."
+                                "The correlation matrix could not be calculated: "
+                                f"{corr_exc}"
+                            )
+
+                cached_correlation = st.session_state.get("screening_correlation")
+                if cached_correlation is not None and cached_correlation[0] == correlation_key:
+                    correlation_matrix = cached_correlation[1]
+                    import plotly.express as px
+
+                    upper_triangle = np.triu(
+                        np.ones(correlation_matrix.shape, dtype=bool), k=1
+                    )
+                    pairwise = correlation_matrix.where(upper_triangle).stack()
+                    if pairwise.empty:
+                        st.warning(
+                            "Insufficient overlapping daily returns "
+                            "to estimate pairwise correlations."
+                        )
+                    else:
+                        avg_corr = float(pairwise.mean())
+                        highest_corr = float(pairwise.max())
+                        high_pairs = int((pairwise > 0.80).sum())
+                        highest_pair = pairwise.idxmax()
+
+                        kpi1, kpi2, kpi3 = st.columns(3)
+                        kpi1.metric("Avg. Pairwise Correlation", f"{avg_corr:.2f}")
+                        kpi2.metric(
+                            "Highest Correlation",
+                            f"{highest_corr:.2f}",
+                            help=f"{highest_pair[0]} / {highest_pair[1]}",
+                        )
+                        kpi3.metric("Pairs Above 0.80", str(high_pairs))
+
+                        heatmap_tickers = selected_tickers_corr
+                        if len(heatmap_tickers) > 35:
+                            st.caption(
+                                "Large universe: the matrix can be filtered "
+                                "for readability; KPIs above always cover "
+                                "all selected assets."
+                            )
+                            heatmap_tickers = st.multiselect(
+                                "Assets to display in heatmap",
+                                options=selected_tickers_corr,
+                                default=selected_tickers_corr[:35],
+                                key="screening_corr_display_tickers",
+                            )
+
+                        if len(heatmap_tickers) >= 2:
+                            display_corr = correlation_matrix.loc[
+                                heatmap_tickers, heatmap_tickers
+                            ]
+                            fig_corr = px.imshow(
+                                display_corr,
+                                zmin=-1,
+                                zmax=1,
+                                color_continuous_scale=[
+                                    [0.0, "#d97706"],
+                                    [0.5, "#161b26"],
+                                    [1.0, "#2563eb"],
+                                ],
+                                aspect="auto",
+                                labels={
+                                    "color": "Correlation",
+                                    "x": "Ticker",
+                                    "y": "Ticker",
+                                },
+                            )
+                            fig_corr.update_traces(
+                                hovertemplate=(
+                                    "%{y} / %{x}<br>"
+                                    "Correlation: %{z:.3f}<extra></extra>"
+                                )
+                            )
+                            fig_corr.update_layout(
+                                template="plotly_dark",
+                                height=max(450, min(1100, 25 * len(heatmap_tickers) + 200)),
+                                margin=dict(l=15, r=15, t=20, b=20),
+                                coloraxis_colorbar=dict(title="Pearson r"),
+                            )
+                            st.plotly_chart(
+                                fig_corr,
+                                use_container_width=True,
+                                key="screening_selected_corr_heatmap",
                             )
                         else:
-                            avg_corr = float(pairwise.mean())
-                            highest_corr = float(pairwise.max())
-                            high_pairs = int((pairwise > 0.80).sum())
-                            highest_pair = pairwise.idxmax()
+                            st.info("Choose at least two assets for the heatmap.")
 
-                            kpi1, kpi2, kpi3 = st.columns(3)
-                            kpi1.metric("Avg. Pairwise Correlation", f"{avg_corr:.2f}")
-                            kpi2.metric(
-                                "Highest Correlation",
-                                f"{highest_corr:.2f}",
-                                help=f"{highest_pair[0]} / {highest_pair[1]}",
-                            )
-                            kpi3.metric("Pairs Above 0.80", str(high_pairs))
-
-                            heatmap_tickers = selected_tickers_corr
-                            if len(heatmap_tickers) > 35:
-                                st.caption(
-                                    "Large universe: the matrix can be filtered "
-                                    "for readability; KPIs above always cover "
-                                    "all selected assets."
-                                )
-                                heatmap_tickers = st.multiselect(
-                                    "Assets to display in heatmap",
-                                    options=selected_tickers_corr,
-                                    default=selected_tickers_corr[:35],
-                                    key="screening_corr_display_tickers",
-                                )
-
-                            if len(heatmap_tickers) >= 2:
-                                display_corr = correlation_matrix.loc[
-                                    heatmap_tickers, heatmap_tickers
-                                ]
-                                fig_corr = px.imshow(
-                                    display_corr,
-                                    zmin=-1,
-                                    zmax=1,
-                                    color_continuous_scale=[
-                                        [0.0, "#d97706"],
-                                        [0.5, "#161b26"],
-                                        [1.0, "#2563eb"],
-                                    ],
-                                    aspect="auto",
-                                    labels={
-                                        "color": "Correlation",
-                                        "x": "Ticker",
-                                        "y": "Ticker",
-                                    },
-                                )
-                                fig_corr.update_traces(
-                                    hovertemplate=(
-                                        "%{y} / %{x}<br>"
-                                        "Correlation: %{z:.3f}<extra></extra>"
-                                    )
-                                )
-                                fig_corr.update_layout(
-                                    template="plotly_dark",
-                                    height=max(450, min(1100, 25 * len(heatmap_tickers) + 200)),
-                                    margin=dict(l=15, r=15, t=20, b=20),
-                                    coloraxis_colorbar=dict(title="Pearson r"),
-                                )
-                                st.plotly_chart(
-                                    fig_corr,
-                                    use_container_width=True,
-                                    key="screening_selected_corr_heatmap",
-                                )
-                            else:
-                                st.info("Choose at least two assets for the heatmap.")
-
-                            st.caption(
-                                f"Period: {screening_state['period']}. "
-                                "Daily close-to-close returns; Pearson correlation; "
-                                "at least 60 overlapping return observations per pair. "
-                                "Correlation is historical, may change over time, "
-                                "and is not a measure of portfolio risk contribution."
-                            )
-
-                    except Exception as corr_exc:
-                        st.warning(
-                            "The correlation matrix could not be calculated: "
-                            f"{corr_exc}"
+                        st.caption(
+                            f"Period: {screening_state['period']}. "
+                            "Daily close-to-close returns; Pearson correlation; "
+                            "at least 60 overlapping return observations per pair. "
+                            "Correlation is historical, may change over time, "
+                            "and is not a measure of portfolio risk contribution."
                         )
 
         excluded_rows = screening_table[
@@ -6130,9 +6137,12 @@ with factor_models_tab:
         st.markdown("#### FF3 Factor Cov — Maximum Sharpe Portfolio")
         st.caption(factor_estimation_caption("FF3", factor_result))
         fc1, fc2, fc3 = st.columns(3)
-        fc1.metric("Expected Return", f"{factor_result['return']:.2%}")
-        fc2.metric("Volatility", f"{factor_result['volatility']:.2%}")
-        fc3.metric("Sharpe Ratio", f"{factor_result['sharpe']:.2f}")
+        with fc1:
+            colored_metric("Expected Return", f"{factor_result['return']:.2%}", "green")
+        with fc2:
+            colored_metric("Volatility", f"{factor_result['volatility']:.2%}", "red")
+        with fc3:
+            colored_metric("Sharpe Ratio", f"{factor_result['sharpe']:.2f}", "blue")
         render_diversification_var_kpis(factor_result["weights"], factor_result["covariance"], capital)
         portfolio_allocation_title()
         display_portfolio_table(factor_result["table"], factor_result["use_fractional_shares"])
@@ -6242,9 +6252,12 @@ with factor_models_tab:
         st.markdown("#### FF5 Factor Cov — Maximum Sharpe Portfolio")
         st.caption(factor_estimation_caption("FF5", factor_result))
         fc1, fc2, fc3 = st.columns(3)
-        fc1.metric("Expected Return", f"{factor_result['return']:.2%}")
-        fc2.metric("Volatility", f"{factor_result['volatility']:.2%}")
-        fc3.metric("Sharpe Ratio", f"{factor_result['sharpe']:.2f}")
+        with fc1:
+            colored_metric("Expected Return", f"{factor_result['return']:.2%}", "green")
+        with fc2:
+            colored_metric("Volatility", f"{factor_result['volatility']:.2%}", "red")
+        with fc3:
+            colored_metric("Sharpe Ratio", f"{factor_result['sharpe']:.2f}", "blue")
         render_diversification_var_kpis(factor_result["weights"], factor_result["covariance"], capital)
         portfolio_allocation_title()
         display_portfolio_table(factor_result["table"], factor_result["use_fractional_shares"])
