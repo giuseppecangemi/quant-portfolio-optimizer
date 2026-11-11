@@ -83,3 +83,37 @@ for market in ("USA", "Borsa Italiana"):
                 dates[159], dates[179], dates[199], dates[160]
             ]
 print("PASS: FF3 and FF5 cutoff for expected returns and Factor Cov across both backtests")
+
+from src.ff3_attribution import compute_ff3_attribution, compute_ff5_attribution
+
+function = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+                and node.name == "add_factor_attributions")
+scope.update(backtest_portfolio=backtest.backtest_portfolio,
+             compute_ff3_attribution=compute_ff3_attribution,
+             compute_ff5_attribution=compute_ff5_attribution)
+engine = next(node for node in tree.body if isinstance(node, ast.FunctionDef)
+              and node.name == "run_backtest_engine")
+exec(compile(ast.Module(body=[function, engine], type_ignores=[]), str(path), "exec"), scope)
+with patch.object(factor_eur, "load_estr_rates", return_value=rates):
+    standard = scope["run_backtest_engine"](
+        ["A", "B"], prices, 160, 20, 0.0, 1.0, 100.0,
+        ff3_factors=ff, ff5_factors=ff, market="Borsa Italiana", eurusd_prices=fx,
+    )
+    for result in (standard, fixed):
+        scope["add_factor_attributions"](result, "Borsa Italiana", ff, ff, fx)
+        for model in ("ff3", "ff5"):
+            for strategy in (model, f"{model}_factor"):
+                attribution = result[f"{strategy}_performance_attribution"]
+                nav = result[f"{strategy}_bt"]["Portfolio Value"]
+                assert np.isclose(attribution["summary"].sum(), nav.iloc[-1] / 100 - 1)
+            cov_weights = result[f"{model}_factor_weights_history"]
+            history = result[f"{model}_factor_cov_exposure_history"]
+            pd.testing.assert_index_equal(history.index, cov_weights.index, check_names=False)
+            signal = dates[159] if result is standard else dates[160]
+            window = prices.loc[:signal].tail(160 if result is standard else 161)
+            eligible = ff.loc[:signal - pd.DateOffset(months=2)]
+            _, stats = factor_currency.estimate_factor_returns(
+                window, eligible, fx, market="Borsa Italiana", model=model, return_stats=True
+            )
+            assert np.isclose(history["Market Beta"].iloc[0], cov_weights.iloc[0] @ stats["Beta MKT"])
+print("PASS: all four EUR attributions reconcile with their own NAV in both backtests")

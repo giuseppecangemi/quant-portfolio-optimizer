@@ -22,7 +22,7 @@ import json
 from datetime import datetime
 from pathlib import Path
 
-from src.ff3_attribution import compute_ff3_attribution
+from src.ff3_attribution import compute_ff3_attribution, compute_ff5_attribution
 from src.fama_french_5 import load_europe_ff5, load_us_ff5, fit_ff5, estimate_ff5_eur_returns
 from src.factor_currency import estimate_factor_returns, factors_for_backtest_signal
 from src.data import get_prices as _get_raw_prices
@@ -95,8 +95,6 @@ st.set_page_config(
 
 import sys
 
-st.sidebar.caption(f"Python: {sys.executable}")
-st.sidebar.caption(f"yfinance: {yf.__version__}")
 
 # =========================================================
 # DATA
@@ -275,6 +273,13 @@ def build_experiment_snapshot(
     ff5_state = st.session_state.get("ff5_results")
     standard_state = st.session_state.get("standard_backtest_results")
     fixed_state = st.session_state.get("fixed_backtest_results")
+
+    if isinstance(standard_state, dict):
+        for run in (standard_state, standard_state.get("fixed"), standard_state.get("dynamic")):
+            if isinstance(run, dict):
+                complete_factor_attributions(run)
+    if isinstance(fixed_state, dict):
+        complete_factor_attributions(fixed_state)
 
     selected_assets = []
     for ticker in tickers:
@@ -506,15 +511,49 @@ def _saved_table(df, percentage_columns=None, money_columns=None):
         st.dataframe(df, use_container_width=True)
 
 
-def render_ff3_attribution(result, key_suffix=""):
-    attribution = result.get("ff3_performance_attribution")
+def add_factor_attributions(result, market, ff3_factors, ff5_factors, eurusd):
+    if market == "USA":
+        return
+    for model, compute, factors in (
+        ("ff3", compute_ff3_attribution, ff3_factors),
+        ("ff5", compute_ff5_attribution, ff5_factors),
+    ):
+        for strategy in (model, f"{model}_factor"):
+            try:
+                result[f"{strategy}_performance_attribution"] = compute(
+                    result[f"{strategy}_bt"], result[f"{model}_factor_cov_exposure_history" if strategy != model
+                                                         else f"{model}_factor_exposure_history"],
+                    factors, eurusd,
+                )
+            except (ValueError, KeyError, TypeError) as error:
+                result[f"{strategy}_attribution_error"] = str(error)
+
+
+def complete_factor_attributions(result):
+    inputs = result.pop("_factor_attribution_inputs", None)
+    if inputs is not None:
+        add_factor_attributions(result, *inputs)
+
+
+def render_factor_attribution(result, key_suffix=""):
+    labels = {"ff3": "FF3", "ff5": "FF5",
+              "ff3_factor": "FF3 Factor Cov", "ff5_factor": "FF5 Factor Cov"}
+    models = [strategy for strategy in labels
+              if (f"{strategy}_performance_attribution" in result
+                  or f"{strategy}_attribution_error" in result)]
+    if not models:
+        return
+    strategy = st.radio("Factor portfolio", models, format_func=labels.__getitem__,
+                        horizontal=True, key=f"attribution_model_{key_suffix}")
+    model = labels[strategy]
+    attribution = result.get(f"{strategy}_performance_attribution")
     if not isinstance(attribution, dict):
+        st.warning(result.get(f"{strategy}_attribution_error", "Attribution is unavailable."))
         return
     summary = attribution.get("summary")
     cumulative = attribution.get("cumulative")
     if not isinstance(summary, pd.Series) or not isinstance(cumulative, pd.DataFrame) or cumulative.empty:
         return
-    st.subheader("FF3 Performance Attribution")
     covered = attribution.get("covered_days", 0)
     total = attribution.get("total_days", 0)
     st.caption(
@@ -536,7 +575,7 @@ def render_ff3_attribution(result, key_suffix=""):
         total_return = float(attribution["total_return"])
         difference = float(attribution.get("reconciliation_difference", 0.0))
         cols = st.columns(3)
-        cols[0].metric("FF3 Total Return", f"{total_return*100:+.2f}%")
+        cols[0].metric(f"{model} Total Return", f"{total_return*100:+.2f}%")
         cols[1].metric("Attribution Sum", f"{float(summary.sum())*100:+.2f} pp")
         cols[2].metric("Reconciliation Difference", f"{difference*100:+.6f} pp")
     table = summary.to_frame("Contribution (pp)") * 100
@@ -550,7 +589,82 @@ def render_ff3_attribution(result, key_suffix=""):
     fig.update_layout(xaxis_title="Date", yaxis_title="Cumulative contribution (pp)",
                       hovermode="x unified")
     st.plotly_chart(fig, use_container_width=True,
-                    key=f"ff3_attr_{key_suffix}")
+                    key=f"{strategy}_attr_{key_suffix}")
+
+
+def render_factor_exposure_history(result, key_suffix=""):
+    histories = {}
+    for label, field in (
+        ("FF3", "ff3_factor_exposure_history"),
+        ("FF5", "ff5_factor_exposure_history"),
+        ("FF3 Factor Cov", "ff3_factor_cov_exposure_history"),
+        ("FF5 Factor Cov", "ff5_factor_cov_exposure_history"),
+    ):
+        history = result.get(field)
+        if isinstance(history, pd.DataFrame) and not history.empty:
+            histories[label] = history
+
+    if not histories:
+        return
+
+    panel = st.expander("Factor Exposure History", key=f"factor_exposure_panel_{key_suffix}",
+                        on_change="rerun")
+    if not panel.open:
+        return
+    with panel:
+        model = st.selectbox("Factor portfolio", list(histories),
+                             key=f"factor_exposure_model_{key_suffix}")
+        st.caption("Regression sensitivities weighted by the selected portfolio's target weights.")
+        history = histories[model].copy()
+        history.index = pd.to_datetime(history.index)
+        history.index.name = "Rebalance Date"
+        factors = [column for column in ("Market Beta", "SMB Exposure", "HML Exposure",
+                                          "RMW Exposure", "CMA Exposure")
+                   if column in history.columns]
+        st.dataframe(history.style.format({column: "{:.3f}" for column in factors}),
+                     use_container_width=True)
+        if factors:
+            figure = go.Figure()
+            for column in factors:
+                figure.add_trace(go.Scatter(x=history.index, y=history[column],
+                                            name=column, mode="lines+markers"))
+            figure.update_layout(xaxis_title="Rebalance Date", yaxis_title="Factor Loading",
+                                 hovermode="x unified")
+            st.plotly_chart(figure, use_container_width=True, key=f"factor_exposure_chart_{key_suffix}")
+
+
+def render_factor_analysis(result, key_suffix=""):
+    if "_factor_attribution_inputs" not in result and not any(value is not None and key.endswith((
+        "_performance_attribution", "_attribution_error", "_exposure_history",
+    )) for key, value in result.items()):
+        return
+
+    panel_key = f"factor_performance_panel_{key_suffix}"
+    st.markdown(
+        """
+        <style>
+        [class*="st-key-factor_performance_panel_"] summary:has(strong) {
+            min-height: 3.75rem;
+            padding-block: 0.75rem;
+            padding-inline: 1rem;
+            background: rgba(37, 99, 235, 0.16);
+            border-inline-start: 4px solid #60a5fa;
+        }
+        [class*="st-key-factor_performance_panel_"] summary strong {
+            font-size: 1.25rem;
+            font-weight: 700;
+        }
+        </style>
+        """,
+        unsafe_allow_html=True,
+    )
+    panel = st.expander("**Factor Performance Attribution**", key=panel_key, on_change="rerun")
+    if not panel.open:
+        return
+    complete_factor_attributions(result)
+    with panel:
+        render_factor_attribution(result, key_suffix=key_suffix)
+        render_factor_exposure_history(result, key_suffix=key_suffix)
 
 
 def _render_saved_transaction_costs(result, saved_costs=None):
@@ -702,36 +816,7 @@ def _render_saved_backtest_summary(result, title, saved_costs=None):
 
         growth[label] = s
 
-    render_ff3_attribution(result, key_suffix=f"saved_{title}")
-
-    ff3_exposure_saved = result.get("ff3_factor_exposure_history")
-    if isinstance(ff3_exposure_saved, pd.DataFrame) and not ff3_exposure_saved.empty:
-        st.markdown("##### FF3 Factor Exposure History")
-        st.dataframe(ff3_exposure_saved.style.format({
-            c: "{:.3f}" for c in ("Market Beta", "SMB Exposure", "HML Exposure")
-            if c in ff3_exposure_saved.columns
-        }), use_container_width=True)
-
-        # Only plot exposure history when there are at least two rebalance dates.
-        if len(ff3_exposure_saved) > 1:
-            exposure_plot = ff3_exposure_saved.copy()
-            exposure_plot.index = pd.to_datetime(exposure_plot.index)
-            exposure_fig = go.Figure()
-            for factor in ("Market Beta", "SMB Exposure", "HML Exposure"):
-                if factor in exposure_plot.columns:
-                    exposure_fig.add_trace(go.Scatter(
-                        x=exposure_plot.index,
-                        y=pd.to_numeric(exposure_plot[factor], errors="coerce"),
-                        mode="lines+markers",
-                        name=factor,
-                    ))
-            exposure_fig.update_layout(
-                xaxis_title="Rebalance Date",
-                yaxis_title="Factor Loading",
-                hovermode="x unified",
-            )
-            st.plotly_chart(exposure_fig, use_container_width=True,
-                            key=f"saved_ff3_exposure_{title}")
+    render_factor_analysis(result, key_suffix=f"saved_{title}")
 
     if not growth.empty:
         st.markdown("##### Portfolio Growth")
@@ -1092,7 +1177,7 @@ def colored_metric(label, value, color):
     c = colors[color]
 
     html = (
-        f'<div style="'
+        f'<div class="kangemi-colored-metric" style="'
         f'background:{c["bg"]};'
         f'border:1px solid {c["border"]};'
         f'border-radius:9px;'
@@ -1364,8 +1449,8 @@ def _comparison_equity(result, key="ff3_bt"):
     return out if len(out) >= 2 and (out > 0).all() else None
 
 
-def _comparison_diagnostics(result):
-    history = result.get("ff3_weights_history")
+def _comparison_diagnostics(result, model="ff3"):
+    history = result.get(f"{model}_weights_history")
     if not isinstance(history, pd.DataFrame) or history.empty:
         return None
     weights = history.fillna(0.0).astype(float)
@@ -1414,7 +1499,7 @@ def _build_same_initial_ff3_buy_hold(prices, standard_result):
 
 def _build_same_initial_model_buy_hold(prices, standard_result, model):
     """Same-inception, same-model weights; no future data in allocation."""
-    key = {"capm": "capm_bt", "ff3": "ff3_bt", "ff5": "ff5_bt"}[model]
+    key = f"{model}_bt"
     equity = _comparison_equity(standard_result, key)
     history = standard_result.get(f"{model}_weights_history")
     if equity is None or not isinstance(history, pd.DataFrame) or history.empty:
@@ -1438,56 +1523,33 @@ def _build_same_initial_model_buy_hold(prices, standard_result, model):
     return (values / values.iloc[0] * float(equity.iloc[0])).rename("Same-initial Buy & Hold")
 
 
-def render_capm_ff3_ff5_backtest_chart(standard_results, fixed_result, key_prefix="live"):
-    """Compare realized CAPM, FF3 and FF5 returns from existing equity curves."""
-    if not isinstance(standard_results, dict) or not isinstance(fixed_result, dict):
-        return
+BACKTEST_COMPARISON_MODELS = (
+    ("capm", "CAPM", "#a970cf"),
+    ("ff3", "FF3", "#5b9ae7"),
+    ("ff5", "FF5", "#67bc79"),
+    ("ff3_factor", "FF3 Factor Cov", "#36c4c1"),
+    ("ff5_factor", "FF5 Factor Cov", "#e7b65b"),
+)
 
-    standard = (
-        {"fixed": standard_results}
-        if "ff3_bt" in standard_results else standard_results
-    )
-    scenarios = [
-        ("WF fisso", standard.get("fixed")),
-        ("WF dinamico", standard.get("dynamic")),
-        ("Fixed Horizon", fixed_result),
-    ]
-    labels, capm_values, ff3_values, ff5_values = [], [], [], []
-    for label, result in scenarios:
-        if not isinstance(result, dict):
-            continue
-        capm_curve = _comparison_equity(result, "capm_bt")
-        ff3_curve = _comparison_equity(result, "ff3_bt")
-        ff5_curve = _comparison_equity(result, "ff5_bt")
-        if capm_curve is None or ff3_curve is None or ff5_curve is None:
-            continue
-        labels.append(label)
-        capm_values.append(100 * (capm_curve.iloc[-1] / capm_curve.iloc[0] - 1))
-        ff3_values.append(100 * (ff3_curve.iloc[-1] / ff3_curve.iloc[0] - 1))
-        ff5_values.append(100 * (ff5_curve.iloc[-1] / ff5_curve.iloc[0] - 1))
 
-    if not labels:
-        return
-
-    st.markdown("##### CAPM vs FF3 vs FF5 — Backtest Performance")
-    st.caption("Realized cumulative returns for each backtest; periods may differ.")
+def render_backtest_return_chart(scenarios, key_prefix):
     fig = go.Figure()
-    for name, values, color in (
-        ("CAPM", capm_values, "#9B59B6"),
-        ("FF3", ff3_values, "#28599B"),
-        ("FF5", ff5_values, "#388545"),
-    ):
-        fig.add_trace(go.Bar(
-            name=name,
-            x=labels,
-            y=values,
-            marker=dict(color=color, line=dict(width=0)),
-            opacity=0.55,
-            text=[f"{value:+.2f}%" for value in values],
-            textposition="outside",
-            hovertemplate="%{x}<br>" + name + ": %{y:+.2f}%<extra></extra>",
-        ))
-    all_values = capm_values + ff3_values + ff5_values
+    for model, name, color in BACKTEST_COMPARISON_MODELS:
+        labels, values = [], []
+        for scenario, result in scenarios:
+            curve = _comparison_equity(result, f"{model}_bt")
+            if curve is None:
+                continue
+            capital = result.get("capital", curve.iloc[0])
+            labels.append(scenario)
+            values.append(100 * (curve.iloc[-1] / capital - 1))
+        if values:
+            fig.add_bar(name=name, x=labels, y=values, marker_color=color,
+                        text=[f"{value:+.2f}%" for value in values], textposition="outside")
+    if not fig.data:
+        st.info("No portfolio curves are available.")
+        return
+    st.caption("Total returns from initial capital. Backtest periods may differ.")
     fig.update_layout(
         template="plotly_dark",
         barmode="group",
@@ -1505,134 +1567,191 @@ def render_capm_ff3_ff5_backtest_chart(standard_results, fixed_result, key_prefi
         uniformtext_minsize=11,
         uniformtext_mode="hide",
     )
-    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_capm_ff3_ff5_comparison")
+    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_model_returns")
 
+
+def style_backtest_analysis_tabs():
+    st.html("""
+        <style>
+        [class*="st-key-backtest_analysis_tabs_"] [role="tablist"] {
+            background: #151b25;
+            border: 1px solid #304058;
+            border-radius: 0.5rem;
+            gap: 0.25rem;
+        }
+        [class*="st-key-backtest_analysis_tabs_"] [role="tab"] {
+            min-height: 3rem;
+            padding-inline: 1rem;
+            white-space: nowrap;
+        }
+        [class*="st-key-backtest_analysis_tabs_"] [role="tab"] p {
+            font-size: 0.95rem;
+            font-weight: 650;
+        }
+        [class*="st-key-backtest_analysis_tabs_"] [role="tab"][aria-selected="true"] {
+            color: #ffc168;
+            background: #23262d;
+            box-shadow: inset 0 -3px #ffc168;
+        }
+        [class*="st-key-backtest_analysis_tabs_"] [data-baseweb="tab-highlight"] {
+            background-color: #ffc168 !important;
+        }
+        </style>
+    """)
 
 def render_backtesting_comparison(standard_results, fixed_result, key_prefix="live"):
     if not isinstance(standard_results, dict) or not isinstance(fixed_result, dict):
         return
     if "ff3_bt" in standard_results:
         standard_results = {"fixed": standard_results}
-    render_capm_ff3_ff5_backtest_chart(standard_results, fixed_result, key_prefix=key_prefix)
     st.subheader("Backtesting Comparison & Diagnostics")
-    st.caption("Common-date growth is normalized to 1 EUR. Strategies retain their original weights and optimization rules.")
-
-    model_specs = [("CAPM", "capm_bt", "#9B59B6"),
-                   ("FF3", "ff3_bt", "#28599B"),
-                   ("FF5", "ff5_bt", "#388545")]
     scenarios = [("Fixed Horizon", fixed_result)] + [
         (f"Walk-Forward {policy.title()}", result)
         for policy, result in standard_results.items() if isinstance(result, dict)
     ]
-    curves = {}
-    for scenario, result in scenarios:
-        for model, key, color in model_specs:
-            equity = _comparison_equity(result, key)
-            if equity is not None:
-                curves[f"{scenario} · {model}"] = (equity, color, scenario)
-    if len(curves) >= 2:
-        common_dates = None
-        for equity, _, _ in curves.values():
-            common_dates = equity.index if common_dates is None else common_dates.intersection(equity.index)
-        common_dates = common_dates.sort_values()
-        if len(common_dates) >= 2:
-            growth = pd.DataFrame({
-                name: eq.reindex(common_dates) / eq.reindex(common_dates).iloc[0]
-                for name, (eq, _, _) in curves.items()
-            })
-            st.markdown("##### Matched out-of-sample dates — CAPM / FF3 / FF5")
-            st.caption(f"Shared period: {common_dates[0]:%Y-%m-%d} to {common_dates[-1]:%Y-%m-%d} "
-                       f"({len(common_dates)} observations). Dates are matched; holdings can differ.")
-            st.dataframe((growth.iloc[-1] - 1).rename("Common-date return").to_frame()
-                         .style.format("{:+.2%}"), use_container_width=True)
-            fig = go.Figure()
-            for name, (eq, color, scenario) in curves.items():
-                fig.add_trace(go.Scatter(
-                    x=common_dates, y=growth[name], mode="lines", name=name,
-                    line=dict(color=color, width=2,
-                              dash="solid" if scenario == "Fixed Horizon" else
-                              "dash" if "Dynamic" in scenario else "dot"),
-                    opacity=0.8,
-                ))
-            fig.update_layout(xaxis_title="Date", yaxis_title="Growth of 1 EUR",
-                              hovermode="x unified", template="plotly_dark")
-            st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_matched_capm_ff3_ff5_growth")
-        else:
-            st.info("Fewer than two shared trading dates for the matched comparison.")
+    panels = ["Backtest Performance", "Matched Out-of-Sample Dates"]
+    if "fixed" in standard_results:
+        panels.append("Rebalance vs Hold")
+    panels.append("Concentration, Turnover and Factor Coverage")
+    style_backtest_analysis_tabs()
+    with st.container(key=f"backtest_analysis_tabs_diagnostics_{key_prefix}"):
+        tabs = dict(zip(panels, st.tabs(panels, key=f"{key_prefix}_diagnostics_tabs", on_change="rerun")))
+    returns_panel = tabs["Backtest Performance"]
+    matched_panel = tabs["Matched Out-of-Sample Dates"]
+    if returns_panel.open:
+        with returns_panel:
+            render_backtest_return_chart(scenarios, key_prefix)
+
+    if matched_panel.open:
+        with matched_panel:
+            curves = {}
+            for scenario, result in scenarios:
+                for model, label, color in BACKTEST_COMPARISON_MODELS:
+                    equity = _comparison_equity(result, f"{model}_bt")
+                    if equity is not None:
+                        curves[f"{scenario} · {label}"] = (equity, color, scenario)
+            if len(curves) >= 2:
+                common_dates = None
+                for equity, _, _ in curves.values():
+                    common_dates = equity.index if common_dates is None else common_dates.intersection(equity.index)
+                common_dates = common_dates.sort_values()
+                if len(common_dates) >= 2:
+                    growth = pd.DataFrame({
+                        name: eq.reindex(common_dates) / eq.reindex(common_dates).iloc[0]
+                        for name, (eq, _, _) in curves.items()
+                    })
+                    st.caption(f"Shared period: {common_dates[0]:%Y-%m-%d} to {common_dates[-1]:%Y-%m-%d} "
+                               f"({len(common_dates)} observations). Dates are matched; holdings can differ.")
+                    fig = go.Figure()
+                    for name, (eq, color, scenario) in curves.items():
+                        fig.add_trace(go.Scatter(
+                            x=common_dates, y=growth[name], mode="lines", name=name,
+                            line=dict(color=color, width=2,
+                                      dash="solid" if scenario == "Fixed Horizon" else
+                                      "dash" if "Dynamic" in scenario else "dot"),
+                            opacity=0.8,
+                        ))
+                    fig.update_layout(xaxis_title="Date", yaxis_title="Growth of 1 unit",
+                                      hovermode="x unified", template="plotly_dark")
+                    st.plotly_chart(fig, use_container_width=True, key=f"{key_prefix}_matched_capm_ff3_ff5_growth")
+                    st.dataframe((growth.iloc[-1] - 1).rename("Common-date return").to_frame()
+                                 .style.format("{:+.2%}"), use_container_width=True)
+                else:
+                    st.info("Fewer than two shared trading dates for the matched comparison.")
 
     if "fixed" in standard_results:
-        wf = standard_results["fixed"]
-        st.markdown("##### Same initial portfolio: rebalance vs hold — CAPM / FF3 / FF5")
-        st.caption("Each Buy & Hold uses its own model's initial weights and start date. "
-                   "Fractional shares remain fixed; transaction costs are excluded.")
-        rows = []
-        fig2 = go.Figure()
-        for model, key, color in model_specs:
-            wf_equity = _comparison_equity(wf, key)
-            cf = wf.get(f"{model.lower()}_same_initial_buy_hold")
-            if wf_equity is None or not isinstance(cf, pd.Series):
-                continue
-            cf = cf.copy()
-            cf.index = pd.to_datetime(cf.index).normalize()
-            if not cf.index.equals(wf_equity.index) or cf.isna().any() or (cf <= 0).any():
-                continue
-            wf_ret = wf_equity.iloc[-1] / wf_equity.iloc[0] - 1
-            bh_ret = cf.iloc[-1] / cf.iloc[0] - 1
-            rows.extend([
-                {"Model": model, "Strategy": "Walk-Forward Fixed", "Return": wf_ret,
-                 "Start date": wf_equity.index[0].date(), "End date": wf_equity.index[-1].date()},
-                {"Model": model, "Strategy": "Same-initial Buy & Hold", "Return": bh_ret,
-                 "Start date": wf_equity.index[0].date(), "End date": wf_equity.index[-1].date()},
-                {"Model": model, "Strategy": "Difference (pp)", "Return": 100*(wf_ret-bh_ret),
-                 "Start date": wf_equity.index[0].date(), "End date": wf_equity.index[-1].date()},
-            ])
-            for name, equity, dash in (("Walk-Forward", wf_equity, "solid"),
-                                       ("Buy & Hold", cf, "dash")):
-                fig2.add_trace(go.Scatter(x=equity.index, y=equity/equity.iloc[0],
-                                          name=f"{model} {name}", mode="lines",
-                                          line=dict(color=color, dash=dash, width=2), opacity=0.85))
-        if rows:
-            display_rows = pd.DataFrame(rows)
-            display_rows["Return"] = [f"{v:+.2f} pp" if strategy == "Difference (pp)"
-                                      else f"{v:+.2%}" for v, strategy in
-                                      zip(display_rows["Return"], display_rows["Strategy"])]
-            st.dataframe(display_rows, use_container_width=True, hide_index=True)
-            fig2.update_layout(xaxis_title="Date", yaxis_title="Growth of 1 EUR",
-                               hovermode="x unified", template="plotly_dark")
-            st.plotly_chart(fig2, use_container_width=True, key=f"{key_prefix}_same_initial_capm_ff3_ff5_growth")
-        else:
-            st.info("Same-initial comparisons are not stored for this run. "
-                    "Run Walk-Forward Fixed again to populate them.")
-    st.markdown("##### Concentration, turnover and factor coverage")
-    diag_rows = {}
-    for label, result in [(f"Walk-Forward {k.title()}", v)
-                          for k, v in standard_results.items() if isinstance(v, dict)] + [
-                              ("Fixed Horizon", fixed_result)]:
-        diag = _comparison_diagnostics(result)
-        if diag is None:
-            continue
-        attr = result.get("ff3_performance_attribution")
-        if isinstance(attr, dict):
-            diag["Factor coverage"] = (f"{attr.get('covered_days', 0)}/"
-                                       f"{attr.get('total_days', 0)}")
-            diag["Unattributed contribution"] = float(
-                attr.get("summary", pd.Series(dtype=float)).get("Unattributed days", 0.0))
-        diag_rows[label] = diag
-    if diag_rows:
-        diag_df = pd.DataFrame(diag_rows).T
-        st.dataframe(diag_df.style.format({
-            "Largest initial weight": "{:.1%}",
-            "Top-3 initial concentration": "{:.1%}",
-            "Initial HHI": "{:.3f}",
-            "Target-weight turnover proxy (ex initial)": "{:.1%}",
-            "Unattributed contribution": "{:+.2%}",
-        }, na_rep="—"), use_container_width=True)
-        st.caption("Turnover is half the absolute change in successive TARGET weights, "
-                   "not drift-adjusted executed trade turnover. "
-                   "Sector concentration and actual trading costs are not estimated here.")
-    st.warning("Factor attribution may be incomplete when recent Fama–French data "
-               "are unavailable. 'Unattributed days' reconciles realized P&L "
-               "but does not assign missing factor contributions.")
+        hold_panel = tabs["Rebalance vs Hold"]
+        if hold_panel.open:
+            with hold_panel:
+                wf = standard_results["fixed"]
+                st.caption("Each Buy & Hold uses its own model's initial weights and start date. "
+                           "Fractional shares remain fixed; transaction costs are excluded.")
+                rows = []
+                fig2 = go.Figure()
+                for model, label, color in BACKTEST_COMPARISON_MODELS:
+                    curve = wf.get(f"{model}_bt")
+                    if isinstance(curve, pd.DataFrame) and "Gross Portfolio Value" in curve:
+                        wf_equity = _comparison_equity({"gross": curve["Gross Portfolio Value"]}, "gross")
+                    elif wf.get("transaction_cost_preset") is None and not wf.get("transaction_cost_summary"):
+                        wf_equity = _comparison_equity(wf, f"{model}_bt")
+                    else:
+                        continue
+                    cf = wf.get(f"{model}_same_initial_buy_hold")
+                    if wf_equity is None or not isinstance(cf, pd.Series):
+                        continue
+                    cf = cf.copy()
+                    cf.index = pd.to_datetime(cf.index).normalize()
+                    if not cf.index.equals(wf_equity.index) or cf.isna().any() or (cf <= 0).any():
+                        continue
+                    wf_ret = wf_equity.iloc[-1] / wf_equity.iloc[0] - 1
+                    bh_ret = cf.iloc[-1] / cf.iloc[0] - 1
+                    rows.extend([
+                        {"Model": label, "Strategy": "Walk-Forward Fixed", "Return": wf_ret,
+                         "Start date": wf_equity.index[0].date(), "End date": wf_equity.index[-1].date()},
+                        {"Model": label, "Strategy": "Same-initial Buy & Hold", "Return": bh_ret,
+                         "Start date": wf_equity.index[0].date(), "End date": wf_equity.index[-1].date()},
+                        {"Model": label, "Strategy": "Difference (pp)", "Return": 100*(wf_ret-bh_ret),
+                         "Start date": wf_equity.index[0].date(), "End date": wf_equity.index[-1].date()},
+                    ])
+                    for name, equity, dash in (("Walk-Forward", wf_equity, "solid"),
+                                               ("Buy & Hold", cf, "dash")):
+                        fig2.add_trace(go.Scatter(x=equity.index, y=equity/equity.iloc[0],
+                                                  name=f"{label} {name}", mode="lines",
+                                                  line=dict(color=color, dash=dash, width=2), opacity=0.85))
+                if rows:
+                    display_rows = pd.DataFrame(rows)
+                    display_rows["Return"] = [f"{v:+.2f} pp" if strategy == "Difference (pp)"
+                                              else f"{v:+.2%}" for v, strategy in
+                                              zip(display_rows["Return"], display_rows["Strategy"])]
+                    st.dataframe(display_rows, use_container_width=True, hide_index=True)
+                    fig2.update_layout(xaxis_title="Date", yaxis_title="Growth of 1 unit",
+                                       hovermode="x unified", template="plotly_dark")
+                    st.plotly_chart(fig2, use_container_width=True, key=f"{key_prefix}_same_initial_capm_ff3_ff5_growth")
+                else:
+                    st.info("Same-initial comparisons are not stored for this run. "
+                            "Run Walk-Forward Fixed again to populate them.")
+    diagnostic_panel = tabs["Concentration, Turnover and Factor Coverage"]
+    if diagnostic_panel.open:
+        with diagnostic_panel:
+            available = [
+                (model, label) for model, label, _ in BACKTEST_COMPARISON_MODELS
+                if any(isinstance(run.get(f"{model}_weights_history"), pd.DataFrame)
+                       and not run[f"{model}_weights_history"].empty for _, run in scenarios)
+            ]
+            if not available:
+                st.info("No portfolio weights are available.")
+                return
+            labels = dict(available)
+            model = st.selectbox("Portfolio", list(labels), format_func=labels.__getitem__,
+                                 key=f"{key_prefix}_diagnostic_model")
+            diag_rows = {}
+            for label, result in scenarios:
+                diag = _comparison_diagnostics(result, model)
+                if diag is None:
+                    continue
+                if model != "capm":
+                    complete_factor_attributions(result)
+                attr = result.get(f"{model}_performance_attribution")
+                if isinstance(attr, dict):
+                    diag["Factor coverage"] = f"{attr.get('covered_days', 0)}/{attr.get('total_days', 0)}"
+                    diag["Unattributed contribution"] = float(
+                        attr.get("summary", pd.Series(dtype=float)).get("Unattributed days", 0.0))
+                diag_rows[label] = diag
+            if diag_rows:
+                diag_df = pd.DataFrame(diag_rows).T
+                st.dataframe(diag_df.style.format({
+                    "Largest initial weight": "{:.1%}",
+                    "Top-3 initial concentration": "{:.1%}",
+                    "Initial HHI": "{:.3f}",
+                    "Target-weight turnover proxy (ex initial)": "{:.1%}",
+                    "Unattributed contribution": "{:+.2%}",
+                }, na_rep="—"), use_container_width=True)
+                st.caption("Turnover is half the absolute change in successive TARGET weights, "
+                           "not drift-adjusted executed trade turnover. "
+                           "Sector concentration and actual trading costs are not estimated here.")
+            if model != "capm":
+                st.caption("Factor coverage depends on available Fama–French observations. "
+                           "Unattributed days retain their realized P&L.")
 
 
 def calculate_drawdown(backtest_data):
@@ -2181,15 +2300,6 @@ def run_fixed_horizon_engine(
         [ff3_weights.reindex(test_prices.columns).fillna(0.0)],
         index=[effective_start],
     )
-    ff3_aligned_stats = ff3_stats.reindex(ff3_weights.index)
-    ff3_factor_exposure_history = pd.DataFrame([{
-        "Market Beta": float((ff3_weights * ff3_aligned_stats["Beta MKT"]).sum()),
-        "SMB Exposure": float((ff3_weights * ff3_aligned_stats["Beta SMB"]).sum()),
-        "HML Exposure": float((ff3_weights * ff3_aligned_stats["Beta HML"]).sum()),
-        "Active Assets": int((ff3_weights > 1e-10).sum()),
-    }], index=pd.DatetimeIndex([effective_start], name="Rebalance Date"))
-
-
     ff5_weights_history = pd.DataFrame(
         [ff5_weights.reindex(test_prices.columns).fillna(0.0)],
         index=[effective_start],
@@ -2202,16 +2312,20 @@ def run_fixed_horizon_engine(
         [ff5_factor_weights.reindex(test_prices.columns).fillna(0.0)],
         index=[effective_start],
     )
-    ff5_aligned_stats = ff5_stats.reindex(ff5_weights.index)
-    ff5_factor_exposure_history = pd.DataFrame([{
-        **{label: float((ff5_weights * ff5_aligned_stats[beta]).sum())
-           for label, beta in (("Market Beta", "Beta MKT"),
-                               ("SMB Exposure", "Beta SMB"),
-                               ("HML Exposure", "Beta HML"),
-                               ("RMW Exposure", "Beta RMW"),
-                               ("CMA Exposure", "Beta CMA"))},
-        "Active Assets": int((ff5_weights > 1e-10).sum()),
-    }], index=pd.DatetimeIndex([effective_start], name="Rebalance Date"))
+    def exposure_history(weights, stats):
+        beta_columns = {
+            "Beta MKT": "Market Beta", "Beta SMB": "SMB Exposure",
+            "Beta HML": "HML Exposure", "Beta RMW": "RMW Exposure", "Beta CMA": "CMA Exposure",
+        }
+        available = stats.columns.intersection(beta_columns)
+        exposure = stats.loc[weights.index, available].mul(weights, axis=0).sum().rename(beta_columns)
+        exposure["Active Assets"] = int((weights > 1e-10).sum())
+        return pd.DataFrame([exposure], index=pd.DatetimeIndex([effective_start], name="Rebalance Date"))
+
+    ff3_factor_exposure_history = exposure_history(ff3_weights, ff3_stats)
+    ff5_factor_exposure_history = exposure_history(ff5_weights, ff5_stats)
+    ff3_factor_cov_exposure_history = exposure_history(ff3_factor_weights, ff3_stats)
+    ff5_factor_cov_exposure_history = exposure_history(ff5_factor_weights, ff5_stats)
 
     min_vol_weights_history = (
         pd.DataFrame(
@@ -2364,9 +2478,11 @@ def run_fixed_horizon_engine(
 
         "ff3_factor_bt": ff3_factor_bt,
         "ff3_factor_weights_history": ff3_factor_weights_history,
+        "ff3_factor_cov_exposure_history": ff3_factor_cov_exposure_history,
         "ff3_factor_bt_metrics": ff3_factor_bt_metrics,
         "ff5_factor_bt": ff5_factor_bt,
         "ff5_factor_weights_history": ff5_factor_weights_history,
+        "ff5_factor_cov_exposure_history": ff5_factor_cov_exposure_history,
         "ff5_factor_bt_metrics": ff5_factor_bt_metrics,
         "ff3_bt": ff3_bt,
         "ff3_weights_history": ff3_weights_history,
@@ -2579,6 +2695,8 @@ def run_backtest_engine(
         ff5_factors=ff5_factors, eurusd_prices=eurusd_prices,
         ff5_exposure_records=ff5_exposure_records,
     )
+    ff3_factor_records = []
+    ff5_factor_records = []
     ff3_factor_bt, ff3_factor_weights_history = backtest_portfolio(
         prices, strategy="ff3_factor_cov_max_sharpe", market=market,
         initial_capital=capital, lookback_days=lookback_days,
@@ -2588,6 +2706,7 @@ def run_backtest_engine(
         historical_fundamentals=historical_fundamentals,
         active_factors=active_factors, transaction_costs=transaction_costs,
         ff3_factors=ff3_factors, eurusd_prices=eurusd_prices,
+        ff3_exposure_records=ff3_factor_records,
     )
     ff5_factor_bt, ff5_factor_weights_history = backtest_portfolio(
         prices, strategy="ff5_factor_cov_max_sharpe", market=market,
@@ -2598,7 +2717,11 @@ def run_backtest_engine(
         historical_fundamentals=historical_fundamentals,
         active_factors=active_factors, transaction_costs=transaction_costs,
         ff5_factors=ff5_factors, eurusd_prices=eurusd_prices,
+        ff5_exposure_records=ff5_factor_records,
     )
+
+    ff3_factor_cov_exposure_history = pd.DataFrame(ff3_factor_records).set_index("Rebalance Date")
+    ff5_factor_cov_exposure_history = pd.DataFrame(ff5_factor_records).set_index("Rebalance Date")
 
     ff5_factor_exposure_history = pd.DataFrame(ff5_exposure_records)
     if not ff5_factor_exposure_history.empty:
@@ -2894,9 +3017,11 @@ def run_backtest_engine(
 
         "ff3_factor_bt": ff3_factor_bt,
         "ff3_factor_weights_history": ff3_factor_weights_history,
+        "ff3_factor_cov_exposure_history": ff3_factor_cov_exposure_history,
         "ff3_factor_bt_metrics": ff3_factor_bt_metrics,
         "ff5_factor_bt": ff5_factor_bt,
         "ff5_factor_weights_history": ff5_factor_weights_history,
+        "ff5_factor_cov_exposure_history": ff5_factor_cov_exposure_history,
         "ff5_factor_bt_metrics": ff5_factor_bt_metrics,
         "ff3_bt": ff3_bt,
         "ff3_weights_history": ff3_weights_history,
@@ -2966,6 +3091,372 @@ def run_backtest_engine(
     }
 
 
+def render_nav_benchmark_chart(values, benchmark, key):
+    lines = pd.concat([values.rename("Portfolio"), benchmark.rename("Benchmark")], axis=1).sort_index()
+    paired = lines.dropna()
+    figure = go.Figure()
+    if len(paired) > 1:
+        # Insert the intersection where the relative NAV changes sign.
+        spread = paired["Portfolio"] - paired["Benchmark"]
+        crossing = spread.mul(spread.shift()).lt(0)
+        for date in spread.index[crossing]:
+            position = spread.index.get_loc(date)
+            previous = spread.index[position - 1]
+            fraction = spread.loc[previous] / (spread.loc[previous] - spread.loc[date])
+            intersection = previous + (date - previous) * fraction
+            value = paired.at[previous, "Benchmark"] + fraction * (
+                paired.at[date, "Benchmark"] - paired.at[previous, "Benchmark"]
+            )
+            paired.loc[intersection] = (value, value)
+        paired = paired.sort_index()
+        for upper, color in (
+            (paired[["Portfolio", "Benchmark"]].max(axis=1), "rgba(52,211,153,0.30)"),
+            (paired[["Portfolio", "Benchmark"]].min(axis=1), "rgba(248,113,113,0.36)"),
+        ):
+            figure.add_scatter(
+                x=list(paired.index) + list(paired.index[::-1]),
+                y=list(upper) + list(paired["Benchmark"].iloc[::-1]),
+                fill="toself", fillcolor=color, mode="lines", line_width=0, hoverinfo="skip",
+            )
+    if not benchmark.empty:
+        figure.add_scatter(x=benchmark.index, y=benchmark, name="Benchmark",
+                           mode="lines", line=dict(color="#9caec6", width=1, dash="dot"))
+    if not values.equals(benchmark):
+        figure.add_scatter(x=values.index, y=values, name="Portfolio",
+                           mode="lines", line=dict(color="#e1ecfc", width=1.3))
+    figure.update_layout(
+        height=74, margin=dict(l=0, r=0, t=4, b=4), showlegend=False,
+        xaxis=dict(visible=False), yaxis=dict(visible=False),
+        paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+        hovermode="x unified",
+    )
+    st.plotly_chart(figure, width="stretch", key=key, config={"displayModeBar": False})
+
+
+
+# Bloomberg-inspired portfolio quadrant framing: subtle, not saturated.
+st.markdown("""<style>
+/* Both columns of each model row stretch to the same height. */
+[data-testid="stHorizontalBlock"]:has(.st-key-portfolio_quadrant_minimum_volatility):has(.st-key-portfolio_quadrant_maximum_sharpe),
+[data-testid="stHorizontalBlock"]:has(.st-key-portfolio_quadrant_risk_parity):has(.st-key-portfolio_quadrant_hierarchical_risk_parity) {
+  align-items: stretch !important;
+}
+[data-testid="stColumn"]:has(> [data-testid="stVerticalBlock"] .st-key-portfolio_quadrant_minimum_volatility),
+[data-testid="stColumn"]:has(> [data-testid="stVerticalBlock"] .st-key-portfolio_quadrant_maximum_sharpe),
+[data-testid="stColumn"]:has(> [data-testid="stVerticalBlock"] .st-key-portfolio_quadrant_risk_parity),
+[data-testid="stColumn"]:has(> [data-testid="stVerticalBlock"] .st-key-portfolio_quadrant_hierarchical_risk_parity) {
+  align-self: stretch !important;
+}
+[data-testid="stColumn"]:has(.st-key-portfolio_quadrant_minimum_volatility) > [data-testid="stVerticalBlock"],
+[data-testid="stColumn"]:has(.st-key-portfolio_quadrant_maximum_sharpe) > [data-testid="stVerticalBlock"],
+[data-testid="stColumn"]:has(.st-key-portfolio_quadrant_risk_parity) > [data-testid="stVerticalBlock"],
+[data-testid="stColumn"]:has(.st-key-portfolio_quadrant_hierarchical_risk_parity) > [data-testid="stVerticalBlock"] {
+  height:100% !important;
+}
+.st-key-portfolio_quadrant_minimum_volatility,
+.st-key-portfolio_quadrant_maximum_sharpe,
+.st-key-portfolio_quadrant_risk_parity,
+.st-key-portfolio_quadrant_hierarchical_risk_parity {
+  flex: 1 1 auto !important;
+  min-height: 100% !important;
+  background: rgba(21, 27, 36, 0.54) !important;
+  border: 1px solid rgba(126, 145, 166, 0.32) !important;
+  border-radius: 5px !important;
+  padding: 16px 15px 18px !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,0.035) !important;
+}
+.st-key-portfolio_quadrant_minimum_volatility { border-top: 3px solid #D7A24D !important; }
+.st-key-portfolio_quadrant_maximum_sharpe { border-top: 3px solid #67A7C9 !important; }
+.st-key-portfolio_quadrant_risk_parity { border-top: 3px solid #9B8CC9 !important; }
+.st-key-portfolio_quadrant_hierarchical_risk_parity { border-top: 3px solid #6CA997 !important; }
+.st-key-portfolio_quadrant_minimum_volatility h3,
+.st-key-portfolio_quadrant_maximum_sharpe h3,
+.st-key-portfolio_quadrant_risk_parity h3,
+.st-key-portfolio_quadrant_hierarchical_risk_parity h3 {
+  font-size: 1.18rem !important;
+  letter-spacing: .01em;
+  padding-bottom: 8px;
+  border-bottom: 1px solid rgba(160,174,192,.18);
+}
+
+/* Backtesting configuration panels — matching portfolio quadrants. */
+[data-testid="stHorizontalBlock"]:has(.st-key-backtest_standard_panel):has(.st-key-backtest_fixed_panel) { align-items: stretch !important; }
+[data-testid="stColumn"]:has(.st-key-backtest_standard_panel),
+[data-testid="stColumn"]:has(.st-key-backtest_fixed_panel) { align-self: stretch !important; }
+[data-testid="stColumn"]:has(.st-key-backtest_standard_panel) > [data-testid="stVerticalBlock"],
+[data-testid="stColumn"]:has(.st-key-backtest_fixed_panel) > [data-testid="stVerticalBlock"] { height: 100% !important; }
+.st-key-backtest_standard_panel, .st-key-backtest_fixed_panel {
+  flex: 1 1 auto !important;
+  min-height: 100% !important;
+  background: rgba(21,27,36,.40) !important;
+  border: 1px solid rgba(126,145,166,.28) !important;
+  border-radius: 6px !important;
+  padding: 16px 16px 18px !important;
+  box-shadow: inset 0 1px 0 rgba(255,255,255,.025) !important;
+}
+.st-key-backtest_standard_panel { border-top: 3px solid #D7A24D !important; }
+.st-key-backtest_fixed_panel { border-top: 3px solid #67A7C9 !important; }
+.st-key-backtest_standard_panel h3, .st-key-backtest_fixed_panel h3 {
+  font-size: 1.18rem !important;
+  padding-bottom: 8px !important;
+  border-bottom: 1px solid rgba(160,174,192,.18) !important;
+}
+.st-key-backtest_standard_panel [data-testid="stAlert"],
+.st-key-backtest_fixed_panel [data-testid="stAlert"] {
+  background: rgba(28,65,92,.32) !important;
+  border: 1px solid rgba(88,155,202,.19) !important;
+  border-radius: 6px !important;
+}
+</style>""", unsafe_allow_html=True)
+
+def render_final_portfolio_values(result, key_suffix):
+    strategies = (
+        ("Maximum Sharpe", "max_sharpe_bt"), ("CAPM Maximum Sharpe", "capm_bt"),
+        ("Minimum Volatility", "min_vol_bt"), ("Risk Parity", "risk_parity_bt"),
+        ("FF3 Maximum Sharpe", "ff3_bt"), ("FF5 Maximum Sharpe", "ff5_bt"),
+        ("FF3 Factor Cov", "ff3_factor_bt"), ("FF5 Factor Cov", "ff5_factor_bt"),
+        ("HRP", "hrp_bt"), ("Equal Weight", "equal_weight_bt"), ("Benchmark", "ftse_mib_bt"),
+    )
+    capital = result["capital"]
+    cards = []
+    for label, key in strategies:
+        curve = result.get(key)
+        if curve is not None and not curve.empty:
+            values = curve["Portfolio Value"]
+            nav = float(values.iloc[-1])
+            cards.append((label, nav, nav / capital - 1, values))
+    cards.sort(key=lambda card: card[2], reverse=True)
+
+    st.subheader("Final Portfolio Value")
+    st.html("""
+        <style>
+        [class*="st-key-final_nav_card_"] {
+            background: linear-gradient(155deg, #19253a 0%, #141c29 65%, #111824 100%);
+            border: 1px solid #304058;
+            border-radius: 0.85rem;
+            box-shadow: 0 4px 16px #0002;
+            padding: 0.65rem 0.8rem;
+        }
+        [class*="st-key-final_nav_cards_"] [data-testid="stMetricLabel"] {
+            color: #c1cde0;
+            font-weight: 600;
+        }
+        [class*="st-key-final_nav_cards_"] [data-testid="stMetricValue"] {
+            color: #f2f6ff;
+            font-variant-numeric: tabular-nums;
+        }
+        </style>
+    """)
+    benchmark_curve = result.get("ftse_mib_bt")
+    benchmark = (benchmark_curve["Portfolio Value"] if benchmark_curve is not None
+                 else pd.Series(dtype=float))
+    if not benchmark.empty:
+        st.caption("Mini charts · dotted line: benchmark · green: portfolio above · red: portfolio below")
+    with st.container(key=f"final_nav_cards_{key_suffix}"):
+        for start in range(0, len(cards), 4):
+            for offset, (column, card) in enumerate(zip(st.columns(4), cards[start:start + 4])):
+                label, nav, total_return, trend = card
+                card_key = f"{key_suffix}_{start + offset}"
+                with column.container(key=f"final_nav_card_{card_key}"):
+                    metric, chart = st.columns([3, 2], gap="small", vertical_alignment="center")
+                    metric.metric(label, f"€{nav:,.2f}", delta=f"{total_return:+.2%}",
+                                  delta_description="Total return")
+                    with chart:
+                        render_nav_benchmark_chart(trend, benchmark, f"nav_chart_{card_key}")
+
+
+def render_backtest_parameters(result, lookback_label, backtest_period_label, rebalance_label):
+    from html import escape
+
+    start = result["effective_start"].strftime("%d/%m/%Y")
+    end = result["effective_end"].strftime("%d/%m/%Y")
+    fields = (
+        ("Initial Capital", f"€{result['capital']:,.2f}"),
+        ("Estimation Window", lookback_label),
+        ("Backtest Period", backtest_period_label),
+        ("Rebalancing", rebalance_label),
+        ("Backtest Start", start),
+        ("Effective Backtest", f"{start} → {end}"),
+    )
+    items = "".join(
+        f"<div><dt>{label}</dt><dd>{escape(str(value))}</dd></div>"
+        for label, value in fields
+    )
+    st.html("""
+        <style>
+        .backtest-parameters { border: 1px solid #3b414a; border-radius: 0.35rem;
+                               background: #101216; color: #e1e7ee;
+                               font: 0.86rem/1.4 "IBM Plex Mono", ui-monospace, monospace;
+                               font-variant-numeric: tabular-nums; }
+        .backtest-parameters dl { margin: 0; display: grid; gap: 1px;
+                                  background: #272d35;
+                                  grid-template-columns: repeat(auto-fit, minmax(9rem, 1fr)); }
+        .backtest-parameters dl > div { background: #101216; min-width: 0; }
+        .backtest-parameters dt { color: #ffc168; background: #202328;
+                                  border-bottom: 2px solid #a96c2a; padding: 0.42rem 0.85rem;
+                                  font-size: 0.78rem; font-weight: 650; text-transform: uppercase; }
+        .backtest-parameters dd { margin: 0; padding: 0.55rem 0.85rem;
+                                  font-weight: 600; overflow-wrap: anywhere; }
+        </style>
+        <section class="backtest-parameters" aria-label="Backtest parameters"><dl>"""
+        + items + "</dl></section>"
+    )
+
+
+def render_terminal_table(comparison, formats, *, index_label, signed=()):
+    from html import escape
+
+    headers = "".join(
+        f'<th scope="col" aria-sort="none"><button type="button">{escape(str(column))}</button></th>'
+        for column in (index_label, *comparison.columns)
+    )
+    rows = []
+    for strategy, metrics in comparison.iterrows():
+        cells = []
+        for column, value in metrics.items():
+            tone = ""
+            if pd.isna(value):
+                text = "—"
+            else:
+                text = formats.get(column, "{}").format(value)
+                if column in signed:
+                    tone = "up" if value > 0 else "down" if value < 0 else ""
+            sort_value = "" if pd.isna(value) else str(float(value))
+            cells.append(f'<td class="{tone}" data-sort="{escape(sort_value)}">{escape(text)}</td>')
+        row_class = ' class="benchmark"' if strategy == "Benchmark" else ""
+        rows.append(f'<tr{row_class}><th scope="row">{escape(str(strategy))}</th>{"".join(cells)}</tr>')
+
+    table_label = escape(index_label)
+    st.html("""
+        <style>
+        .strategy-terminal { overflow-x: auto; border: 1px solid #3b414a; border-radius: 0.35rem;
+                             color: #e1e7ee; background: #101216; }
+        .strategy-terminal table { width: 100%; border-spacing: 0;
+                                   font: 0.86rem/1.4 "IBM Plex Mono", ui-monospace, monospace;
+                                   font-variant-numeric: tabular-nums; }
+        .strategy-terminal th, .strategy-terminal td { padding: 0.42rem 0.85rem; white-space: nowrap; }
+        .strategy-terminal thead th { color: #ffc168; background: #202328;
+                                     border-bottom: 2px solid #a96c2a; text-transform: uppercase; }
+        .strategy-terminal thead button {
+            color: inherit; font: inherit; text-transform: inherit; cursor: pointer;
+            background: transparent; border: 0; padding: 0; text-align: inherit; width: 100%;
+        }
+        .strategy-terminal thead button:hover { color: #ffe0ae; }
+        .strategy-terminal th[aria-sort="ascending"] button::after { content: " ▲"; }
+        .strategy-terminal th[aria-sort="descending"] button::after { content: " ▼"; }
+        .strategy-terminal td, .strategy-terminal thead th { text-align: right; }
+        .strategy-terminal th:first-child { text-align: left; position: sticky; left: 0; z-index: 1; }
+        .strategy-terminal tbody tr { background: #101216; }
+        .strategy-terminal tbody tr:nth-child(even) { background: #171b21; }
+        .strategy-terminal tbody tr:hover { background: #252b34; }
+        .strategy-terminal tbody th { background: inherit; font-weight: 550; }
+        .strategy-terminal tbody th, .strategy-terminal td { border-bottom: 1px solid #272d35; }
+        .strategy-terminal tbody tr.benchmark { background: #1d2a39; }
+        .strategy-terminal .benchmark th, .strategy-terminal .benchmark td {
+            border-top: 1px solid #607287; font-weight: 700;
+        }
+        .strategy-terminal .up { color: #6de0ad; }
+        .strategy-terminal .down { color: #ff9299; }
+        </style>
+        """ + f'<div class="strategy-terminal"><table aria-label="{table_label}"><thead><tr>'  + headers + "</tr></thead><tbody>" + "".join(rows) + """
+        </tbody></table>
+        <script>
+        (() => {
+            const table = document.currentScript.parentElement.querySelector("table");
+            const headers = Array.from(table.tHead.rows[0].cells);
+            const body = table.tBodies[0];
+            headers.forEach((header, index) => {
+                header.querySelector("button").addEventListener("click", () => {
+                    const previous = header.getAttribute("aria-sort");
+                    const ascending = previous === "none" ? index === 0 : previous !== "ascending";
+                    headers.forEach(cell => cell.setAttribute("aria-sort", "none"));
+                    header.setAttribute("aria-sort", ascending ? "ascending" : "descending");
+                    const direction = ascending ? 1 : -1;
+                    const rows = Array.from(body.rows);
+                    rows.sort((a, b) => {
+                        if (index === 0) {
+                            return direction * a.cells[0].textContent.localeCompare(b.cells[0].textContent);
+                        }
+                        const left = a.cells[index].dataset.sort;
+                        const right = b.cells[index].dataset.sort;
+                        if (left === "" || right === "") return Number(left === "") - Number(right === "");
+                        return direction * (Number(left) - Number(right));
+                    });
+                    rows.forEach(row => body.appendChild(row));
+                });
+            });
+        })();
+        </script>
+        </div>""", unsafe_allow_javascript=True
+    )
+
+
+def select_backtest_result(source):
+    choice = st.session_state[f"backtest_result_nav_{source}"]
+    st.session_state["backtest_result_view"] = choice
+    other = "bottom" if source == "top" else "top"
+    st.session_state[f"backtest_result_nav_{other}"] = choice
+    st.session_state["backtest_result_scroll"] = source == "bottom"
+
+
+def render_backtest_result_navigation(options, position):
+    with st.container(key=f"backtest_result_bar_{position}"):
+        st.segmented_control(
+            "Backtest view", list(options), format_func=options.__getitem__,
+            key=f"backtest_result_nav_{position}", selection_mode="single", required=True,
+            label_visibility="collapsed", on_change=select_backtest_result, args=(position,),
+        )
+
+
+def start_backtest_result_navigation(options):
+    selected = st.session_state.get("backtest_result_view")
+    if selected not in options:
+        selected = next(iter(options))
+        st.session_state["backtest_result_view"] = selected
+    for position in ("top", "bottom"):
+        st.session_state[f"backtest_result_nav_{position}"] = selected
+
+    st.html("""
+        <style>
+        [class*="st-key-backtest_result_bar_"] [role="radiogroup"] {
+            gap: 0.55rem;
+        }
+        [class*="st-key-backtest_result_bar_"] button[role="radio"] {
+            min-height: 3.5rem;
+            padding: 0.75rem 1.35rem;
+            border: 1px solid #304058 !important;
+            border-radius: 0.65rem !important;
+            background: linear-gradient(155deg, #19253a, #141c29) !important;
+            color: #d9e4f5 !important;
+        }
+        [class*="st-key-backtest_result_bar_"] button[role="radio"] p {
+            font: 650 1rem/1.25 "IBM Plex Mono", ui-monospace, monospace;
+        }
+        [class*="st-key-backtest_result_bar_"] button[role="radio"]:hover {
+            border-color: #738bad !important;
+        }
+        [class*="st-key-backtest_result_bar_"] button[role="radio"][aria-checked="true"] {
+            color: #ffc168 !important;
+            border-color: #a96c2a !important;
+            background: linear-gradient(155deg, #253247, #192337) !important;
+            box-shadow: inset 0 -3px #ffc168;
+        }
+        </style>
+        <div id="backtest-results-start"></div>
+    """)
+    if len(options) > 1:
+        render_backtest_result_navigation(options, "top")
+    if st.session_state.pop("backtest_result_scroll", False):
+        st.html(f"""
+            <script>
+            requestAnimationFrame(() => requestAnimationFrame(() => {{
+                document.getElementById("backtest-results-start")?.scrollIntoView({{block: "start"}});
+            }}));
+            </script><!-- {selected} -->
+        """, unsafe_allow_javascript=True)
+    return selected
+
+
 def display_backtest_results(
     result,
     title,
@@ -2980,67 +3471,11 @@ def display_backtest_results(
         st.info("These results predate FF3 backtesting. Run Backtests again to include FF3.")
         return
 
-    st.markdown("---")
-
     st.header(title)
 
     st.caption(description)
 
-    cost_summary = result.get("transaction_cost_summary", {})
-    if cost_summary:
-        st.subheader("Transaction Costs — Gross vs Net")
-        st.caption("Costs are deducted from the portfolio cash at each actual rebalance; "
-                   "gross is a cost-free counterfactual using the same target weights. "
-                   "The index benchmark has no simulated trading costs.")
-        st.dataframe(pd.DataFrame.from_dict(cost_summary, orient="index").round(2),
-                     use_container_width=True)
-
-    # =====================================================
-    # CONFIGURATION SUMMARY
-    # =====================================================
-
-    info_col1, info_col2, info_col3, info_col4, info_col5 = (
-        st.columns(5)
-    )
-
-    info_col1.metric(
-        "Initial Capital",
-        f"€{result['capital']:,.2f}",
-    )
-
-    info_col2.metric(
-        "Estimation Window",
-        lookback_label,
-    )
-
-    info_col3.metric(
-        "Backtest Period",
-        backtest_period_label,
-    )
-
-    info_col4.metric(
-        "Rebalancing",
-        rebalance_label,
-    )
-
-    info_col5.metric(
-        "Backtest Start",
-        result[
-            "effective_start"
-        ].strftime("%d/%m/%Y"),
-    )
-
-    st.caption(
-        "Effective backtest: "
-        f"{result['effective_start'].strftime('%d/%m/%Y')} "
-        "→ "
-        f"{result['effective_end'].strftime('%d/%m/%Y')}"
-    )
-
-    # =====================================================
-    # STRATEGY COMPARISON
-    # =====================================================
-
+    render_backtest_parameters(result, lookback_label, backtest_period_label, rebalance_label)
     st.subheader(
         "Strategy Comparison"
     )
@@ -3115,18 +3550,15 @@ def display_backtest_results(
                 "€{:,.2f}"
             )
 
-    st.dataframe(
-        comparison.style.format(
-            comparison_format
-        ),
-        use_container_width=True,
-    )
+    render_terminal_table(comparison, comparison_format, index_label="Strategy",
+                          signed=("Total Return", "CAGR", "Max Drawdown"))
 
     st.caption(
         "The selected benchmark is shown as a passive buy-and-hold "
         "benchmark starting from the same date and "
         "capital as the portfolio strategies."
     )
+
 
     # =====================================================
     # PORTFOLIO GROWTH
@@ -3458,377 +3890,221 @@ def display_backtest_results(
     # REBALANCING HISTORY
     # =====================================================
 
-    if result.get(
-        "is_fixed_horizon",
-        False,
-    ):
+    render_final_portfolio_values(result, result_key)
 
-        st.subheader(
-            "Initial Optimal Allocation"
+    fixed_horizon = result.get("is_fixed_horizon", False)
+    history_title = "Initial Optimal Allocation" if fixed_horizon else "Rebalancing History"
+    style_backtest_analysis_tabs()
+    with st.container(key=f"backtest_analysis_tabs_{result_key}"):
+        history_tab, cost_tab, attribution_tab = st.tabs(
+            [history_title, "Transaction Costs", "Factor Attribution"],
+            key=f"backtest_analysis_view_{result_key}", on_change="rerun",
         )
 
-        st.caption(
-            "These are the portfolio weights calculated "
-            "at the beginning of the backtest using only "
-            "the preceding estimation period. "
-            "The allocation is then held unchanged for "
-            "the entire Fixed-Horizon test."
-        )
+    if history_tab.open:
+        with history_tab:
+            if fixed_horizon:
+                st.caption("The initial target weights determine the quantities held throughout the test.")
+            else:
+                st.caption("Target weights at each rebalance. The table turnover measures changes in target weights.")
 
-    else:
+            rebalance_strategy = st.selectbox(
+                "Strategy",
+                [
+                    "Maximum Sharpe",
+                    "CAPM Maximum Sharpe",
+                    "FF3 Maximum Sharpe",
+                    "FF5 Maximum Sharpe",
+                    "FF3 Factor Cov Maximum Sharpe",
+                    "FF5 Factor Cov Maximum Sharpe",
+                    "Minimum Volatility",
+                    "Risk Parity",
+                    "HRP",
+                    "Equal Weight",
+                ],
+                key=f"rebalance_strategy_{result_key}",
+            )
 
-        st.subheader(
-            "Rebalancing History"
-        )
+            if (
+                rebalance_strategy
+                == "Maximum Sharpe"
+            ):
 
-        st.caption(
-            "The table shows the target portfolio weights "
-            "selected at every rebalance. Turnover measures "
-            "how much of the portfolio allocation changed "
-            "compared with the previous rebalance."
-        )
+                selected_weights_history = (
+                    result[
+                        "max_sharpe_weights_history"
+                    ]
+                )
 
-    rebalance_strategy = st.selectbox(
-        "Strategy",
-        [
-            "Maximum Sharpe",
-            "CAPM Maximum Sharpe",
-            "FF3 Maximum Sharpe",
-            "FF5 Maximum Sharpe",
-            "FF3 Factor Cov Maximum Sharpe",
-            "FF5 Factor Cov Maximum Sharpe",
-            "Minimum Volatility",
-            "Risk Parity",
-            "HRP",
-            "Equal Weight",
-        ],
-        key=f"rebalance_strategy_{result_key}",
-    )
+            elif (
+                rebalance_strategy
+                == "CAPM Maximum Sharpe"
+            ):
 
-    if (
-        rebalance_strategy
-        == "Maximum Sharpe"
-    ):
+                selected_weights_history = (
+                    result["capm_weights_history"]
+                )
 
-        selected_weights_history = (
-            result[
-                "max_sharpe_weights_history"
-            ]
-        )
+            elif rebalance_strategy == "FF3 Maximum Sharpe":
+                selected_weights_history = result["ff3_weights_history"]
 
-    elif (
-        rebalance_strategy
-        == "CAPM Maximum Sharpe"
-    ):
+            elif rebalance_strategy == "FF5 Maximum Sharpe":
+                selected_weights_history = result.get("ff5_weights_history", pd.DataFrame())
 
-        selected_weights_history = (
-            result["capm_weights_history"]
-        )
+            elif rebalance_strategy == "FF3 Factor Cov Maximum Sharpe":
+                selected_weights_history = result.get("ff3_factor_weights_history", pd.DataFrame())
 
-    elif rebalance_strategy == "FF3 Maximum Sharpe":
-        selected_weights_history = result["ff3_weights_history"]
+            elif rebalance_strategy == "FF5 Factor Cov Maximum Sharpe":
+                selected_weights_history = result.get("ff5_factor_weights_history", pd.DataFrame())
 
-    elif rebalance_strategy == "FF5 Maximum Sharpe":
-        selected_weights_history = result.get("ff5_weights_history", pd.DataFrame())
+            elif (
+                rebalance_strategy
+                == "Minimum Volatility"
+            ):
 
-    elif rebalance_strategy == "FF3 Factor Cov Maximum Sharpe":
-        selected_weights_history = result.get("ff3_factor_weights_history", pd.DataFrame())
+                selected_weights_history = (
+                    result[
+                        "min_vol_weights_history"
+                    ]
+                )
 
-    elif rebalance_strategy == "FF5 Factor Cov Maximum Sharpe":
-        selected_weights_history = result.get("ff5_factor_weights_history", pd.DataFrame())
+            elif (
+                rebalance_strategy
+                == "Risk Parity"
+            ):
 
-    elif (
-        rebalance_strategy
-        == "Minimum Volatility"
-    ):
+                selected_weights_history = (
+                    result[
+                        "risk_parity_weights_history"
+                    ]
+                )
 
-        selected_weights_history = (
-            result[
-                "min_vol_weights_history"
-            ]
-        )
+            elif (
+                rebalance_strategy
+                == "HRP"
+            ):
 
-    elif (
-        rebalance_strategy
-        == "Risk Parity"
-    ):
+                selected_weights_history = (
+                    result[
+                        "hrp_weights_history"
+                    ]
+                )
 
-        selected_weights_history = (
-            result[
-                "risk_parity_weights_history"
-            ]
-        )
+            else:
 
-    elif (
-        rebalance_strategy
-        == "HRP"
-    ):
+                selected_weights_history = (
+                    result[
+                        "equal_weight_weights_history"
+                    ]
+                )
 
-        selected_weights_history = (
-            result[
-                "hrp_weights_history"
-            ]
-        )
+            rebalance_table = (
+                prepare_rebalancing_history(
+                    selected_weights_history
+                )
+            )
 
-    else:
+            rebalance_format = {
+                column: "{:.2%}"
+                for column
+                in rebalance_table.columns
+            }
 
-        selected_weights_history = (
-            result[
-                "equal_weight_weights_history"
-            ]
-        )
+            rebalance_table.index = rebalance_table.index.strftime("%Y-%m-%d")
+            curve_key = {
+                "Maximum Sharpe": "max_sharpe_bt", "CAPM Maximum Sharpe": "capm_bt",
+                "FF3 Maximum Sharpe": "ff3_bt", "FF5 Maximum Sharpe": "ff5_bt",
+                "FF3 Factor Cov Maximum Sharpe": "ff3_factor_bt",
+                "FF5 Factor Cov Maximum Sharpe": "ff5_factor_bt",
+                "Minimum Volatility": "min_vol_bt", "Risk Parity": "risk_parity_bt",
+                "HRP": "hrp_bt", "Equal Weight": "equal_weight_bt",
+            }[rebalance_strategy]
+            trade_log = result.get(curve_key, pd.DataFrame()).attrs.get("transaction_log")
+            if trade_log is not None and "Executed Turnover" in trade_log:
+                turnover_series = trade_log.set_index("Rebalance Date")["Executed Turnover"]
+                turnover_series = turnover_series.reindex(selected_weights_history.index)
+                turnover_label = "Executed turnover (buys + sells)"
+            else:
+                turnover_series = calculate_turnover(selected_weights_history)
+                turnover_label = "Target-weight turnover proxy"
+            st.caption(turnover_label)
 
-    rebalance_table = (
-        prepare_rebalancing_history(
-            selected_weights_history
-        )
-    )
+            if len(turnover_series) > 1:
 
-    rebalance_format = {
-        column: "{:.2%}"
-        for column
-        in rebalance_table.columns
-    }
+                average_turnover = (
+                    turnover_series
+                    .iloc[1:]
+                    .mean()
+                )
 
-    st.dataframe(
-        rebalance_table.style.format(
-            rebalance_format
-        ),
-        use_container_width=True,
-    )
+                max_turnover = (
+                    turnover_series
+                    .iloc[1:]
+                    .max()
+                )
 
-    render_ff3_attribution(result, key_suffix=result_key)
+                total_turnover = (
+                    turnover_series
+                    .iloc[1:]
+                    .sum()
+                )
 
-    ff5_exposures = result.get("ff5_factor_exposure_history")
-    if isinstance(ff5_exposures, pd.DataFrame) and not ff5_exposures.empty:
-        st.subheader("FF5 Factor Exposure History")
-        st.dataframe(ff5_exposures.style.format(precision=3), use_container_width=True)
+            else:
 
-    # FF3 factor exposures: target-weighted regression sensitivities at each rebalance.
-    ff3_exposures = result.get("ff3_factor_exposure_history")
-    if isinstance(ff3_exposures, pd.DataFrame) and not ff3_exposures.empty:
-        st.subheader("FF3 Factor Exposure History")
-        st.caption(
-            "Target-weighted FF3 factor loadings estimated using historical data "
-            "at each rebalance. These are sensitivities, not factor returns "
-            "or a performance attribution."
-        )
-        exposure_display = ff3_exposures.copy()
-        exposure_display.index = pd.to_datetime(exposure_display.index)
-        exposure_display.index.name = "Rebalance Date"
-        exposure_format = {
-            name: "{:.3f}" for name in
-            ("Market Beta", "SMB Exposure", "HML Exposure")
-            if name in exposure_display.columns
-        }
-        st.dataframe(exposure_display.style.format(exposure_format),
-                     use_container_width=True)
-        if len(exposure_display) > 1:
-            exposure_fig = go.Figure()
-            for name in ("Market Beta", "SMB Exposure", "HML Exposure"):
-                if name in exposure_display.columns:
-                    exposure_fig.add_trace(go.Scatter(
-                        x=exposure_display.index, y=exposure_display[name],
-                        name=name, mode="lines+markers"))
-            exposure_fig.update_layout(xaxis_title="Rebalance Date",
-                                       yaxis_title="Factor Loading", hovermode="x unified")
-            st.plotly_chart(exposure_fig, use_container_width=True)
+                average_turnover = 0.0
+                max_turnover = 0.0
+                total_turnover = 0.0
 
-    # =====================================================
-    # TURNOVER
-    # =====================================================
+            for column, (label, value, color) in zip(st.columns(3), (
+                ("Average Turnover", average_turnover, "blue"),
+                ("Maximum Turnover", max_turnover, "yellow"),
+                ("Cumulative Turnover", total_turnover, "purple"),
+            )):
+                with column:
+                    colored_metric(label, f"{value:.2%}", color)
 
-    curve_key = {
-        "Maximum Sharpe": "max_sharpe_bt", "CAPM Maximum Sharpe": "capm_bt",
-        "FF3 Maximum Sharpe": "ff3_bt", "FF5 Maximum Sharpe": "ff5_bt",
-        "FF3 Factor Cov Maximum Sharpe": "ff3_factor_bt",
-        "FF5 Factor Cov Maximum Sharpe": "ff5_factor_bt",
-        "Minimum Volatility": "min_vol_bt", "Risk Parity": "risk_parity_bt",
-        "HRP": "hrp_bt", "Equal Weight": "equal_weight_bt",
-    }[rebalance_strategy]
-    trade_log = result.get(curve_key, pd.DataFrame()).attrs.get("transaction_log")
-    if trade_log is not None and "Executed Turnover" in trade_log:
-        turnover_series = trade_log.set_index("Rebalance Date")["Executed Turnover"]
-        turnover_series = turnover_series.reindex(selected_weights_history.index)
-        turnover_label = "Executed turnover (buys + sells)"
-    else:
-        turnover_series = calculate_turnover(selected_weights_history)
-        turnover_label = "Target-weight turnover proxy"
-    st.caption(turnover_label)
+            render_terminal_table(rebalance_table, rebalance_format, index_label="Rebalance Date")
 
-    if len(turnover_series) > 1:
-
-        average_turnover = (
-            turnover_series
-            .iloc[1:]
-            .mean()
-        )
-
-        max_turnover = (
-            turnover_series
-            .iloc[1:]
-            .max()
-        )
-
-        total_turnover = (
-            turnover_series
-            .iloc[1:]
-            .sum()
-        )
-
-    else:
-
-        average_turnover = 0.0
-        max_turnover = 0.0
-        total_turnover = 0.0
-
-    turnover_col1, turnover_col2, turnover_col3 = (
-        st.columns(3)
-    )
-
-    turnover_col1.metric(
-        "Average Turnover",
-        f"{average_turnover:.2%}",
-    )
-
-    turnover_col2.metric(
-        "Maximum Turnover",
-        f"{max_turnover:.2%}",
-    )
-
-    turnover_col3.metric(
-        "Cumulative Turnover",
-        f"{total_turnover:.2%}",
-    )
-
-    # =====================================================
-    # FINAL VALUES
-    # =====================================================
-
-    st.subheader(
-        "Final Portfolio Value"
-    )
-
-    (
-        final_col1,
-        final_col2,
-        final_col3,
-        final_col4,
-        final_col5,
-        final_col6,
-        final_col7,
-    ) = st.columns(7)
-
-    final_max = (
-        result["max_sharpe_bt"]
-        ["Portfolio Value"]
-        .iloc[-1]
-    )
-
-    final_capm = (
-        result["capm_bt"]
-        ["Portfolio Value"]
-        .iloc[-1]
-    )
-
-    final_min = (
-        result["min_vol_bt"]
-        ["Portfolio Value"]
-        .iloc[-1]
-    )
-
-    final_risk_parity = (
-        result["risk_parity_bt"]
-        ["Portfolio Value"]
-        .iloc[-1]
-    )
-
-    final_hrp = (
-        result["hrp_bt"]
-        ["Portfolio Value"]
-        .iloc[-1]
-    )
-
-    final_equal = (
-        result["equal_weight_bt"]
-        ["Portfolio Value"]
-        .iloc[-1]
-    )
-
-    final_ftse = (
-        result["ftse_mib_bt"]
-        ["Portfolio Value"]
-        .iloc[-1]
-    )
-
-    capital = result["capital"]
-
-    final_col1.metric(
-        "Maximum Sharpe",
-        f"€{final_max:,.2f}",
-        delta=(
-            f"{final_max / capital - 1:.2%}"
-        ),
-    )
-
-    final_col2.metric(
-        "CAPM Max Sharpe",
-        f"€{final_capm:,.2f}",
-        delta=(
-            f"{final_capm / capital - 1:.2%}"
-        ),
-    )
-
-    final_col3.metric(
-        "Minimum Volatility",
-        f"€{final_min:,.2f}",
-        delta=(
-            f"{final_min / capital - 1:.2%}"
-        ),
-    )
-
-    final_col4.metric(
-        "Risk Parity",
-        f"€{final_risk_parity:,.2f}",
-        delta=(
-            f"{final_risk_parity / capital - 1:.2%}"
-        ),
-    )
-
-    final_col5.metric(
-        "HRP",
-        f"€{final_hrp:,.2f}",
-        delta=(
-            f"{final_hrp / capital - 1:.2%}"
-        ),
-    )
-
-    final_col6.metric(
-        "Equal Weight",
-        f"€{final_equal:,.2f}",
-        delta=(
-            f"{final_equal / capital - 1:.2%}"
-        ),
-    )
-
-    final_col7.metric(
-        "Benchmark",
-        f"€{final_ftse:,.2f}",
-        delta=(
-            f"{final_ftse / capital - 1:.2%}"
-        ),
-    )
+    if cost_tab.open:
+        with cost_tab:
+            cost_summary = result.get("transaction_cost_summary", {})
+            if not cost_summary:
+                st.info("No transaction costs were recorded for this backtest.")
+            else:
+                st.caption("Costs are deducted from the portfolio cash at each actual rebalance; "
+                           "gross is a cost-free counterfactual using the same target weights. "
+                           "The index benchmark has no simulated trading costs.")
+                costs = pd.DataFrame.from_dict(cost_summary, orient="index")
+                strategy = st.selectbox("Strategy cost breakdown", costs.index.tolist(),
+                                        key=f"cost_strategy_{result_key}")
+                selected = costs.loc[strategy]
+                cost_drag = selected["Gross Return (%)"] - selected["Net Return (%)"]
+                for column, (label, value, color) in zip(st.columns(3), (
+                    ("Total Trading Costs", f"€{selected['Total Costs (€)']:,.2f}", "red"),
+                    ("Orders", f"{selected['Orders']:,.0f}", "blue"),
+                    ("Gross − Net Return", f"{cost_drag:.2f} pp", "yellow"),
+                )):
+                    with column:
+                        colored_metric(label, value, color)
+                render_terminal_table(
+                    costs,
+                    {"Total Costs (€)": "€{:,.2f}", "Orders": "{:,.0f}",
+                     "Gross Return (%)": "{:+.2f}%", "Net Return (%)": "{:+.2f}%"},
+                    index_label="Strategy", signed=("Gross Return (%)", "Net Return (%)"),
+                )
 
 
+    if attribution_tab.open:
+        with attribution_tab:
+            complete_factor_attributions(result)
+            if not any(f"{model}_{suffix}" in result
+                       for model in ("ff3", "ff5", "ff3_factor", "ff5_factor")
+                       for suffix in ("performance_attribution", "attribution_error")):
+                st.info("Factor performance attribution is unavailable for this backtest.")
+            render_factor_attribution(result, key_suffix=result_key)
+            render_factor_exposure_history(result, key_suffix=result_key)
 
-    if "ff5_bt" in result:
-        final_ff5 = result["ff5_bt"]["Portfolio Value"].iloc[-1]
-        st.metric("FF5 Maximum Sharpe", f"€{final_ff5:,.2f}",
-                  delta=f"{final_ff5 / capital - 1:.2%}")
 
-    final_ff3 = result["ff3_bt"]["Portfolio Value"].iloc[-1]
-    st.metric("FF3 Maximum Sharpe", f"€{final_ff3:,.2f}",
-              delta=f"{final_ff3 / capital - 1:.2%}")
 
 # =========================================================
 # SESSION STATE
@@ -3922,16 +4198,225 @@ if (
 # HEADER
 # =========================================================
 
-st.title(
-    "Quant Portfolio Optimizer"
-)
-
-st.write(
-    """
-    Quantitative portfolio analysis and optimization
-    based on Modern Portfolio Theory.
-    """
-)
+st.html("""
+<style>
+/* KangemiEdu translucent dark UI — visual only; no quantitative logic changes. */
+:root { --kg-surface:rgba(30,41,59,.30); --kg-surface-hover:rgba(39,52,72,.40);
+  --kg-border:rgba(148,163,184,.12); --kg-text:#e9eff8; --kg-muted:#a8b6c8;
+  --kg-accent:#e7ad65; }
+[data-testid="stAppViewContainer"] { background:#0e1117; }
+[data-testid="stMainBlockContainer"], .block-container {
+  padding-top:1.15rem !important; padding-bottom:2.2rem !important;
+}
+/* Terminal typography for the interface, with body copy left in the app font. */
+[data-testid="stAppViewContainer"] {
+  --kg-terminal-font:"IBM Plex Mono",ui-monospace,monospace;
+}
+[data-testid="stAppViewContainer"] :is(h1,h2,h3,h4,h5,h6) {
+  font-family:var(--kg-terminal-font);
+}
+[data-testid="stAppViewContainer"] [data-testid="stWidgetLabel"] p {
+  font-family:var(--kg-terminal-font);
+}
+[data-testid="stAppViewContainer"] :is([data-testid="stMetricLabel"],[data-testid="stMetricValue"],
+  [data-testid="stMetricDelta"],.kangemi-colored-metric) {
+  font-family:var(--kg-terminal-font);font-variant-numeric:tabular-nums;
+}
+/* Uniform rhythm between top-level page components. */
+[data-testid="stMainBlockContainer"] > div { gap:.75rem; }
+[data-testid="stVerticalBlock"] { gap:.75rem; }
+[data-testid="stVerticalBlock"] > [data-testid="stElementContainer"]:empty { display:none; }
+h1,h2,h3 { letter-spacing:-.025em; }
+[data-testid="stMarkdownContainer"] h2,
+[data-testid="stMarkdownContainer"] h3 { margin-top:.35rem; margin-bottom:.2rem; }
+[data-testid="stCaptionContainer"] { color:var(--kg-muted); }
+.kangemi-app-header {
+  background:linear-gradient(115deg,rgba(30,41,59,.40),rgba(16,22,32,.20) 75%);
+  border:1px solid var(--kg-border); border-left:3px solid var(--kg-accent);
+  border-radius:.65rem; padding:.95rem 1.25rem 1rem; color:var(--kg-text);
+}
+.kangemi-app-header .brand {
+  color:var(--kg-accent);font:650 .76rem/1.3 "IBM Plex Mono",ui-monospace,monospace;
+  letter-spacing:.055em;
+}
+.kangemi-app-header h1 {
+  margin:.18rem 0 .28rem;padding:0;font-size:clamp(1.55rem,2.4vw,2.15rem);
+  line-height:1.14;letter-spacing:-.035em;color:var(--kg-text);
+}
+.kangemi-app-header p { margin:0;color:var(--kg-muted);font-size:.88rem; }
+.st-key-kangemi_main_navigation [role="tablist"] {
+  background:rgba(30,41,59,.23);border:1px solid var(--kg-border);
+  border-radius:.55rem;gap:.1rem;overflow-x:auto;
+}
+.st-key-kangemi_main_navigation [role="tab"] {
+  min-height:2.65rem;padding-inline:.72rem;white-space:nowrap;
+  background:transparent;border-radius:.3rem .3rem 0 0;
+}
+.st-key-kangemi_main_navigation [role="tab"] p {
+  font:600 .76rem/1.25 "IBM Plex Mono",ui-monospace,monospace;
+}
+.st-key-kangemi_main_navigation [role="tab"][aria-selected="true"] {
+  color:var(--kg-accent);background:rgba(148,163,184,.095);
+  box-shadow:inset 0 -2px var(--kg-accent);
+}
+.st-key-kangemi_main_navigation [data-baseweb="tab-highlight"] {
+  background-color:var(--kg-accent) !important;
+}
+/* Page-level hero: visually connects the section title to its tools. */
+.kangemi-section-hero {
+  background:linear-gradient(110deg,rgba(30,41,59,.30),rgba(30,41,59,.10));
+  border:1px solid rgba(148,163,184,.12);
+  border-left:3px solid rgba(231,173,101,.78);
+  border-radius:.65rem;
+  padding:1rem 1.2rem;
+  margin:.15rem 0 .25rem;
+}
+.kangemi-section-eyebrow {
+  font:600 .67rem/1.4 "IBM Plex Mono",ui-monospace,monospace;
+  color:rgba(231,173,101,.82);letter-spacing:.09em;margin-bottom:.3rem;
+}
+.kangemi-section-hero h2 {
+  color:#e9eff8;font-size:clamp(1.45rem,2.2vw,1.9rem);
+  letter-spacing:-.03em;line-height:1.2;margin:0 0 .35rem;
+}
+.kangemi-section-hero p {
+  color:#a8b6c8;font-size:.88rem;line-height:1.5;
+  max-width:85ch;margin:0;
+}
+@media(max-width:850px) { .kangemi-section-hero {padding:.85rem 1rem;} }
+/* Sidebar: remove Streamlit's reserved top whitespace above first widget. */
+[data-testid="stSidebar"] [data-testid="stSidebarContent"] {
+  padding-top: 0 !important;
+}
+[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {
+  padding-top: .35rem !important;
+  margin-top: 0 !important;
+}
+[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] > div,
+[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] [data-testid="stVerticalBlock"] {
+  margin-top: 0 !important;
+}
+[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] h2:first-child,
+[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] h3:first-child {
+  margin-top: 0 !important;
+}
+/* Sidebar — quiet glass styling, tighter rhythm, readable controls. */
+[data-testid="stSidebar"] {
+  background:linear-gradient(180deg,rgba(24,30,42,.94),rgba(18,23,33,.97)) !important;
+  border-right:1px solid rgba(148,163,184,.12);
+}
+[data-testid="stSidebar"] [data-testid="stSidebarUserContent"] {padding-top:.35rem !important;}
+[data-testid="stSidebar"] [data-testid="stVerticalBlock"] {gap:.58rem;}
+[data-testid="stSidebar"] h2,[data-testid="stSidebar"] h3 {
+  font-size:1.01rem !important;line-height:1.35;margin:.65rem 0 .12rem;
+  letter-spacing:-.015em;
+}
+[data-testid="stSidebar"] [data-testid="stWidgetLabel"] p {
+  font-size:.79rem;font-weight:600;color:rgba(231,237,246,.88);
+}
+[data-testid="stSidebar"] [data-testid="stCaptionContainer"] p {
+  font-size:.73rem;line-height:1.5;color:rgba(169,184,204,.72);
+}
+[data-testid="stSidebar"] [data-baseweb="select"] > div,
+[data-testid="stSidebar"] [data-baseweb="input"] {
+  background:rgba(10,16,27,.48) !important;
+  border:1px solid rgba(148,163,184,.14) !important;
+  border-radius:.5rem !important;
+}
+[data-testid="stSidebar"] [data-testid="stAlert"] {
+  background:rgba(48,91,133,.13) !important;
+  border:1px solid rgba(90,151,208,.17) !important;
+  border-radius:.55rem;padding:.65rem .8rem;
+}
+[data-testid="stSidebar"] [data-testid="stAlert"] p {
+  color:rgba(175,207,236,.88);font-size:.76rem;line-height:1.55;
+}
+[data-testid="stSidebar"] [data-testid="stRadio"] label,
+[data-testid="stSidebar"] [data-testid="stToggle"] label {font-size:.79rem;}
+[data-testid="stSidebar"] hr {border-color:rgba(148,163,184,.12);margin:.6rem 0;}
+[data-testid="stSidebar"] [data-testid="stExpander"] {
+  border:1px solid rgba(148,163,184,.12);background:rgba(30,41,59,.18);
+  border-radius:.55rem;
+}
+/* All existing kangemi_controls_* containers share the same light glass surface. */
+[class*="st-key-kangemi_controls_"] {
+  background:var(--kg-surface);border:1px solid var(--kg-border);
+  border-radius:.65rem;padding:.85rem 1rem;
+}
+[class*="st-key-kangemi_controls_"] [data-testid="stWidgetLabel"] p {
+  color:var(--kg-accent);font:600 .8rem/1.3 "IBM Plex Mono",ui-monospace,monospace;
+}
+[class*="st-key-kangemi_controls_"] [data-baseweb="select"] > div,
+[class*="st-key-kangemi_controls_"] [data-baseweb="input"] {
+  background:rgba(15,23,42,.38);border-color:rgba(148,163,184,.18);
+}
+[class*="st-key-kangemi_controls_"] [data-baseweb="tag"] {
+  background:rgba(90,114,147,.28);color:var(--kg-text);
+}
+[class*="st-key-kangemi_controls_"] button[data-testid="stBaseButton-primary"] {
+  background:rgba(231,173,101,.88) !important;color:#171c25 !important;
+  border:1px solid rgba(255,198,124,.55);min-height:2.5rem;font-weight:700;
+}
+[class*="st-key-kangemi_controls_"] button[data-testid="stBaseButton-primary"]:hover {
+  background:rgba(245,190,120,.98) !important;border-color:#f5be78;
+}
+[class*="st-key-kangemi_controls_"] button[role="radio"] {
+  min-height:2.45rem;background:rgba(30,41,59,.28) !important;
+  border-color:var(--kg-border) !important;color:#d9e4f5 !important;
+}
+[class*="st-key-kangemi_controls_"] button[role="radio"][aria-checked="true"] {
+  color:var(--kg-accent) !important;border-color:rgba(231,173,101,.45) !important;
+  box-shadow:inset 0 -2px var(--kg-accent);
+}
+/* Optimization tab: compact unified panel and quiet guidance message. */
+.st-key-kangemi_controls_optimization { margin-top:.1rem; }
+.st-key-kangemi_controls_optimization [data-testid="stHorizontalBlock"] { gap:1rem; }
+.st-key-kangemi_controls_optimization [data-testid="stVerticalBlock"] { gap:.3rem; }
+.st-key-kangemi_optimization_intro {
+  background:transparent;border:0;padding:0 0 .15rem;
+}
+.st-key-kangemi_optimization_intro h2,
+.st-key-kangemi_optimization_intro h3 { margin:0 0 .2rem; }
+.st-key-kangemi_optimization_notice, .st-key-kangemi_backtest_notice {
+  background:rgba(30,41,59,.23);border:1px solid var(--kg-border);
+  border-radius:.5rem;padding:.65rem .85rem;color:var(--kg-muted);
+}
+.st-key-kangemi_optimization_notice p, .st-key-kangemi_backtest_notice p { margin:0;font-size:.86rem; }
+@media(max-width:850px) {
+  .kangemi-app-header { padding:.8rem 1rem; }
+  .st-key-kangemi_main_navigation [role="tab"] { padding-inline:.55rem; }
+  [class*="st-key-kangemi_controls_"] { padding:.7rem .75rem; }
+}
+.kangemi-screening-kpis {
+  display:grid;grid-template-columns:repeat(auto-fit,minmax(10rem,1fr));gap:.75rem;
+}
+.kangemi-screening-kpis > div {
+  background:var(--kg-surface);border:1px solid var(--kg-border);
+  border-inline-start:2px solid var(--kpi-accent);border-radius:.55rem;padding:.65rem .85rem;
+}
+.kangemi-screening-kpis .selected {--kpi-accent:var(--kg-accent);}
+.kangemi-screening-kpis .eligible {--kpi-accent:#83a9d3;}
+.kangemi-screening-kpis .excluded {--kpi-accent:#d78f96;}
+.kangemi-screening-kpis span {
+  display:block;color:var(--kpi-accent);font:600 .77rem/1.3 "IBM Plex Mono",ui-monospace,monospace;
+}
+.kangemi-screening-kpis strong {
+  display:block;color:var(--kg-text);font-size:1.38rem;line-height:1.3;
+  font-variant-numeric:tabular-nums;margin-top:.25rem;
+}
+.st-key-kangemi_quant_ranking {
+  border:1px solid var(--kg-border);border-radius:.55rem;padding:.65rem .85rem .8rem;
+}
+.st-key-kangemi_quant_ranking h4 {
+  color:var(--kg-accent);font:650 .9rem/1.3 "IBM Plex Mono",ui-monospace,monospace;
+}
+</style>
+<header class="kangemi-app-header">
+  <div class="brand">KangemiEdu</div>
+  <h1>Quant Portfolio Optimizer</h1>
+  <p>Quantitative portfolio analysis and optimization based on Modern Portfolio Theory.</p>
+</header>
+""")
 
 
 # =========================================================
@@ -4085,31 +4570,6 @@ capital = (
 
 
 # ---------------------------------------------------------
-# FRACTIONAL SHARES
-# ---------------------------------------------------------
-
-st.sidebar.subheader(
-    "Quote frazionarie"
-)
-
-use_fractional_shares = (
-    st.sidebar.toggle(
-        "Utilizza quote frazionarie",
-        value=False,
-    )
-)
-
-st.sidebar.info(
-    "Attivando questa opzione, il portafoglio può "
-    "utilizzare quote frazionarie (es. 3,42 azioni) "
-    "per avvicinarsi maggiormente all'allocazione "
-    "ottimale. Se disattivata, vengono utilizzate "
-    "solo quote intere e il capitale non investito "
-    "rimane come liquidità residua."
-)
-
-
-# ---------------------------------------------------------
 # DIVERSIFICATION
 # ---------------------------------------------------------
 
@@ -4152,6 +4612,30 @@ else:
 
     max_weight = 1.0
 
+
+# ---------------------------------------------------------
+# FRACTIONAL SHARES
+# ---------------------------------------------------------
+
+st.sidebar.subheader(
+    "Quote frazionarie"
+)
+
+use_fractional_shares = (
+    st.sidebar.toggle(
+        "Utilizza quote frazionarie",
+        value=False,
+    )
+)
+
+st.sidebar.info(
+    "Attivando questa opzione, il portafoglio può "
+    "utilizzare quote frazionarie (es. 3,42 azioni) "
+    "per avvicinarsi maggiormente all'allocazione "
+    "ottimale. Se disattivata, vengono utilizzate "
+    "solo quote intere e il capitale non investito "
+    "rimane come liquidità residua."
+)
 
 
 # =========================================================
@@ -4263,19 +4747,20 @@ with st.sidebar.expander(
 # MAIN NAVIGATION
 # =========================================================
 
-asset_selection_tab, optimization_tab, factor_models_tab, backtest_tab, monte_carlo_tab, robustness_tab, volatility_tab, ml_tab, saved_experiments_tab = st.tabs(
-    [
-        "Asset Selection",
-        "Portfolio Optimization",
-        "Factor Models",
-        "Backtesting",
-        "Monte Carlo Simulation",
-        "Robustness Analysis",
-        "Volatility Analytics",
-        "ML Return Forecasting",
-        "Saved Experiments",
-    ]
-)
+with st.container(key="kangemi_main_navigation"):
+    asset_selection_tab, optimization_tab, factor_models_tab, backtest_tab, monte_carlo_tab, robustness_tab, volatility_tab, ml_tab, saved_experiments_tab = st.tabs(
+        [
+            "Asset Selection",
+            "Portfolio Optimization",
+            "Factor Models",
+            "Backtesting",
+            "Monte Carlo Simulation",
+            "Robustness Analysis",
+            "Volatility Analytics",
+            "ML Return Forecasting",
+            "Saved Experiments",
+        ]
+    )
 
 
 # =========================================================
@@ -4318,69 +4803,62 @@ def render_diversification_var_kpis(weights, covariance, portfolio_capital):
 
 with asset_selection_tab:
 
-    st.header("Asset Selection")
+    st.markdown("### Quantitative asset screener")
+    with st.container(key="kangemi_controls_screener"):
+        quant_factors = st.multiselect(
+            "Active Quant factors",
+            options=["Momentum", "Risk", "Value", "Quality"],
+            default=["Momentum", "Risk"],
+            key="quant_active_factors",
+            help="Default: Momentum and Risk only. Value/Quality require fundamentals."
+        )
+        if not quant_factors:
+            st.warning("Select at least one Quant factor before running screening.")
 
-    st.caption(
-        "Screen the full selected market universe using transparent quantitative "
-        "rules before portfolio construction. Invalid or unavailable tickers are "
-        "excluded automatically and never stop the analysis."
-    )
-
-    st.markdown("### Quantitative Screener")
-    quant_factors = st.multiselect(
-        "Active Quant factors",
-        options=["Momentum", "Risk", "Value", "Quality"],
-        default=["Momentum", "Risk"],
-        key="quant_active_factors",
-        help="Default: Momentum and Risk only. Value/Quality require fundamentals."
-    )
-    if not quant_factors:
-        st.warning("Select at least one Quant factor before running screening.")
-
-    st.caption(
-        "The model equally weights the selected signal families. "
-        "By default, only Momentum and Risk are active. Each component is converted "
-        "to a cross-sectional percentile score from 0 to 100."
-    )
-
-    screener_col1, screener_col2, screener_col3 = st.columns(
-        [2, 2, 1],
-        vertical_alignment="bottom",
-    )
-
-    with screener_col1:
-        screening_period = st.selectbox(
-            "Screening history",
-            ["1y", "2y", "5y"],
-            index=1,
-            key="screening_period",
+        st.caption(
+            "The model equally weights the selected signal families. "
+            "By default, only Momentum and Risk are active. Each component is converted "
+            "to a cross-sectional percentile score from 0 to 100."
         )
 
-    with screener_col2:
-        max_top_n = max(2, len(market_instruments))
-        default_top_n = min(10, max_top_n)
-
-        screening_top_n = st.number_input(
-            "Number of assets to select",
-            min_value=2,
-            max_value=max_top_n,
-            value=default_top_n,
-            step=1,
-            key="screening_top_n",
+        screener_col1, screener_col2, screener_col3 = st.columns(
+            [2, 2, 1],
+            vertical_alignment="bottom",
         )
 
-    with screener_col3:
-        run_screening = st.button(
-            "Run Screening",
-            type="primary",
-            use_container_width=True,
-        )
+        with screener_col1:
+            screening_period = st.selectbox(
+                "Screening history",
+                ["1y", "2y", "5y"],
+                index=1,
+                key="screening_period",
+            )
 
-    st.info(
-        "Ticker validation is fault-tolerant: instruments with missing, invalid "
-        "or unavailable Yahoo Finance price data are marked as Excluded. "
-        "The remaining universe continues to be analysed normally."
-    )
+        with screener_col2:
+            max_top_n = max(2, len(market_instruments))
+            default_top_n = min(10, max_top_n)
+
+            screening_top_n = st.number_input(
+                "Number of assets to select",
+                min_value=2,
+                max_value=max_top_n,
+                value=default_top_n,
+                step=1,
+                key="screening_top_n",
+            )
+
+        with screener_col3:
+            run_screening = st.button(
+                "Run Screening",
+                type="primary",
+                use_container_width=True,
+            )
+
+        st.info(
+            "Ticker validation is fault-tolerant: instruments with missing, invalid "
+            "or unavailable Yahoo Finance price data are marked as Excluded. "
+            "The remaining universe continues to be analysed normally."
+        )
 
     if run_screening and quant_factors:
 
@@ -4438,30 +4916,13 @@ with asset_selection_tab:
             screening_table["Rank"].notna().sum()
         )
 
-        q1, q2, q3 = st.columns(3)
-
-        with q1:
-            colored_metric(
-                "Selected Assets",
-                f"{selected_count}",
-                "green",
-            )
-
-        with q2:
-            colored_metric(
-                "Eligible Assets",
-                f"{eligible_count}",
-                "blue",
-            )
-
-        with q3:
-            colored_metric(
-                "Excluded Assets",
-                f"{excluded_count}",
-                "red",
-            )
-
-        st.markdown("#### Quant Ranking")
+        st.html(f"""
+            <div class="kangemi-screening-kpis">
+                <div class="selected"><span>Selected Assets</span><strong>{selected_count}</strong></div>
+                <div class="eligible"><span>Eligible Assets</span><strong>{eligible_count}</strong></div>
+                <div class="excluded"><span>Excluded Assets</span><strong>{excluded_count}</strong></div>
+            </div>
+        """)
 
         display_columns = [
             "Rank",
@@ -4476,18 +4937,20 @@ with asset_selection_tab:
             "Reason",
         ]
 
-        st.dataframe(
-            screening_table[display_columns].style.format({
-                "Rank": "{:.0f}",
-                "Momentum Score": "{:.1f}",
-                "Risk Score": "{:.1f}",
-                "Value Score": "{:.1f}",
-                "Quality Score": "{:.1f}",
-                "Quant Score": "{:.1f}",
-            }),
-            use_container_width=True,
-            hide_index=True,
-        )
+        with st.container(key="kangemi_quant_ranking"):
+            st.markdown("#### Quant Ranking")
+            st.dataframe(
+                screening_table[display_columns].style.format({
+                    "Rank": "{:.0f}",
+                    "Momentum Score": "{:.1f}",
+                    "Risk Score": "{:.1f}",
+                    "Value Score": "{:.1f}",
+                    "Quality Score": "{:.1f}",
+                    "Quant Score": "{:.1f}",
+                }).set_properties(subset=["Quant Score"], **{"background-color": "#202d41", "font-weight": "600"}),
+                use_container_width=True,
+                hide_index=True,
+            )
 
         selected_rows = screening_table[
             screening_table["Selected"]
@@ -4666,47 +5129,39 @@ with asset_selection_tab:
 
 with optimization_tab:
 
-    st.header(
-        "Portfolio Optimization"
-    )
-
-    st.caption(
-        "Estimate the optimal portfolio allocation "
-        "today using historical returns and risk."
-    )
-
-    optimization_control_col1, optimization_control_col2 = (
-        st.columns(
-            [3, 1],
-            vertical_alignment="bottom",
-        )
-    )
-
-    with optimization_control_col1:
-
-        optimization_period = (
-            st.selectbox(
-                "Historical estimation period",
-                [f"{year}y" for year in range(1, 11)],
-                index=4,
-                key="optimization_period",
-                help=(
-                    "Historical data used to estimate "
-                    "expected returns and covariance "
-                    "for today's optimal portfolio."
-                ),
+    with st.container(key="kangemi_controls_optimization"):
+        optimization_control_col1, optimization_control_col2 = (
+            st.columns(
+                [2.4, 1],
+                vertical_alignment="bottom",
             )
         )
 
-    with optimization_control_col2:
+        with optimization_control_col1:
 
-        run_optimization = (
-            st.button(
-                "Run Portfolio Optimization",
-                type="primary",
-                use_container_width=True,
+            optimization_period = (
+                st.selectbox(
+                    "Historical estimation period",
+                    [f"{year}y" for year in range(1, 11)],
+                    index=4,
+                    key="optimization_period",
+                    help=(
+                        "Historical data used to estimate "
+                        "expected returns and covariance "
+                        "for today's optimal portfolio."
+                    ),
+                )
             )
-        )
+
+        with optimization_control_col2:
+
+            run_optimization = (
+                st.button(
+                    "Run Portfolio Optimization",
+                    type="primary",
+                    use_container_width=True,
+                )
+            )
 
 
     # =====================================================
@@ -5100,10 +5555,11 @@ with optimization_tab:
 
     if optimization_results is None:
 
-        st.info(
-            "Select the instruments and parameters, "
-            "then click **Run Portfolio Optimization**."
-        )
+        with st.container(key="kangemi_optimization_notice"):
+            st.markdown(
+                "ℹ️ Select the instruments and parameters, "
+                "then click **Run Portfolio Optimization**."
+            )
 
     else:
 
@@ -5126,340 +5582,345 @@ with optimization_tab:
         # =================================================
 
         with min_column:
+            with st.container(border=True, key="portfolio_quadrant_minimum_volatility"):
 
-            st.subheader(
-                "Minimum Volatility"
-            )
-
-            metric_col1, metric_col2, metric_col3 = (
-                st.columns(3)
-            )
-
-            with metric_col1:
-
-                colored_metric(
-                    "Expected Return",
-                    f"{r['min_return']:.2%}",
-                    "green",
+                st.subheader(
+                    "Minimum Volatility"
                 )
 
-            with metric_col2:
-
-                colored_metric(
-                    "Volatility",
-                    f"{r['min_volatility']:.2%}",
-                    "red",
+                metric_col1, metric_col2, metric_col3 = (
+                    st.columns(3)
                 )
 
-            with metric_col3:
+                with metric_col1:
 
-                colored_metric(
-                    "Sharpe Ratio",
-                    f"{r['min_sharpe']:.2f}",
-                    "blue",
+                    colored_metric(
+                        "Expected Return",
+                        f"{r['min_return']:.2%}",
+                        "green",
+                    )
+
+                with metric_col2:
+
+                    colored_metric(
+                        "Volatility",
+                        f"{r['min_volatility']:.2%}",
+                        "red",
+                    )
+
+                with metric_col3:
+
+                    colored_metric(
+                        "Sharpe Ratio",
+                        f"{r['min_sharpe']:.2f}",
+                        "blue",
+                    )
+
+                render_diversification_var_kpis(r["min_weights"], r["covariance"], r["capital"])
+
+                portfolio_allocation_title()
+
+                display_portfolio_table(
+                    r["min_table"],
+                    r["use_fractional_shares"],
                 )
 
-            render_diversification_var_kpis(r["min_weights"], r["covariance"], r["capital"])
-
-            portfolio_allocation_title()
-
-            display_portfolio_table(
-                r["min_table"],
-                r["use_fractional_shares"],
-            )
-
-            summary_col1, summary_col2 = (
-                st.columns(2)
-            )
-
-            with summary_col1:
-
-                colored_metric(
-                    "Total Invested",
-                    f"€{r['min_total_invested']:,.2f}",
-                    "purple",
+                summary_col1, summary_col2 = (
+                    st.columns(2)
                 )
 
-            with summary_col2:
+                with summary_col1:
 
-                colored_metric(
-                    "Residual Cash",
-                    f"€{r['min_cash']:,.2f}",
-                    "yellow",
-                )
+                    colored_metric(
+                        "Total Invested",
+                        f"€{r['min_total_invested']:,.2f}",
+                        "purple",
+                    )
+
+                with summary_col2:
+
+                    colored_metric(
+                        "Residual Cash",
+                        f"€{r['min_cash']:,.2f}",
+                        "yellow",
+                    )
 
 
-        # =================================================
-        # MAXIMUM SHARPE
-        # =================================================
+            # =================================================
+            # MAXIMUM SHARPE
+            # =================================================
 
         with max_column:
+            with st.container(border=True, key="portfolio_quadrant_maximum_sharpe"):
 
-            st.subheader(
-                "Maximum Sharpe"
-            )
-
-            metric_col1, metric_col2, metric_col3 = (
-                st.columns(3)
-            )
-
-            with metric_col1:
-
-                colored_metric(
-                    "Expected Return",
-                    f"{r['max_return']:.2%}",
-                    "green",
+                st.subheader(
+                    "Maximum Sharpe"
                 )
 
-            with metric_col2:
-
-                colored_metric(
-                    "Volatility",
-                    f"{r['max_volatility']:.2%}",
-                    "red",
+                metric_col1, metric_col2, metric_col3 = (
+                    st.columns(3)
                 )
 
-            with metric_col3:
+                with metric_col1:
 
-                colored_metric(
-                    "Sharpe Ratio",
-                    f"{r['max_sharpe']:.2f}",
-                    "blue",
+                    colored_metric(
+                        "Expected Return",
+                        f"{r['max_return']:.2%}",
+                        "green",
+                    )
+
+                with metric_col2:
+
+                    colored_metric(
+                        "Volatility",
+                        f"{r['max_volatility']:.2%}",
+                        "red",
+                    )
+
+                with metric_col3:
+
+                    colored_metric(
+                        "Sharpe Ratio",
+                        f"{r['max_sharpe']:.2f}",
+                        "blue",
+                    )
+
+                render_diversification_var_kpis(r["max_weights"], r["covariance"], r["capital"])
+
+                portfolio_allocation_title()
+
+                display_portfolio_table(
+                    r["max_table"],
+                    r["use_fractional_shares"],
                 )
 
-            render_diversification_var_kpis(r["max_weights"], r["covariance"], r["capital"])
-
-            portfolio_allocation_title()
-
-            display_portfolio_table(
-                r["max_table"],
-                r["use_fractional_shares"],
-            )
-
-            summary_col1, summary_col2 = (
-                st.columns(2)
-            )
-
-            with summary_col1:
-
-                colored_metric(
-                    "Total Invested",
-                    f"€{r['max_total_invested']:,.2f}",
-                    "purple",
+                summary_col1, summary_col2 = (
+                    st.columns(2)
                 )
 
-            with summary_col2:
+                with summary_col1:
 
-                colored_metric(
-                    "Residual Cash",
-                    f"€{r['max_cash']:,.2f}",
-                    "yellow",
+                    colored_metric(
+                        "Total Invested",
+                        f"€{r['max_total_invested']:,.2f}",
+                        "purple",
+                    )
+
+                with summary_col2:
+
+                    colored_metric(
+                        "Residual Cash",
+                        f"€{r['max_cash']:,.2f}",
+                        "yellow",
+                    )
+
+
+        risk_parity_column, hrp_column = st.columns(2, gap="medium")
+
+        with risk_parity_column:
+            with st.container(border=True, key="portfolio_quadrant_risk_parity"):
+                # =================================================
+                # RISK PARITY
+                # =================================================
+
+                st.subheader(
+                    "Risk Parity"
+                )
+
+                st.caption(
+                    "Equal Risk Contribution portfolio. Capital weights "
+                    "are selected so that each asset contributes as evenly "
+                    "as possible to total portfolio risk."
+                )
+
+                (
+                    risk_metric_col1,
+                    risk_metric_col2,
+                    risk_metric_col3,
+                ) = st.columns(3)
+
+                with risk_metric_col1:
+
+                    colored_metric(
+                        "Expected Return",
+                        f"{r['risk_parity_return']:.2%}",
+                        "green",
+                    )
+
+                with risk_metric_col2:
+
+                    colored_metric(
+                        "Volatility",
+                        f"{r['risk_parity_volatility']:.2%}",
+                        "red",
+                    )
+
+                with risk_metric_col3:
+
+                    colored_metric(
+                        "Sharpe Ratio",
+                        f"{r['risk_parity_sharpe']:.2f}",
+                        "blue",
+                    )
+
+                render_diversification_var_kpis(r["risk_parity_weights"], r["covariance"], r["capital"])
+
+                portfolio_allocation_title()
+
+                display_portfolio_table(
+                    r["risk_parity_table"],
+                    r["use_fractional_shares"],
+                )
+
+                risk_summary_col1, risk_summary_col2 = (
+                    st.columns(2)
+                )
+
+                with risk_summary_col1:
+
+                    colored_metric(
+                        "Total Invested",
+                        f"€{r['risk_parity_total_invested']:,.2f}",
+                        "purple",
+                    )
+
+                with risk_summary_col2:
+
+                    colored_metric(
+                        "Residual Cash",
+                        f"€{r['risk_parity_cash']:,.2f}",
+                        "yellow",
+                    )
+
+                st.markdown(
+                    "#### Risk Contribution"
+                )
+
+                risk_contribution_table = pd.DataFrame(
+                    {
+                        "Instrument": [
+                            get_company_name(ticker)
+                            for ticker
+                            in r["risk_parity_contributions"].index
+                        ],
+                        "Portfolio Weight":
+                            r["risk_parity_weights"].values,
+                        "Risk Contribution":
+                            r["risk_parity_contributions"].values,
+                    }
+                )
+
+                risk_contribution_table = (
+                    risk_contribution_table
+                    .sort_values(
+                        "Risk Contribution",
+                        ascending=False,
+                    )
+                    .reset_index(drop=True)
+                )
+
+                st.dataframe(
+                    risk_contribution_table.style.format(
+                        {
+                            "Portfolio Weight": "{:.2%}",
+                            "Risk Contribution": "{:.2%}",
+                        }
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
                 )
 
 
-        # =================================================
-        # RISK PARITY
-        # =================================================
 
-        st.divider()
+        with hrp_column:
+            with st.container(border=True, key="portfolio_quadrant_hierarchical_risk_parity"):
+                # =================================================
+                # HIERARCHICAL RISK PARITY
+                # =================================================
 
-        st.subheader(
-            "Risk Parity"
-        )
+                st.subheader(
+                    "Hierarchical Risk Parity (HRP)"
+                )
 
-        st.caption(
-            "Equal Risk Contribution portfolio. Capital weights "
-            "are selected so that each asset contributes as evenly "
-            "as possible to total portfolio risk."
-        )
+                st.caption(
+                    "HRP groups assets according to their correlation structure "
+                    "and allocates capital recursively across the resulting "
+                    "clusters. It does not use expected returns to determine weights."
+                )
 
-        (
-            risk_metric_col1,
-            risk_metric_col2,
-            risk_metric_col3,
-        ) = st.columns(3)
+                hrp_metric_col1, hrp_metric_col2, hrp_metric_col3 = (
+                    st.columns(3)
+                )
 
-        with risk_metric_col1:
+                with hrp_metric_col1:
+                    colored_metric(
+                        "Expected Return",
+                        f"{r['hrp_return']:.2%}",
+                        "green",
+                    )
 
-            colored_metric(
-                "Expected Return",
-                f"{r['risk_parity_return']:.2%}",
-                "green",
-            )
+                with hrp_metric_col2:
+                    colored_metric(
+                        "Volatility",
+                        f"{r['hrp_volatility']:.2%}",
+                        "red",
+                    )
 
-        with risk_metric_col2:
+                with hrp_metric_col3:
+                    colored_metric(
+                        "Sharpe Ratio",
+                        f"{r['hrp_sharpe']:.2f}",
+                        "blue",
+                    )
 
-            colored_metric(
-                "Volatility",
-                f"{r['risk_parity_volatility']:.2%}",
-                "red",
-            )
+                render_diversification_var_kpis(r["hrp_weights"], r["covariance"], r["capital"])
 
-        with risk_metric_col3:
+                portfolio_allocation_title()
 
-            colored_metric(
-                "Sharpe Ratio",
-                f"{r['risk_parity_sharpe']:.2f}",
-                "blue",
-            )
+                display_portfolio_table(
+                    r["hrp_table"],
+                    r["use_fractional_shares"],
+                )
 
-        render_diversification_var_kpis(r["risk_parity_weights"], r["covariance"], r["capital"])
+                hrp_summary_col1, hrp_summary_col2 = st.columns(2)
 
-        portfolio_allocation_title()
+                with hrp_summary_col1:
+                    colored_metric(
+                        "Total Invested",
+                        f"€{r['hrp_total_invested']:,.2f}",
+                        "purple",
+                    )
 
-        display_portfolio_table(
-            r["risk_parity_table"],
-            r["use_fractional_shares"],
-        )
+                with hrp_summary_col2:
+                    colored_metric(
+                        "Residual Cash",
+                        f"€{r['hrp_cash']:,.2f}",
+                        "yellow",
+                    )
 
-        risk_summary_col1, risk_summary_col2 = (
-            st.columns(2)
-        )
+                st.markdown("#### Hierarchical Cluster Order")
 
-        with risk_summary_col1:
+                hrp_cluster_table = pd.DataFrame(
+                    {
+                        "Cluster Order": range(1, len(r["hrp_order"]) + 1),
+                        "Instrument": [
+                            get_company_name(ticker)
+                            for ticker in r["hrp_order"]
+                        ],
+                        "Portfolio Weight": [
+                            r["hrp_weights"].loc[ticker]
+                            for ticker in r["hrp_order"]
+                        ],
+                    }
+                )
 
-            colored_metric(
-                "Total Invested",
-                f"€{r['risk_parity_total_invested']:,.2f}",
-                "purple",
-            )
-
-        with risk_summary_col2:
-
-            colored_metric(
-                "Residual Cash",
-                f"€{r['risk_parity_cash']:,.2f}",
-                "yellow",
-            )
-
-        st.markdown(
-            "#### Risk Contribution"
-        )
-
-        risk_contribution_table = pd.DataFrame(
-            {
-                "Instrument": [
-                    get_company_name(ticker)
-                    for ticker
-                    in r["risk_parity_contributions"].index
-                ],
-                "Portfolio Weight":
-                    r["risk_parity_weights"].values,
-                "Risk Contribution":
-                    r["risk_parity_contributions"].values,
-            }
-        )
-
-        risk_contribution_table = (
-            risk_contribution_table
-            .sort_values(
-                "Risk Contribution",
-                ascending=False,
-            )
-            .reset_index(drop=True)
-        )
-
-        st.dataframe(
-            risk_contribution_table.style.format(
-                {
-                    "Portfolio Weight": "{:.2%}",
-                    "Risk Contribution": "{:.2%}",
-                }
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
-
-
-        # =================================================
-        # HIERARCHICAL RISK PARITY
-        # =================================================
-
-        st.divider()
-
-        st.subheader(
-            "Hierarchical Risk Parity (HRP)"
-        )
-
-        st.caption(
-            "HRP groups assets according to their correlation structure "
-            "and allocates capital recursively across the resulting "
-            "clusters. It does not use expected returns to determine weights."
-        )
-
-        hrp_metric_col1, hrp_metric_col2, hrp_metric_col3 = (
-            st.columns(3)
-        )
-
-        with hrp_metric_col1:
-            colored_metric(
-                "Expected Return",
-                f"{r['hrp_return']:.2%}",
-                "green",
-            )
-
-        with hrp_metric_col2:
-            colored_metric(
-                "Volatility",
-                f"{r['hrp_volatility']:.2%}",
-                "red",
-            )
-
-        with hrp_metric_col3:
-            colored_metric(
-                "Sharpe Ratio",
-                f"{r['hrp_sharpe']:.2f}",
-                "blue",
-            )
-
-        render_diversification_var_kpis(r["hrp_weights"], r["covariance"], r["capital"])
-
-        portfolio_allocation_title()
-
-        display_portfolio_table(
-            r["hrp_table"],
-            r["use_fractional_shares"],
-        )
-
-        hrp_summary_col1, hrp_summary_col2 = st.columns(2)
-
-        with hrp_summary_col1:
-            colored_metric(
-                "Total Invested",
-                f"€{r['hrp_total_invested']:,.2f}",
-                "purple",
-            )
-
-        with hrp_summary_col2:
-            colored_metric(
-                "Residual Cash",
-                f"€{r['hrp_cash']:,.2f}",
-                "yellow",
-            )
-
-        st.markdown("#### Hierarchical Cluster Order")
-
-        hrp_cluster_table = pd.DataFrame(
-            {
-                "Cluster Order": range(1, len(r["hrp_order"]) + 1),
-                "Instrument": [
-                    get_company_name(ticker)
-                    for ticker in r["hrp_order"]
-                ],
-                "Portfolio Weight": [
-                    r["hrp_weights"].loc[ticker]
-                    for ticker in r["hrp_order"]
-                ],
-            }
-        )
-
-        st.dataframe(
-            hrp_cluster_table.style.format(
-                {"Portfolio Weight": "{:.2%}"}
-            ),
-            use_container_width=True,
-            hide_index=True,
-        )
+                st.dataframe(
+                    hrp_cluster_table.style.format(
+                        {"Portfolio Weight": "{:.2%}"}
+                    ),
+                    use_container_width=True,
+                    hide_index=True,
+                )
 
 
         # =================================================
@@ -5564,764 +6025,632 @@ with optimization_tab:
 
         render_optimization_k(r)
         
+def render_fama_french_model(model, tickers, market, capital, max_weight,
+                              risk_free_rate, use_fractional_shares):
+    code = model.lower()
+    factor_names = "MKT−RF, SMB and HML" if model == "FF3" else "MKT−RF, SMB, HML, RMW and CMA"
+    st.subheader(f"Fama–French {'Three' if model == 'FF3' else 'Five'}-Factor Model")
+    st.caption(
+        f"Region-specific daily {factor_names} from the Kenneth French Data Library. "
+        "European factors are converted to EUR using EURUSD and €STR."
+    )
+    with st.container(key=f"kangemi_controls_{code}"):
+        window, covariance_control, action = st.columns([2, 2, 1], vertical_alignment="bottom")
+        period = window.selectbox("Estimation Window", ["1y", "2y", "5y", "10y"],
+                                  index=2, key=f"{code}_period")
+        covariance_choice = covariance_control.segmented_control(
+            "Covariance", ["Historical", "Factor Cov"], default="Historical",
+            required=True, key=f"{code}_covariance",
+        )
+    use_factor_cov = covariance_choice == "Factor Cov"
+    result_key = f"{code}_factor_results" if use_factor_cov else f"{code}_results"
+
+    if action.button(f"Run {model}", type="primary", width="stretch") and validate_portfolio(tickers, max_weight):
+        try:
+            with st.spinner(f"Estimating {model}..."):
+                prices = get_prices(tickers, period=period, preserve_missing=True)
+                loaders = (load_us_ff3, load_europe_ff3) if model == "FF3" else (load_us_ff5, load_europe_ff5)
+                factors = loaders[0 if market == "USA" else 1]()
+                fx = None if market == "USA" else get_prices(["EURUSD=X"], period=period)
+                expected, stats = estimate_factor_returns(prices, factors, fx, market=market,
+                                                         model=code, return_stats=True)
+                if use_factor_cov:
+                    from src.factor_covariance import estimate_factor_covariance
+                    covariance = estimate_factor_covariance(
+                        prices, factors, model=code, eurusd_prices=fx, market=market
+                    )
+                else:
+                    covariance = covariance_matrix(calculate_returns(prices))
+                expected = expected.reindex(covariance.index)
+                weights = optimize_maximum_sharpe(expected, covariance, risk_free_rate=risk_free_rate,
+                                                  max_weight=max_weight)
+                annual_return = portfolio_return(weights.values, expected)
+                volatility = portfolio_volatility(weights.values, covariance)
+                table = prepare_portfolio_table(weights, prices, capital, use_fractional_shares)
+                st.session_state[result_key] = {
+                    "period": period, "stats": stats, "expected_returns_eur": expected,
+                    "covariance": covariance, "weights": weights, "table": table,
+                    "return": annual_return, "volatility": volatility,
+                    "sharpe": (annual_return - risk_free_rate) / volatility if volatility > 0 else 0.0,
+                    "total_invested": float(table["Invested"].sum()),
+                    "use_fractional_shares": use_fractional_shares,
+                    "fx_drift_annualized": None, "factor_observations": len(factors),
+                }
+        except Exception as exc:
+            st.error(f"{model} analysis failed: {exc}")
+
+    if st.session_state.get(result_key) is None:
+        st.info(f"Click **Run {model}** to estimate the portfolio with {covariance_choice} covariance.")
+    for saved_factor_cov in (False, True):
+        saved_key = f"{code}_factor_results" if saved_factor_cov else f"{code}_results"
+        saved_result = st.session_state.get(saved_key)
+        if saved_result is not None:
+            render_fama_french_result(model, saved_result, capital, saved_factor_cov)
+
+
+def render_fama_french_result(model, result, capital, use_factor_cov):
+    title = f"{model} Factor Cov" if use_factor_cov else f"{model} Historical Cov"
+    st.markdown(f"#### {title} — Maximum Sharpe Portfolio")
+    st.caption(factor_estimation_caption(model, result))
+    for column, (label, value, color) in zip(st.columns(3), (
+        ("Expected Return", f"{result['return']:.2%}", "green"),
+        ("Volatility", f"{result['volatility']:.2%}", "red"),
+        ("Sharpe Ratio", f"{result['sharpe']:.2f}", "blue"),
+    )):
+        with column:
+            colored_metric(label, value, color)
+    render_diversification_var_kpis(result["weights"], result["covariance"], capital)
+    portfolio_allocation_title()
+    display_portfolio_table(result["table"], result["use_fractional_shares"])
+    for column, (label, value, color) in zip(st.columns(2), (
+        ("Total Invested", result["total_invested"], "purple"),
+        ("Residual Cash", capital - result["total_invested"], "yellow"),
+    )):
+        with column:
+            colored_metric(label, f"€{value:,.2f}", color)
+
+    st.markdown(f"#### {model} Asset Statistics")
+    display = result["stats"].copy()
+    display.insert(0, "Instrument", [get_company_name(ticker) for ticker in display.index])
+    formats = {
+        "Alpha (annualized)": "{:.2%}", "R Squared": "{:.2%}",
+        **{column: "{:.3f}" for column in display if column.startswith("Beta ")},
+        **{column: "{:.2%}" for column in display if "Return" in column},
+    }
+    st.dataframe(display.style.format(formats), width="stretch")
+    st.caption("Expected returns use historical factor averages and exclude estimated alpha.")
+    if model == "FF5" and not use_factor_cov:
+        ff3 = st.session_state.get("ff3_results")
+        if ff3 is not None:
+            st.markdown("#### FF3 vs FF5 — In-sample Comparison")
+            metrics = {"Expected Return": "return", "Volatility": "volatility", "Sharpe Ratio": "sharpe"}
+            comparison = pd.DataFrame({
+                label: {metric: portfolio[field] for metric, field in metrics.items()}
+                for label, portfolio in (("FF3", ff3), ("FF5", result))
+            })
+            st.dataframe(comparison.style.format("{:.3f}"), width="stretch")
+            if ff3["period"] != result["period"]:
+                st.warning("FF3 and FF5 use different estimation periods.")
+
+
 with factor_models_tab:
 
-    st.header("Factor Models")
-    st.caption(
-        "Estimate expected returns with factor models and feed them "
-        "into the same portfolio optimization engine."
-    )
+    for field in ("capm_period", "ff3_period", "ff5_period", "ff3_covariance", "ff5_covariance"):
+        if field in st.session_state:
+            st.session_state[field] = st.session_state[field]
 
-    st.subheader("Capital Asset Pricing Model (CAPM)")
-    st.caption(
-        "Market proxy: FTSE MIB. CAPM estimates each asset's beta, "
-        "alpha and expected return relative to the market, then uses "
-        "those expected returns in a Maximum Sharpe portfolio."
-    )
-
-    capm_col1, capm_col2 = st.columns([3, 1], vertical_alignment="bottom")
-
-    with capm_col1:
-        capm_period = st.selectbox(
-            "Historical estimation period",
-            ["1y", "2y", "5y", "10y"],
-            index=2,
-            key="capm_period",
+    style_backtest_analysis_tabs()
+    with st.container(key="backtest_analysis_tabs_factor_models"):
+        capm_model_tab, ff3_model_tab, ff5_model_tab = st.tabs(
+            ["CAPM", "Fama–French FF3", "Fama–French FF5"], key="factor_model_view", on_change="rerun"
         )
 
-    with capm_col2:
-        run_capm = st.button(
-            "Run CAPM Analysis",
-            type="primary",
-            use_container_width=True,
-        )
-
-    if run_capm and validate_portfolio(tickers, max_weight):
-        try:
-            with st.spinner("Running CAPM analysis..."):
-                capm_prices = get_prices(tickers, period=capm_period)
-                market_prices = get_prices([FTSE_MIB_TICKER], period=capm_period)
-
-                asset_returns = calculate_returns(capm_prices)
-                market_returns = calculate_returns(market_prices).iloc[:, 0]
-
-                common_index = asset_returns.index.intersection(market_returns.index)
-                asset_returns = asset_returns.loc[common_index]
-                market_returns = market_returns.loc[common_index]
-
-                capm_stats = calculate_capm(
-                    asset_returns,
-                    market_returns,
-                    risk_free_rate=risk_free_rate,
-                )
-
-                capm_mu = capm_stats["CAPM Expected Return"]
-                capm_covariance = covariance_matrix(asset_returns)
-
-                capm_weights = optimize_maximum_sharpe(
-                    capm_mu,
-                    capm_covariance,
-                    risk_free_rate=risk_free_rate,
-                    max_weight=max_weight,
-                )
-
-                # Frontiera efficiente costruita usando i rendimenti
-                # attesi impliciti del CAPM e la covarianza storica.
-                capm_min_weights = optimize_minimum_volatility(
-                    capm_mu,
-                    capm_covariance,
-                    max_weight=max_weight,
-                )
-
-                capm_frontier = efficient_frontier(
-                    capm_mu,
-                    capm_covariance,
-                    max_weight=max_weight,
-                    points=100,
-                )
-
-                capm_portfolio_return = portfolio_return(
-                    capm_weights.values, capm_mu
-                )
-                capm_portfolio_volatility = portfolio_volatility(
-                    capm_weights.values, capm_covariance
-                )
-                capm_portfolio_sharpe = (
-                    (capm_portfolio_return - risk_free_rate)
-                    / capm_portfolio_volatility
-                    if capm_portfolio_volatility > 0 else 0.0
-                )
-
-                capm_table = prepare_portfolio_table(
-                    capm_weights, capm_prices, capital, use_fractional_shares
-                )
-                capm_total_invested = capm_table["Invested"].sum()
-
-                st.session_state.factor_model_results = {
-                    "period": capm_period,
-                    "stats": capm_stats,
-                    "expected_returns": capm_mu,
-                    "covariance": capm_covariance,
-                    "frontier": capm_frontier,
-                    "min_weights": capm_min_weights,
-                    "weights": capm_weights,
-                    "prices": capm_prices,
-                    "table": capm_table,
-                    "return": capm_portfolio_return,
-                    "volatility": capm_portfolio_volatility,
-                    "sharpe": capm_portfolio_sharpe,
-                    "total_invested": capm_total_invested,
-                    "cash": capital - capm_total_invested,
-                    "use_fractional_shares": use_fractional_shares,
-                    "market_expected_return": float(market_returns.mean() * 252),
-                    "asset_returns": asset_returns,
-                    "market_returns": market_returns,
-                }
-        except Exception as e:
-            st.error(f"CAPM analysis failed: {e}")
-
-    capm_result = st.session_state.factor_model_results
-
-    if capm_result is None:
-        st.info(
-            "Select the instruments and parameters, then click "
-            "**Run CAPM Analysis**."
-        )
-    else:
-        cr = capm_result
-        st.divider()
-        st.caption(
-            f"CAPM estimated using {cr['period']} of historical data "
-            "and FTSE MIB as the market proxy."
-        )
-
-
-        st.subheader("CAPM Maximum Sharpe Portfolio")
-        st.caption(
-            "Maximum Sharpe allocation using CAPM expected returns "
-            "instead of historical mean returns."
-        )
-
-        m1, m2, m3 = st.columns(3)
-        with m1:
-            colored_metric("Expected Return", f"{cr['return']:.2%}", "green")
-        with m2:
-            colored_metric("Volatility", f"{cr['volatility']:.2%}", "red")
-        with m3:
-            colored_metric("Sharpe Ratio", f"{cr['sharpe']:.2f}", "blue")
-
-        render_diversification_var_kpis(cr["weights"], cr["covariance"], capital)
-        portfolio_allocation_title()
-        display_portfolio_table(cr["table"], cr["use_fractional_shares"])
-
-        s1, s2 = st.columns(2)
-        with s1:
-            colored_metric(
-                "Total Invested", f"€{cr['total_invested']:,.2f}", "purple"
-            )
-        with s2:
-            colored_metric("Residual Cash", f"€{cr['cash']:,.2f}", "yellow")
-
-
-        st.divider()
-        stats_display = cr["stats"].copy()
-        stats_display.insert(
-            0,
-            "Instrument",
-            [get_company_name(t) for t in stats_display.index],
-        )
-        st.markdown("#### CAPM Asset Statistics")
-        st.dataframe(
-            stats_display.style.format({
-                "Beta": "{:.2f}",
-                "Alpha": "{:.2%}",
-                "R Squared": "{:.2%}",
-                "Market Correlation": "{:.2f}",
-                "Historical Return": "{:.2%}",
-                "CAPM Expected Return": "{:.2%}",
-            }),
-            use_container_width=True,
-        )
-
-        # =================================================
-        # CAPM REGRESSION
-        # =================================================
-
-        st.markdown("#### CAPM Regression")
-
-        st.caption(
-            "Each point represents one trading day. The horizontal axis shows "
-            "the selected benchmark excess return and the vertical axis shows the selected "
-            "asset's excess return. The fitted line is the CAPM regression: "
-            "its slope is Beta and its intercept is Alpha."
-        )
-
-        regression_ticker = st.selectbox(
-            "Select an asset",
-            options=list(cr["asset_returns"].columns),
-            format_func=get_company_name,
-            key="capm_regression_asset",
-        )
-
-        # Il CAPM è stimato sui rendimenti in eccesso.
-        # Convertiamo quindi il risk-free annuale in giornaliero.
-        daily_risk_free_rate = (1.0 + risk_free_rate) ** (1.0 / 252.0) - 1.0
-
-        regression_x = (
-            cr["market_returns"] - daily_risk_free_rate
-        ).rename("Market Excess Return")
-
-        regression_y = (
-            cr["asset_returns"][regression_ticker] - daily_risk_free_rate
-        ).rename("Asset Excess Return")
-
-        regression_data = pd.concat(
-            [regression_x, regression_y],
-            axis=1,
-        ).dropna()
-
-        regression_alpha_annual = float(
-            cr["stats"].loc[regression_ticker, "Alpha"]
-        )
-        regression_beta = float(
-            cr["stats"].loc[regression_ticker, "Beta"]
-        )
-        regression_r_squared = float(
-            cr["stats"].loc[regression_ticker, "R Squared"]
-        )
-
-        # calculate_capm espone Alpha annualizzato.
-        # Per disegnare la retta sui rendimenti giornalieri
-        # riconvertiamo l'intercetta alla scala giornaliera.
-        regression_alpha_daily = regression_alpha_annual / 252.0
-
-        x_min = float(regression_data["Market Excess Return"].min())
-        x_max = float(regression_data["Market Excess Return"].max())
-
-        regression_line_x = [x_min, x_max]
-        regression_line_y = [
-            regression_alpha_daily + regression_beta * x_min,
-            regression_alpha_daily + regression_beta * x_max,
-        ]
-
-        regression_fig = go.Figure()
-
-        regression_fig.add_trace(
-            go.Scatter(
-                x=regression_data["Market Excess Return"],
-                y=regression_data["Asset Excess Return"],
-                mode="markers",
-                name="Daily Returns",
-                marker=dict(
-                    size=6,
-                    opacity=0.55,
-                ),
-                customdata=regression_data.index.strftime("%d/%m/%Y"),
-                hovertemplate=(
-                    "Date: %{customdata}"
-                    "<br>FTSE MIB Excess Return: %{x:.2%}"
-                    "<br>Asset Excess Return: %{y:.2%}"
-                    "<extra></extra>"
-                ),
-            )
-        )
-
-        regression_fig.add_trace(
-            go.Scatter(
-                x=regression_line_x,
-                y=regression_line_y,
-                mode="lines",
-                name="CAPM Regression",
-                hovertemplate=(
-                    "FTSE MIB Excess Return: %{x:.2%}"
-                    "<br>Fitted Asset Excess Return: %{y:.2%}"
-                    "<extra>CAPM Regression</extra>"
-                ),
-            )
-        )
-
-        regression_fig.update_layout(
-            hovermode="closest",
-            legend_title="Series",
-        )
-
-        regression_fig.update_xaxes(
-            title_text="FTSE MIB Excess Return",
-            tickformat=".1%",
-            showline=True,
-            linecolor="rgba(255, 255, 255, 0.45)",
-            linewidth=1,
-            zeroline=True,
-            zerolinecolor="rgba(255, 255, 255, 0.18)",
-        )
-
-        regression_fig.update_yaxes(
-            title_text=f"{get_company_name(regression_ticker)} Excess Return",
-            tickformat=".1%",
-            showline=True,
-            linecolor="rgba(255, 255, 255, 0.45)",
-            linewidth=1,
-            zeroline=True,
-            zerolinecolor="rgba(255, 255, 255, 0.18)",
-        )
-
-
-
-        st.plotly_chart(
-            regression_fig,
-            use_container_width=True,
-            key="capm_regression_chart",
-        )
-
-        regression_col1, regression_col2, regression_col3 = st.columns(3)
-
-        regression_col1.metric(
-            "Beta",
-            f"{regression_beta:.2f}",
-        )
-
-        regression_col2.metric(
-            "Alpha (annualized)",
-            f"{regression_alpha_annual:.2%}",
-        )
-
-        regression_col3.metric(
-            "R²",
-            f"{regression_r_squared:.2%}",
-        )
-
-        st.divider()
-
-        st.markdown("#### Security Market Line")
-        st.caption(
-            "The Security Market Line (SML) shows the relationship between "
-            "systematic risk, measured by Beta, and the expected return implied "
-            "by CAPM. Assets with higher Beta require a higher expected return "
-            "as compensation for greater exposure to market risk."
-        )
-
-        sml_stats = cr["stats"].sort_values("Beta")
-        beta_min = min(0.0, float(sml_stats["Beta"].min()))
-        beta_max = max(1.0, float(sml_stats["Beta"].max()))
-        beta_line = pd.Series(
-            [beta_min + (beta_max - beta_min) * i / 100 for i in range(101)]
-        )
-        sml_return = (
-            risk_free_rate
-            + beta_line * (cr["market_expected_return"] - risk_free_rate)
-        )
-        sml_fig = go.Figure()
-        sml_fig.add_trace(go.Scatter(
-            x=beta_line, y=sml_return, mode="lines", name="Security Market Line"
-        ))
-        sml_fig.add_trace(go.Scatter(
-            x=sml_stats["Beta"],
-            y=sml_stats["CAPM Expected Return"],
-            mode="markers+text",
-            text=[get_company_name(t) for t in sml_stats.index],
-            textposition="top center",
-            name="Assets",
-        ))
-        sml_fig.update_layout(
-            hovermode="closest",
-        )
-        sml_fig.update_xaxes(
-            title_text="Beta",
-            showline=True,
-            linecolor="rgba(255, 255, 255, 0.45)",
-            linewidth=1,
-            zeroline=False,
-        )
-        sml_fig.update_yaxes(
-            title_text="Expected Return",
-            tickformat=".1%",
-            showline=True,
-            linecolor="rgba(255, 255, 255, 0.45)",
-            linewidth=1,
-            zeroline=False,
-        )
-        st.plotly_chart(sml_fig, use_container_width=True)
-
-        # =================================================
-        # CAPM EFFICIENT FRONTIER + CAPITAL MARKET LINE
-        # =================================================
-
-        st.divider()
-        st.markdown("#### CAPM Efficient Frontier & Capital Market Line")
-        st.caption(
-            "The Efficient Frontier represents the portfolios offering the "
-            "highest expected return for each level of volatility. The Capital "
-            "Market Line (CML) starts from the risk-free asset and is tangent "
-            "to the frontier at the CAPM Maximum Sharpe portfolio, representing "
-            "combinations of the risk-free asset and the tangency portfolio."
-        )
-
-        capm_frontier_fig = plot_efficient_frontier(
-            cr["frontier"],
-            cr["expected_returns"],
-            cr["covariance"],
-            cr["min_weights"],
-            cr["weights"],
-            risk_free_rate,
-        )
-
-        # Il Maximum Sharpe della frontiera CAPM è il portafoglio
-        # di tangenza della Capital Market Line.
-        tangency_volatility = cr["volatility"]
-        tangency_return = cr["return"]
-
-        # Estendiamo la CML oltre il portafoglio di tangenza, come nella
-        # rappresentazione teorica classica. L'estensione è puramente
-        # grafica e non modifica i pesi del portafoglio.
-        frontier_max_volatility = max(
-            float(cr["frontier"]["volatility"].max()),
-            float(cr["expected_returns"].index.to_series().map(
-                lambda ticker: cr["covariance"].loc[ticker, ticker] ** 0.5
-            ).max()),
-            float(tangency_volatility),
-        )
-        cml_max_volatility = frontier_max_volatility * 1.08
-
-        if tangency_volatility > 0:
-            cml_slope = (
-                (tangency_return - risk_free_rate)
-                / tangency_volatility
-            )
-            cml_end_return = (
-                risk_free_rate
-                + cml_slope * cml_max_volatility
+    if capm_model_tab.open:
+        with capm_model_tab:
+            st.subheader("Capital Asset Pricing Model (CAPM)")
+            st.caption(
+                "Market proxy: FTSE MIB. CAPM estimates each asset's beta, "
+                "alpha and expected return relative to the market, then uses "
+                "those expected returns in a Maximum Sharpe portfolio."
             )
 
-            capm_frontier_fig.add_trace(
-                go.Scatter(
-                    x=[0.0, cml_max_volatility],
-                    y=[risk_free_rate, cml_end_return],
-                    mode="lines",
-                    name="Capital Market Line",
-                    line=dict(
-                        color="rgba(56, 189, 248, 0.95)",
-                        width=2,
-                    ),
-                    hovertemplate=(
-                        "Capital Market Line<br>"
-                        "Volatility: %{x:.2%}<br>"
-                        "Expected Return: %{y:.2%}"
-                        "<extra></extra>"
-                    ),
+            with st.container(key="kangemi_controls_capm"):
+                capm_col1, capm_col2 = st.columns([3, 1], vertical_alignment="bottom")
+
+                with capm_col1:
+                    capm_period = st.selectbox(
+                        "Historical estimation period",
+                        ["1y", "2y", "5y", "10y"],
+                        index=2,
+                        key="capm_period",
+                    )
+
+                with capm_col2:
+                    run_capm = st.button(
+                        "Run CAPM",
+                        type="primary",
+                        use_container_width=True,
+                    )
+
+            if run_capm and validate_portfolio(tickers, max_weight):
+                try:
+                    with st.spinner("Running CAPM analysis..."):
+                        capm_prices = get_prices(tickers, period=capm_period)
+                        market_prices = get_prices([FTSE_MIB_TICKER], period=capm_period)
+
+                        asset_returns = calculate_returns(capm_prices)
+                        market_returns = calculate_returns(market_prices).iloc[:, 0]
+
+                        common_index = asset_returns.index.intersection(market_returns.index)
+                        asset_returns = asset_returns.loc[common_index]
+                        market_returns = market_returns.loc[common_index]
+
+                        capm_stats = calculate_capm(
+                            asset_returns,
+                            market_returns,
+                            risk_free_rate=risk_free_rate,
+                        )
+
+                        capm_mu = capm_stats["CAPM Expected Return"]
+                        capm_covariance = covariance_matrix(asset_returns)
+
+                        capm_weights = optimize_maximum_sharpe(
+                            capm_mu,
+                            capm_covariance,
+                            risk_free_rate=risk_free_rate,
+                            max_weight=max_weight,
+                        )
+
+                        # Frontiera efficiente costruita usando i rendimenti
+                        # attesi impliciti del CAPM e la covarianza storica.
+                        capm_min_weights = optimize_minimum_volatility(
+                            capm_mu,
+                            capm_covariance,
+                            max_weight=max_weight,
+                        )
+
+                        capm_frontier = efficient_frontier(
+                            capm_mu,
+                            capm_covariance,
+                            max_weight=max_weight,
+                            points=100,
+                        )
+
+                        capm_portfolio_return = portfolio_return(
+                            capm_weights.values, capm_mu
+                        )
+                        capm_portfolio_volatility = portfolio_volatility(
+                            capm_weights.values, capm_covariance
+                        )
+                        capm_portfolio_sharpe = (
+                            (capm_portfolio_return - risk_free_rate)
+                            / capm_portfolio_volatility
+                            if capm_portfolio_volatility > 0 else 0.0
+                        )
+
+                        capm_table = prepare_portfolio_table(
+                            capm_weights, capm_prices, capital, use_fractional_shares
+                        )
+                        capm_total_invested = capm_table["Invested"].sum()
+
+                        st.session_state.factor_model_results = {
+                            "period": capm_period,
+                            "stats": capm_stats,
+                            "expected_returns": capm_mu,
+                            "covariance": capm_covariance,
+                            "frontier": capm_frontier,
+                            "min_weights": capm_min_weights,
+                            "weights": capm_weights,
+                            "prices": capm_prices,
+                            "table": capm_table,
+                            "return": capm_portfolio_return,
+                            "volatility": capm_portfolio_volatility,
+                            "sharpe": capm_portfolio_sharpe,
+                            "total_invested": capm_total_invested,
+                            "cash": capital - capm_total_invested,
+                            "use_fractional_shares": use_fractional_shares,
+                            "market_expected_return": float(market_returns.mean() * 252),
+                            "asset_returns": asset_returns,
+                            "market_returns": market_returns,
+                        }
+                except Exception as e:
+                    st.error(f"CAPM analysis failed: {e}")
+
+            capm_result = st.session_state.factor_model_results
+
+            if capm_result is None:
+                st.info(
+                    "Select the instruments and parameters, then click "
+                    "**Run CAPM**."
                 )
-            )
-
-        # Risk-free asset: volatilità zero e rendimento pari al tasso
-        # privo di rischio impostato nella sidebar.
-        capm_frontier_fig.add_trace(
-            go.Scatter(
-                x=[0.0],
-                y=[risk_free_rate],
-                mode="markers+text",
-                text=["Risk-Free Asset"],
-                textposition="top right",
-                name="Risk-Free Asset",
-                marker=dict(
-                    size=10,
-                    symbol="diamond",
-                    color="rgba(245, 158, 11, 1.0)",
-                ),
-                hovertemplate=(
-                    "Risk-Free Asset<br>"
-                    "Volatility: 0.00%<br>"
-                    "Expected Return: %{y:.2%}"
-                    "<extra></extra>"
-                ),
-            )
-        )
-
-        # Rinominiamo il punto Maximum Sharpe già prodotto dalla funzione
-        # standard per chiarire che qui è il portafoglio CAPM di tangenza.
-        for trace in capm_frontier_fig.data:
-            if trace.name == "Maximum Sharpe":
-                trace.name = "CAPM Maximum Sharpe"
-
-        # Il titolo è già mostrato da Streamlit sopra il grafico:
-        # evitiamo quindi di duplicarlo dentro Plotly.
-        capm_frontier_fig.update_layout(
-            title=None,
-            hovermode="closest",
-        )
-        capm_frontier_fig.update_xaxes(
-            title_text="Volatility",
-            tickformat=".0%",
-            showline=True,
-            linecolor="rgba(255, 255, 255, 0.45)",
-            linewidth=1,
-            zeroline=False,
-            rangemode="tozero",
-        )
-        capm_frontier_fig.update_yaxes(
-            title_text="Expected Return",
-            tickformat=".1%",
-            showline=True,
-            linecolor="rgba(255, 255, 255, 0.45)",
-            linewidth=1,
-            zeroline=False,
-        )
-
-        st.plotly_chart(
-            capm_frontier_fig,
-            use_container_width=True,
-        )
-
-
-
-
-    # =====================================================
-    # FAMA-FRENCH THREE-FACTOR MODEL (EUROPE)
-    # =====================================================
-    st.divider()
-    st.subheader("Fama–French Three-Factor Model (FF3)")
-    st.caption(
-        "Region-specific daily MKT−RF, SMB and HML factors from the Kenneth French Data Library. "
-        "European factors are converted to EUR using EURUSD and the ECB €STR rate before estimating factor exposures."
-    )
-    ff3_col1, ff3_col2 = st.columns([3, 1], vertical_alignment="bottom")
-    with ff3_col1:
-        ff3_period = st.selectbox(
-            "FF3 historical estimation period", ["1y", "2y", "5y", "10y"],
-            index=2, key="ff3_period"
-        )
-    with ff3_col2:
-        run_ff3 = st.button("Run FF3 Analysis", use_container_width=True)
-        run_ff3_factor = st.button("Run FF3 Factor Cov", use_container_width=True)
-
-    if (run_ff3 or run_ff3_factor) and validate_portfolio(tickers, max_weight):
-        try:
-            with st.spinner("Estimating regional Fama–French factors..."):
-                ff3_eur_prices = get_prices(tickers, period=ff3_period, preserve_missing=True)
-                ff3_factors = load_us_ff3() if market == "USA" else load_europe_ff3()
-                ff3_fx_prices = None if market == "USA" else get_prices(["EURUSD=X"], period=ff3_period)
-                ff3_mu_eur, ff3_stats = estimate_factor_returns(
-                    ff3_eur_prices, ff3_factors, ff3_fx_prices,
-                    market=market, model="ff3", return_stats=True,
+            else:
+                cr = capm_result
+                st.divider()
+                st.caption(
+                    f"CAPM estimated using {cr['period']} of historical data "
+                    "and FTSE MIB as the market proxy."
                 )
-                ff3_cov = covariance_matrix(calculate_returns(ff3_eur_prices))
-                if run_ff3_factor:
-                    from src.factor_covariance import estimate_factor_covariance
-                    ff3_cov = estimate_factor_covariance(ff3_eur_prices, ff3_factors, model="ff3", eurusd_prices=ff3_fx_prices, market=market)
-                ff3_mu_eur = ff3_mu_eur.reindex(ff3_cov.index)
-                ff3_weights = optimize_maximum_sharpe(
-                    ff3_mu_eur, ff3_cov,
-                    risk_free_rate=risk_free_rate, max_weight=max_weight
-                )
-                ff3_return = portfolio_return(ff3_weights.values, ff3_mu_eur)
-                ff3_vol = portfolio_volatility(ff3_weights.values, ff3_cov)
-                ff3_table = prepare_portfolio_table(
-                    ff3_weights, ff3_eur_prices, capital, use_fractional_shares
-                )
-                result_key = "ff3_factor_results" if run_ff3_factor else "ff3_results"
-                st.session_state[result_key] = {
-                    "period": ff3_period, "stats": ff3_stats,
-                    "expected_returns_eur": ff3_mu_eur,
-                    "covariance": ff3_cov,
-                    "weights": ff3_weights, "table": ff3_table,
-                    "return": ff3_return, "volatility": ff3_vol,
-                    "sharpe": (ff3_return-risk_free_rate)/ff3_vol if ff3_vol>0 else 0.0,
-                    "total_invested": float(ff3_table["Invested"].sum()),
-                    "use_fractional_shares": use_fractional_shares,
-                    "fx_drift_annualized": None,
-                    "factor_observations": len(ff3_factors),
-                }
-        except Exception as exc:
-            st.error(f"FF3 analysis failed: {exc}")
-
-    factor_result = st.session_state.get("ff3_factor_results")
-    if factor_result is not None:
-        st.markdown("#### FF3 Factor Cov — Maximum Sharpe Portfolio")
-        st.caption(factor_estimation_caption("FF3", factor_result))
-        fc1, fc2, fc3 = st.columns(3)
-        with fc1:
-            colored_metric("Expected Return", f"{factor_result['return']:.2%}", "green")
-        with fc2:
-            colored_metric("Volatility", f"{factor_result['volatility']:.2%}", "red")
-        with fc3:
-            colored_metric("Sharpe Ratio", f"{factor_result['sharpe']:.2f}", "blue")
-        render_diversification_var_kpis(factor_result["weights"], factor_result["covariance"], capital)
-        portfolio_allocation_title()
-        display_portfolio_table(factor_result["table"], factor_result["use_fractional_shares"])
-    ff3_result = st.session_state.get("ff3_results")
-    if ff3_result is not None:
-        st.caption(factor_estimation_caption("FF3", ff3_result))
-        st.markdown("#### FF3 Maximum Sharpe Portfolio")
-        ff3_m1, ff3_m2, ff3_m3 = st.columns(3)
-        with ff3_m1:
-            colored_metric("Expected Return", f"{ff3_result['return']:.2%}", "green")
-        with ff3_m2:
-            colored_metric("Volatility", f"{ff3_result['volatility']:.2%}", "red")
-        with ff3_m3:
-            colored_metric("Sharpe Ratio", f"{ff3_result['sharpe']:.2f}", "blue")
-        render_diversification_var_kpis(ff3_result["weights"], ff3_result["covariance"], capital)
-        portfolio_allocation_title()
-        display_portfolio_table(ff3_result["table"], ff3_result["use_fractional_shares"])
-        ff3_cash_1, ff3_cash_2 = st.columns(2)
-        with ff3_cash_1:
-            colored_metric("Total Invested", f"€{ff3_result['total_invested']:,.2f}", "purple")
-        with ff3_cash_2:
-            colored_metric("Residual Cash", f"€{capital-ff3_result['total_invested']:,.2f}", "yellow")
-        st.markdown("#### FF3 Asset Statistics")
-        ff3_display = ff3_result["stats"].copy()
-        ff3_display.insert(0, "Instrument", [get_company_name(t) for t in ff3_display.index])
-        ff3_display["FF3 Expected Return EUR"] = ff3_result["expected_returns_eur"]
-        st.dataframe(ff3_display.style.format({
-            "Alpha (annualized)": "{:.2%}", "Beta MKT": "{:.3f}",
-            "Beta SMB": "{:.3f}", "Beta HML": "{:.3f}",
-            "R Squared": "{:.2%}",
-            "FF3 Expected Return USD": "{:.2%}",
-            "FF3 Expected Return EUR": "{:.2%}",
-            "Historical Return USD": "{:.2%}",
-        }), use_container_width=True)
-        st.caption(
-            "Expected returns use historical factor averages, excluding estimated alpha. "
-            "The USD-to-EUR conversion uses historical average EUR/USD drift as an "
-            "approximation, not an FX forecast. Factor exposures are estimated in USD. "
-            "This is an in-sample allocation, not a walk-forward FF3 backtest."
-        )
-    else:
-        st.info("Click **Run FF3 Analysis** to estimate the three-factor model.")
 
 
-    # =====================================================
-    # FAMA-FRENCH FIVE-FACTOR MODEL (EUROPE)
-    # =====================================================
-    st.divider()
-    st.subheader("Fama–French Five-Factor Model (FF5)")
-    st.caption(
-        "Region-specific daily MKT−RF, SMB, HML, RMW and CMA factors from the "
-        "Kenneth French Data Library. European factors are converted to EUR "
-        "using EURUSD and the ECB €STR rate before estimating factor exposures."
-    )
-    ff5_c1, ff5_c2 = st.columns([3, 1], vertical_alignment="bottom")
-    with ff5_c1:
-        ff5_period = st.selectbox(
-            "FF5 historical estimation period", ["1y", "2y", "5y", "10y"],
-            index=2, key="ff5_period"
-        )
-    with ff5_c2:
-        run_ff5 = st.button("Run FF5 Analysis", use_container_width=True)
-        run_ff5_factor = st.button("Run FF5 Factor Cov", use_container_width=True)
+                st.subheader("CAPM Maximum Sharpe Portfolio")
+                st.caption(
+                    "Maximum Sharpe allocation using CAPM expected returns "
+                    "instead of historical mean returns."
+                )
 
-    if (run_ff5 or run_ff5_factor) and validate_portfolio(tickers, max_weight):
-        try:
-            with st.spinner("Estimating European FF5 factors..."):
-                ff5_eur_prices = get_prices(tickers, period=ff5_period, preserve_missing=True)
-                ff5_factors = load_us_ff5() if market == "USA" else load_europe_ff5()
-                ff5_fx_prices = None if market == "USA" else get_prices(["EURUSD=X"], period=ff5_period)
-                ff5_mu_eur, ff5_stats = estimate_factor_returns(
-                    ff5_eur_prices, ff5_factors, ff5_fx_prices,
-                    market=market, model="ff5", return_stats=True,
-                )
-                ff5_cov = covariance_matrix(calculate_returns(ff5_eur_prices))
-                if run_ff5_factor:
-                    from src.factor_covariance import estimate_factor_covariance
-                    ff5_cov = estimate_factor_covariance(ff5_eur_prices, ff5_factors, model="ff5", eurusd_prices=ff5_fx_prices, market=market)
-                ff5_mu_eur = ff5_mu_eur.reindex(ff5_cov.index)
-                ff5_weights = optimize_maximum_sharpe(
-                    ff5_mu_eur, ff5_cov,
-                    risk_free_rate=risk_free_rate, max_weight=max_weight
-                )
-                ff5_return = portfolio_return(ff5_weights.values, ff5_mu_eur)
-                ff5_vol = portfolio_volatility(ff5_weights.values, ff5_cov)
-                ff5_table = prepare_portfolio_table(
-                    ff5_weights, ff5_eur_prices, capital, use_fractional_shares
-                )
-                result_key = "ff5_factor_results" if run_ff5_factor else "ff5_results"
-                st.session_state[result_key] = {
-                    "period": ff5_period, "stats": ff5_stats,
-                    "expected_returns_eur": ff5_mu_eur,
-                    "covariance": ff5_cov,
-                    "weights": ff5_weights, "table": ff5_table,
-                    "return": ff5_return, "volatility": ff5_vol,
-                    "sharpe": (ff5_return-risk_free_rate)/ff5_vol if ff5_vol>0 else 0.0,
-                    "total_invested": float(ff5_table["Invested"].sum()),
-                    "use_fractional_shares": use_fractional_shares,
-                    "fx_drift_annualized": None,
-                    "factor_observations": len(ff5_factors),
-                }
-        except Exception as exc:
-            st.error(f"FF5 analysis failed: {exc}")
+                m1, m2, m3 = st.columns(3)
+                with m1:
+                    colored_metric("Expected Return", f"{cr['return']:.2%}", "green")
+                with m2:
+                    colored_metric("Volatility", f"{cr['volatility']:.2%}", "red")
+                with m3:
+                    colored_metric("Sharpe Ratio", f"{cr['sharpe']:.2f}", "blue")
 
-    factor_result = st.session_state.get("ff5_factor_results")
-    if factor_result is not None:
-        st.markdown("#### FF5 Factor Cov — Maximum Sharpe Portfolio")
-        st.caption(factor_estimation_caption("FF5", factor_result))
-        fc1, fc2, fc3 = st.columns(3)
-        with fc1:
-            colored_metric("Expected Return", f"{factor_result['return']:.2%}", "green")
-        with fc2:
-            colored_metric("Volatility", f"{factor_result['volatility']:.2%}", "red")
-        with fc3:
-            colored_metric("Sharpe Ratio", f"{factor_result['sharpe']:.2f}", "blue")
-        render_diversification_var_kpis(factor_result["weights"], factor_result["covariance"], capital)
-        portfolio_allocation_title()
-        display_portfolio_table(factor_result["table"], factor_result["use_fractional_shares"])
-    ff5_result = st.session_state.get("ff5_results")
-    if ff5_result is not None:
-        st.caption(factor_estimation_caption("FF5", ff5_result))
-        st.markdown("#### FF5 Maximum Sharpe Portfolio")
-        ff5_m1, ff5_m2, ff5_m3 = st.columns(3)
-        with ff5_m1:
-            colored_metric("Expected Return", f"{ff5_result['return']:.2%}", "green")
-        with ff5_m2:
-            colored_metric("Volatility", f"{ff5_result['volatility']:.2%}", "red")
-        with ff5_m3:
-            colored_metric("Sharpe Ratio", f"{ff5_result['sharpe']:.2f}", "blue")
-        render_diversification_var_kpis(ff5_result["weights"], ff5_result["covariance"], capital)
-        portfolio_allocation_title()
-        display_portfolio_table(ff5_result["table"], ff5_result["use_fractional_shares"])
-        ff5_cash_1, ff5_cash_2 = st.columns(2)
-        with ff5_cash_1:
-            colored_metric("Total Invested", f"€{ff5_result['total_invested']:,.2f}", "purple")
-        with ff5_cash_2:
-            colored_metric("Residual Cash", f"€{capital-ff5_result['total_invested']:,.2f}", "yellow")
-        st.markdown("#### FF5 Asset Statistics")
-        ff5_display = ff5_result["stats"].copy()
-        ff5_display.insert(
-            0, "Instrument", [get_company_name(t) for t in ff5_display.index]
-        )
-        ff5_display["FF5 Expected Return EUR"] = ff5_result["expected_returns_eur"]
-        st.dataframe(ff5_display.style.format({
-            "Alpha (annualized)": "{:.2%}",
-            "Beta MKT": "{:.3f}", "Beta SMB": "{:.3f}",
-            "Beta HML": "{:.3f}", "Beta RMW": "{:.3f}",
-            "Beta CMA": "{:.3f}", "R Squared": "{:.2%}",
-            "FF5 Expected Return USD": "{:.2%}",
-            "FF5 Expected Return EUR": "{:.2%}",
-            "Historical Return USD": "{:.2%}",
-        }), use_container_width=True)
-        st.caption(
-            "Expected returns use historical factor means, excluding estimated alpha. "
-            "FX drift is an approximation, not a forecast. This is an in-sample "
-            "allocation, not a walk-forward FF5 backtest."
-        )
-        ff3_compare = st.session_state.get("ff3_results")
-        if ff3_compare is not None:
-            st.markdown("#### FF3 vs FF5 — In-sample Comparison")
-            st.dataframe(pd.DataFrame({
-                "FF3": {
-                    "Expected Return": ff3_compare["return"],
-                    "Volatility": ff3_compare["volatility"],
-                    "Sharpe Ratio": ff3_compare["sharpe"],
-                },
-                "FF5": {
-                    "Expected Return": ff5_result["return"],
-                    "Volatility": ff5_result["volatility"],
-                    "Sharpe Ratio": ff5_result["sharpe"],
-                },
-            }).style.format("{:.3f}"), use_container_width=True)
-            if ff3_compare["period"] != ff5_result["period"]:
-                st.warning(
-                    "FF3 and FF5 use different estimation periods. "
-                    "Choose matching periods before comparing."
+                render_diversification_var_kpis(cr["weights"], cr["covariance"], capital)
+                portfolio_allocation_title()
+                display_portfolio_table(cr["table"], cr["use_fractional_shares"])
+
+                s1, s2 = st.columns(2)
+                with s1:
+                    colored_metric(
+                        "Total Invested", f"€{cr['total_invested']:,.2f}", "purple"
+                    )
+                with s2:
+                    colored_metric("Residual Cash", f"€{cr['cash']:,.2f}", "yellow")
+
+
+                st.divider()
+                stats_display = cr["stats"].copy()
+                stats_display.insert(
+                    0,
+                    "Instrument",
+                    [get_company_name(t) for t in stats_display.index],
                 )
-    else:
-        st.info("Click **Run FF5 Analysis** to estimate the five-factor model.")
+                st.markdown("#### CAPM Asset Statistics")
+                st.dataframe(
+                    stats_display.style.format({
+                        "Beta": "{:.2f}",
+                        "Alpha": "{:.2%}",
+                        "R Squared": "{:.2%}",
+                        "Market Correlation": "{:.2f}",
+                        "Historical Return": "{:.2%}",
+                        "CAPM Expected Return": "{:.2%}",
+                    }),
+                    use_container_width=True,
+                )
+
+                # =================================================
+                # CAPM REGRESSION
+                # =================================================
+
+                st.markdown("#### CAPM Regression")
+
+                st.caption(
+                    "Each point represents one trading day. The horizontal axis shows "
+                    "the selected benchmark excess return and the vertical axis shows the selected "
+                    "asset's excess return. The fitted line is the CAPM regression: "
+                    "its slope is Beta and its intercept is Alpha."
+                )
+
+                regression_ticker = st.selectbox(
+                    "Select an asset",
+                    options=list(cr["asset_returns"].columns),
+                    format_func=get_company_name,
+                    key="capm_regression_asset",
+                )
+
+                # Il CAPM è stimato sui rendimenti in eccesso.
+                # Convertiamo quindi il risk-free annuale in giornaliero.
+                daily_risk_free_rate = (1.0 + risk_free_rate) ** (1.0 / 252.0) - 1.0
+
+                regression_x = (
+                    cr["market_returns"] - daily_risk_free_rate
+                ).rename("Market Excess Return")
+
+                regression_y = (
+                    cr["asset_returns"][regression_ticker] - daily_risk_free_rate
+                ).rename("Asset Excess Return")
+
+                regression_data = pd.concat(
+                    [regression_x, regression_y],
+                    axis=1,
+                ).dropna()
+
+                regression_alpha_annual = float(
+                    cr["stats"].loc[regression_ticker, "Alpha"]
+                )
+                regression_beta = float(
+                    cr["stats"].loc[regression_ticker, "Beta"]
+                )
+                regression_r_squared = float(
+                    cr["stats"].loc[regression_ticker, "R Squared"]
+                )
+
+                # calculate_capm espone Alpha annualizzato.
+                # Per disegnare la retta sui rendimenti giornalieri
+                # riconvertiamo l'intercetta alla scala giornaliera.
+                regression_alpha_daily = regression_alpha_annual / 252.0
+
+                x_min = float(regression_data["Market Excess Return"].min())
+                x_max = float(regression_data["Market Excess Return"].max())
+
+                regression_line_x = [x_min, x_max]
+                regression_line_y = [
+                    regression_alpha_daily + regression_beta * x_min,
+                    regression_alpha_daily + regression_beta * x_max,
+                ]
+
+                regression_fig = go.Figure()
+
+                regression_fig.add_trace(
+                    go.Scatter(
+                        x=regression_data["Market Excess Return"],
+                        y=regression_data["Asset Excess Return"],
+                        mode="markers",
+                        name="Daily Returns",
+                        marker=dict(
+                            size=6,
+                            opacity=0.55,
+                        ),
+                        customdata=regression_data.index.strftime("%d/%m/%Y"),
+                        hovertemplate=(
+                            "Date: %{customdata}"
+                            "<br>FTSE MIB Excess Return: %{x:.2%}"
+                            "<br>Asset Excess Return: %{y:.2%}"
+                            "<extra></extra>"
+                        ),
+                    )
+                )
+
+                regression_fig.add_trace(
+                    go.Scatter(
+                        x=regression_line_x,
+                        y=regression_line_y,
+                        mode="lines",
+                        name="CAPM Regression",
+                        hovertemplate=(
+                            "FTSE MIB Excess Return: %{x:.2%}"
+                            "<br>Fitted Asset Excess Return: %{y:.2%}"
+                            "<extra>CAPM Regression</extra>"
+                        ),
+                    )
+                )
+
+                regression_fig.update_layout(
+                    hovermode="closest",
+                    legend_title="Series",
+                )
+
+                regression_fig.update_xaxes(
+                    title_text="FTSE MIB Excess Return",
+                    tickformat=".1%",
+                    showline=True,
+                    linecolor="rgba(255, 255, 255, 0.45)",
+                    linewidth=1,
+                    zeroline=True,
+                    zerolinecolor="rgba(255, 255, 255, 0.18)",
+                )
+
+                regression_fig.update_yaxes(
+                    title_text=f"{get_company_name(regression_ticker)} Excess Return",
+                    tickformat=".1%",
+                    showline=True,
+                    linecolor="rgba(255, 255, 255, 0.45)",
+                    linewidth=1,
+                    zeroline=True,
+                    zerolinecolor="rgba(255, 255, 255, 0.18)",
+                )
+
+
+
+                st.plotly_chart(
+                    regression_fig,
+                    use_container_width=True,
+                    key="capm_regression_chart",
+                )
+
+                regression_col1, regression_col2, regression_col3 = st.columns(3)
+
+                regression_col1.metric(
+                    "Beta",
+                    f"{regression_beta:.2f}",
+                )
+
+                regression_col2.metric(
+                    "Alpha (annualized)",
+                    f"{regression_alpha_annual:.2%}",
+                )
+
+                regression_col3.metric(
+                    "R²",
+                    f"{regression_r_squared:.2%}",
+                )
+
+                st.divider()
+
+                st.markdown("#### Security Market Line")
+                st.caption(
+                    "The Security Market Line (SML) shows the relationship between "
+                    "systematic risk, measured by Beta, and the expected return implied "
+                    "by CAPM. Assets with higher Beta require a higher expected return "
+                    "as compensation for greater exposure to market risk."
+                )
+
+                sml_stats = cr["stats"].sort_values("Beta")
+                beta_min = min(0.0, float(sml_stats["Beta"].min()))
+                beta_max = max(1.0, float(sml_stats["Beta"].max()))
+                beta_line = pd.Series(
+                    [beta_min + (beta_max - beta_min) * i / 100 for i in range(101)]
+                )
+                sml_return = (
+                    risk_free_rate
+                    + beta_line * (cr["market_expected_return"] - risk_free_rate)
+                )
+                sml_fig = go.Figure()
+                sml_fig.add_trace(go.Scatter(
+                    x=beta_line, y=sml_return, mode="lines", name="Security Market Line"
+                ))
+                sml_fig.add_trace(go.Scatter(
+                    x=sml_stats["Beta"],
+                    y=sml_stats["CAPM Expected Return"],
+                    mode="markers+text",
+                    text=[get_company_name(t) for t in sml_stats.index],
+                    textposition="top center",
+                    name="Assets",
+                ))
+                sml_fig.update_layout(
+                    hovermode="closest",
+                )
+                sml_fig.update_xaxes(
+                    title_text="Beta",
+                    showline=True,
+                    linecolor="rgba(255, 255, 255, 0.45)",
+                    linewidth=1,
+                    zeroline=False,
+                )
+                sml_fig.update_yaxes(
+                    title_text="Expected Return",
+                    tickformat=".1%",
+                    showline=True,
+                    linecolor="rgba(255, 255, 255, 0.45)",
+                    linewidth=1,
+                    zeroline=False,
+                )
+                st.plotly_chart(sml_fig, use_container_width=True)
+
+                # =================================================
+                # CAPM EFFICIENT FRONTIER + CAPITAL MARKET LINE
+                # =================================================
+
+                st.divider()
+                st.markdown("#### CAPM Efficient Frontier & Capital Market Line")
+                st.caption(
+                    "The Efficient Frontier represents the portfolios offering the "
+                    "highest expected return for each level of volatility. The Capital "
+                    "Market Line (CML) starts from the risk-free asset and is tangent "
+                    "to the frontier at the CAPM Maximum Sharpe portfolio, representing "
+                    "combinations of the risk-free asset and the tangency portfolio."
+                )
+
+                capm_frontier_fig = plot_efficient_frontier(
+                    cr["frontier"],
+                    cr["expected_returns"],
+                    cr["covariance"],
+                    cr["min_weights"],
+                    cr["weights"],
+                    risk_free_rate,
+                )
+
+                # Il Maximum Sharpe della frontiera CAPM è il portafoglio
+                # di tangenza della Capital Market Line.
+                tangency_volatility = cr["volatility"]
+                tangency_return = cr["return"]
+
+                # Estendiamo la CML oltre il portafoglio di tangenza, come nella
+                # rappresentazione teorica classica. L'estensione è puramente
+                # grafica e non modifica i pesi del portafoglio.
+                frontier_max_volatility = max(
+                    float(cr["frontier"]["volatility"].max()),
+                    float(cr["expected_returns"].index.to_series().map(
+                        lambda ticker: cr["covariance"].loc[ticker, ticker] ** 0.5
+                    ).max()),
+                    float(tangency_volatility),
+                )
+                cml_max_volatility = frontier_max_volatility * 1.08
+
+                if tangency_volatility > 0:
+                    cml_slope = (
+                        (tangency_return - risk_free_rate)
+                        / tangency_volatility
+                    )
+                    cml_end_return = (
+                        risk_free_rate
+                        + cml_slope * cml_max_volatility
+                    )
+
+                    capm_frontier_fig.add_trace(
+                        go.Scatter(
+                            x=[0.0, cml_max_volatility],
+                            y=[risk_free_rate, cml_end_return],
+                            mode="lines",
+                            name="Capital Market Line",
+                            line=dict(
+                                color="rgba(56, 189, 248, 0.95)",
+                                width=2,
+                            ),
+                            hovertemplate=(
+                                "Capital Market Line<br>"
+                                "Volatility: %{x:.2%}<br>"
+                                "Expected Return: %{y:.2%}"
+                                "<extra></extra>"
+                            ),
+                        )
+                    )
+
+                # Risk-free asset: volatilità zero e rendimento pari al tasso
+                # privo di rischio impostato nella sidebar.
+                capm_frontier_fig.add_trace(
+                    go.Scatter(
+                        x=[0.0],
+                        y=[risk_free_rate],
+                        mode="markers+text",
+                        text=["Risk-Free Asset"],
+                        textposition="top right",
+                        name="Risk-Free Asset",
+                        marker=dict(
+                            size=10,
+                            symbol="diamond",
+                            color="rgba(245, 158, 11, 1.0)",
+                        ),
+                        hovertemplate=(
+                            "Risk-Free Asset<br>"
+                            "Volatility: 0.00%<br>"
+                            "Expected Return: %{y:.2%}"
+                            "<extra></extra>"
+                        ),
+                    )
+                )
+
+                # Rinominiamo il punto Maximum Sharpe già prodotto dalla funzione
+                # standard per chiarire che qui è il portafoglio CAPM di tangenza.
+                for trace in capm_frontier_fig.data:
+                    if trace.name == "Maximum Sharpe":
+                        trace.name = "CAPM Maximum Sharpe"
+
+                # Il titolo è già mostrato da Streamlit sopra il grafico:
+                # evitiamo quindi di duplicarlo dentro Plotly.
+                capm_frontier_fig.update_layout(
+                    title=None,
+                    hovermode="closest",
+                )
+                capm_frontier_fig.update_xaxes(
+                    title_text="Volatility",
+                    tickformat=".0%",
+                    showline=True,
+                    linecolor="rgba(255, 255, 255, 0.45)",
+                    linewidth=1,
+                    zeroline=False,
+                    rangemode="tozero",
+                )
+                capm_frontier_fig.update_yaxes(
+                    title_text="Expected Return",
+                    tickformat=".1%",
+                    showline=True,
+                    linecolor="rgba(255, 255, 255, 0.45)",
+                    linewidth=1,
+                    zeroline=False,
+                )
+
+                st.plotly_chart(
+                    capm_frontier_fig,
+                    use_container_width=True,
+                )
+
+    for model, model_tab in (("FF3", ff3_model_tab), ("FF5", ff5_model_tab)):
+        if model_tab.open:
+            with model_tab:
+                render_fama_french_model(model, tickers, market, capital, max_weight,
+                                         risk_free_rate, use_fractional_shares)
 
     render_factors_k(
         st.session_state.get("factor_model_results"),
@@ -6706,131 +7035,132 @@ with backtest_tab:
     # =====================================================
 
     with standard_col:
+        with st.container(border=True, key="backtest_standard_panel"):
 
-        st.subheader(
-            "Standard Walk-Forward"
-        )
-
-        st.caption(
-            "Uses one historical dataset. The first "
-            "part is used for estimation and the "
-            "remaining observations form the backtest. "
-            "The estimation window then rolls forward "
-            "at every rebalance."
-        )
-
-        run_standard = (
-            st.checkbox(
-                "Run Standard Walk-Forward",
-                value=True,
-                key="run_standard",
+            st.subheader(
+                "Standard Walk-Forward"
             )
-        )
 
-        standard_period = (
-            st.selectbox(
-                "Historical dataset",
-                [f"{year}y" for year in range(1, 11)],
-                index=4,
-                key="standard_period",
+            st.caption(
+                "Uses one historical dataset. The first "
+                "part is used for estimation and the "
+                "remaining observations form the backtest. "
+                "The estimation window then rolls forward "
+                "at every rebalance."
             )
-        )
 
-        standard_dataset_years = int(standard_period[:-1])
-        standard_lookback_options = {
-            f"{year} year" + ("s" if year != 1 else ""): 252 * year
-            for year in range(1, standard_dataset_years)
-        }
-        if not standard_lookback_options:
-            standard_lookback_options = {"6 months": 126}
-
-        standard_lookback_label = (
-            st.selectbox(
-                "Estimation window",
-                list(
-                    standard_lookback_options.keys()
-                ),
-                index=min(1, len(standard_lookback_options) - 1),
-                key="standard_lookback",
+            run_standard = (
+                st.checkbox(
+                    "Run Standard Walk-Forward",
+                    value=True,
+                    key="run_standard",
+                )
             )
-        )
 
-        standard_lookback_days = (
-            standard_lookback_options[
-                standard_lookback_label
-            ]
-        )
-
-        standard_rebalance_options = {
-            "Monthly": 21,
-            "Quarterly": 63,
-            "Semiannual": 126,
-            "Annual": 252,
-        }
-
-        standard_rebalance_label = (
-            st.selectbox(
-                "Rebalancing frequency",
-                list(
-                    standard_rebalance_options.keys()
-                ),
-                index=1,
-                key="standard_rebalance",
+            standard_period = (
+                st.selectbox(
+                    "Historical dataset",
+                    [f"{year}y" for year in range(1, 11)],
+                    index=4,
+                    key="standard_period",
+                )
             )
-        )
 
-        standard_rebalance_days = (
-            standard_rebalance_options[
-                standard_rebalance_label
-            ]
-        )
+            standard_dataset_years = int(standard_period[:-1])
+            standard_lookback_options = {
+                f"{year} year" + ("s" if year != 1 else ""): 252 * year
+                for year in range(1, standard_dataset_years)
+            }
+            if not standard_lookback_options:
+                standard_lookback_options = {"6 months": 126}
 
-        if selection_mode == "Quant Selection":
-            standard_selection_policy_labels = st.multiselect(
-                "Asset selection policy",
-                [
-                    "Fixed at Backtest Start",
-                    "Re-screen at Every Rebalance",
-                ],
-                default=["Fixed at Backtest Start"],
-                key="standard_selection_policies",
-                help=(
-                    "You can run either policy or both. Fixed selects assets "
-                    "once at the beginning of the out-of-sample period and "
-                    "subsequent rebalances update weights only. Dynamic "
-                    "rebuilds the Momentum + Risk ranking at every rebalance, "
-                    "so both constituents and weights may change."
-                ),
+            standard_lookback_label = (
+                st.selectbox(
+                    "Estimation window",
+                    list(
+                        standard_lookback_options.keys()
+                    ),
+                    index=min(1, len(standard_lookback_options) - 1),
+                    key="standard_lookback",
+                )
             )
-        else:
-            standard_selection_policy_labels = ["Manual universe"]
 
-        # Optional short-horizon evaluation: keep the rolling estimation
-        # window unchanged, but test only the most recent N trading days.
-        standard_oos_options = {
-            "Remaining historical period": None,
-            "1 month": 21,
-            "2 months": 42,
-            "3 months": 63,
-            "6 months": 126,
-        }
-        standard_oos_label = st.selectbox(
-            "Out-of-sample test period",
-            list(standard_oos_options),
-            index=0,
-            key="standard_oos_period",
-        )
-        standard_oos_days = standard_oos_options[standard_oos_label]
-        available_oos_days = standard_dataset_years * 252 - standard_lookback_days
-        if standard_oos_days is not None and standard_oos_days > available_oos_days:
-            st.warning("The selected dataset and estimation window do not "
-                       "leave enough history for this test period.")
-        st.info(
-            f"Historical dataset: {standard_dataset_years} years\n\n"
-            f"Estimation window: {standard_lookback_label}\n\n"
-            f"Out-of-sample: {standard_oos_label if standard_oos_days is not None else f'approximately {available_oos_days / 252:g} years'} "
-            "(rolling estimation at every rebalance)."
-        )
+            standard_lookback_days = (
+                standard_lookback_options[
+                    standard_lookback_label
+                ]
+            )
+
+            standard_rebalance_options = {
+                "Monthly": 21,
+                "Quarterly": 63,
+                "Semiannual": 126,
+                "Annual": 252,
+            }
+
+            standard_rebalance_label = (
+                st.selectbox(
+                    "Rebalancing frequency",
+                    list(
+                        standard_rebalance_options.keys()
+                    ),
+                    index=1,
+                    key="standard_rebalance",
+                )
+            )
+
+            standard_rebalance_days = (
+                standard_rebalance_options[
+                    standard_rebalance_label
+                ]
+            )
+
+            if selection_mode == "Quant Selection":
+                standard_selection_policy_labels = st.multiselect(
+                    "Asset selection policy",
+                    [
+                        "Fixed at Backtest Start",
+                        "Re-screen at Every Rebalance",
+                    ],
+                    default=["Fixed at Backtest Start"],
+                    key="standard_selection_policies",
+                    help=(
+                        "You can run either policy or both. Fixed selects assets "
+                        "once at the beginning of the out-of-sample period and "
+                        "subsequent rebalances update weights only. Dynamic "
+                        "rebuilds the Momentum + Risk ranking at every rebalance, "
+                        "so both constituents and weights may change."
+                    ),
+                )
+            else:
+                standard_selection_policy_labels = ["Manual universe"]
+
+            # Optional short-horizon evaluation: keep the rolling estimation
+            # window unchanged, but test only the most recent N trading days.
+            standard_oos_options = {
+                "Remaining historical period": None,
+                "1 month": 21,
+                "2 months": 42,
+                "3 months": 63,
+                "6 months": 126,
+            }
+            standard_oos_label = st.selectbox(
+                "Out-of-sample test period",
+                list(standard_oos_options),
+                index=0,
+                key="standard_oos_period",
+            )
+            standard_oos_days = standard_oos_options[standard_oos_label]
+            available_oos_days = standard_dataset_years * 252 - standard_lookback_days
+            if standard_oos_days is not None and standard_oos_days > available_oos_days:
+                st.warning("The selected dataset and estimation window do not "
+                           "leave enough history for this test period.")
+            st.info(
+                f"Historical dataset: {standard_dataset_years} years\n\n"
+                f"Estimation window: {standard_lookback_label}\n\n"
+                f"Out-of-sample: {standard_oos_label if standard_oos_days is not None else f'approximately {available_oos_days / 252:g} years'} "
+                "(rolling estimation at every rebalance)."
+            )
 
 
     # =====================================================
@@ -6838,133 +7168,116 @@ with backtest_tab:
     # =====================================================
 
     with fixed_col:
+        with st.container(border=True, key="backtest_fixed_panel"):
 
-        st.subheader(
-            "Fixed Horizon"
-        )
-
-        st.caption(
-            "Separates estimation from testing. "
-            "For example, 5 years estimation + "
-            "1 year backtest asks how the strategy "
-            "would have performed if it had started "
-            "one year ago using the previous five "
-            "years of information."
-        )
-
-        run_fixed = (
-            st.checkbox(
-                "Run Fixed Horizon",
-                value=True,
-                key="run_fixed",
+            st.subheader(
+                "Fixed Horizon"
             )
-        )
 
-        fixed_lookback_options = {
-            f"{year} year" + ("s" if year != 1 else ""): 252 * year
-            for year in range(1, 11)
-        }
-
-        fixed_lookback_label = (
-            st.selectbox(
-                "Estimation window",
-                list(
-                    fixed_lookback_options.keys()
-                ),
-                index=3,
-                key="fixed_lookback",
+            st.caption(
+                "Separates estimation from testing. "
+                "For example, 5 years estimation + "
+                "1 year backtest asks how the strategy "
+                "would have performed if it had started "
+                "one year ago using the previous five "
+                "years of information."
             )
-        )
 
-        fixed_lookback_days = (
-            fixed_lookback_options[
-                fixed_lookback_label
-            ]
-        )
+            run_fixed = (
+                st.checkbox(
+                    "Run Fixed Horizon",
+                    value=True,
+                    key="run_fixed",
+                )
+            )
 
-        fixed_backtest_options = {
-            "1 month": 21,
-            "2 months": 42,
-            "3 months": 63,
-            "6 months": 126,
-            **{
+            fixed_lookback_options = {
                 f"{year} year" + ("s" if year != 1 else ""): 252 * year
                 for year in range(1, 11)
-            },
-        }
+            }
 
-        fixed_backtest_label = (
-            st.selectbox(
-                "Backtest period",
-                list(
-                    fixed_backtest_options.keys()
-                ),
-                index=4,  # Keep the previous default: 1 year.
-                key="fixed_backtest",
+            fixed_lookback_label = (
+                st.selectbox(
+                    "Estimation window",
+                    list(
+                        fixed_lookback_options.keys()
+                    ),
+                    index=3,
+                    key="fixed_lookback",
+                )
             )
-        )
 
-        fixed_backtest_days = (
-            fixed_backtest_options[
-                fixed_backtest_label
-            ]
-        )
+            fixed_lookback_days = (
+                fixed_lookback_options[
+                    fixed_lookback_label
+                ]
+            )
+
+            fixed_backtest_options = {
+                "1 month": 21,
+                "2 months": 42,
+                "3 months": 63,
+                "6 months": 126,
+                **{
+                    f"{year} year" + ("s" if year != 1 else ""): 252 * year
+                    for year in range(1, 11)
+                },
+            }
+
+            fixed_backtest_label = (
+                st.selectbox(
+                    "Backtest period",
+                    list(
+                        fixed_backtest_options.keys()
+                    ),
+                    index=4,  # Keep the previous default: 1 year.
+                    key="fixed_backtest",
+                )
+            )
+
+            fixed_backtest_days = (
+                fixed_backtest_options[
+                    fixed_backtest_label
+                ]
+            )
 
 
 
-        required_years = (
-            fixed_lookback_days
-            + fixed_backtest_days
-        ) / 252
+            required_years = (
+                fixed_lookback_days
+                + fixed_backtest_days
+            ) / 252
 
-        st.info(
-            "Example\n\n"
-            f"Estimation: {fixed_lookback_label}\n\n"
-            f"Backtest: {fixed_backtest_label}\n\n"
-            f"→ approximately "
-            f"{required_years:.2f} years "
-            f"of historical data required."
-        )
+            st.info(
+                "Example\n\n"
+                f"Estimation: {fixed_lookback_label}\n\n"
+                f"Backtest: {fixed_backtest_label}\n\n"
+                f"→ approximately "
+                f"{required_years:.2f} years "
+                f"of historical data required."
+            )
 
 
     st.subheader("Transaction Costs")
-    bt_cost_choice = st.selectbox(
-        "Execution cost scenario",
-        ["None (legacy / gross)", "Optimistic", "Base", "Conservative"],
-        index=2, key="bt_transaction_cost_choice",
-        help="Costs charged on every actual purchase, sale and rebalance. "
-             "Commission per order plus half-spread and slippage on traded notional.",
-    )
-    bt_cost_assumptions = TRANSACTION_COST_PRESETS.get(bt_cost_choice)
-    if bt_cost_assumptions is not None:
-        st.caption(
-            f"Commission: {bt_cost_assumptions.commission_rate*100:.2f}% "
-            f"(minimum €{bt_cost_assumptions.min_commission:.2f}/order); "
-            f"half-spread: {bt_cost_assumptions.half_spread_bps:g} bps; "
-            f"slippage: {bt_cost_assumptions.slippage_bps:g} bps. "
-            "Italian transaction tax and capital gains taxes excluded."
+    with st.container(key="kangemi_controls_backtest"):
+        bt_cost_choice = st.selectbox(
+            "Execution cost scenario",
+            ["None (legacy / gross)", "Optimistic", "Base", "Conservative"],
+            index=2, key="bt_transaction_cost_choice",
+            help="Costs charged on every actual purchase, sale and rebalance. "
+                 "Commission per order plus half-spread and slippage on traded notional.",
         )
-
-    # =====================================================
-    # RUN BACKTEST BUTTON
-    # =====================================================
-
-    st.write("")
-
-    button_space_left, button_center, button_space_right = (
-        st.columns([1, 2, 1])
-    )
-
-    with button_center:
-
-        run_backtests = (
-            st.button(
-                "Run Backtests",
-                type="primary",
-                use_container_width=True,
+        bt_cost_assumptions = TRANSACTION_COST_PRESETS.get(bt_cost_choice)
+        if bt_cost_assumptions is not None:
+            st.caption(
+                f"Commission: {bt_cost_assumptions.commission_rate*100:.2f}% "
+                f"(minimum €{bt_cost_assumptions.min_commission:.2f}/order); "
+                f"half-spread: {bt_cost_assumptions.half_spread_bps:g} bps; "
+                f"slippage: {bt_cost_assumptions.slippage_bps:g} bps. "
+                "Italian transaction tax and capital gains taxes excluded."
             )
-        )
-
+        _, action_column, _ = st.columns([1, 2, 1])
+        run_backtests = action_column.button("Run Backtests", type="primary", width="stretch")
 
     # =====================================================
     # RUN SELECTED BACKTESTS
@@ -7164,19 +7477,13 @@ with backtest_tab:
                                         st.dataframe(audit_table, width="stretch")
                                         st.download_button("Download historical ranking CSV", audit_table.to_csv(index=False), file_name=f"quant_selection_{audit_date}.csv", key=f"pit_standard_{audit_date}_{policy}")
                             standard_result["drbt_price_history"] = standard_prices
-                            try:
-                                if market == "USA":
-                                    raise ValueError("EUR FX attribution is not applicable to USD-native USA portfolios")
-                                standard_result["ff3_performance_attribution"] = compute_ff3_attribution(
-                                    standard_result["ff3_bt"],
-                                    standard_result["ff3_factor_exposure_history"],
-                                    standard_ff3_factors, standard_eurusd,
+                            if market != "USA":
+                                standard_result["_factor_attribution_inputs"] = (
+                                    market, standard_ff3_factors, standard_ff5_factors, standard_eurusd,
                                 )
-                            except (ValueError, KeyError, TypeError) as attribution_error:
-                                standard_result["ff3_attribution_error"] = str(attribution_error)
 
                             if policy == "fixed":
-                                for model in ("capm", "ff3", "ff5"):
+                                for model in ("capm", "ff3", "ff5", "ff3_factor", "ff5_factor"):
                                     try:
                                         standard_result[f"{model}_same_initial_buy_hold"] = (
                                             _build_same_initial_model_buy_hold(
@@ -7313,16 +7620,10 @@ with backtest_tab:
                                 with st.expander(f"Historical Quant Selection ranking — {audit_date}"):
                                     st.dataframe(audit_table, width="stretch")
                                     st.download_button("Download historical ranking CSV", audit_table.to_csv(index=False), file_name=f"quant_selection_{audit_date}.csv", key=f"pit_fixed_{audit_date}")
-                        try:
-                            if market == "USA":
-                                raise ValueError("EUR FX attribution is not applicable to USD-native USA portfolios")
-                            fixed_result["ff3_performance_attribution"] = compute_ff3_attribution(
-                                fixed_result["ff3_bt"],
-                                fixed_result["ff3_factor_exposure_history"],
-                                fixed_ff3_factors, fixed_eurusd,
+                        if market != "USA":
+                            fixed_result["_factor_attribution_inputs"] = (
+                                market, fixed_ff3_factors, fixed_ff5_factors, fixed_eurusd,
                             )
-                        except (ValueError, KeyError, TypeError) as attribution_error:
-                            fixed_result["ff3_attribution_error"] = str(attribution_error)
 
                         fixed_result[
                             "lookback_label"
@@ -7368,50 +7669,57 @@ with backtest_tab:
     )
 
 
-    # =====================================================
-    # STANDARD RESULTS
-    # =====================================================
+    if standard_result is None:
+        standard_results_to_display = {}
+    elif "max_sharpe_bt" in standard_result:
+        standard_results_to_display = {"fixed": standard_result}
+    else:
+        standard_results_to_display = standard_result
 
-    if standard_result is not None:
+    result_views = {
+        f"standard_{policy}": f"Walk-Forward · {'Fixed' if policy == 'fixed' else 'Dynamic'} Selection"
+        for policy in ("fixed", "dynamic") if policy in standard_results_to_display
+    }
+    if fixed_result is not None:
+        result_views["fixed"] = "Fixed Horizon"
+    if result_views:
+        st.markdown("---")
+    selected_view = start_backtest_result_navigation(result_views) if result_views else None
 
-        # Backward compatibility with results saved by older app versions.
-        if "max_sharpe_bt" in standard_result:
-            standard_results_to_display = {"fixed": standard_result}
-        else:
-            standard_results_to_display = standard_result
+    if selected_view in ("standard_fixed", "standard_dynamic"):
+        policy_key = selected_view.removeprefix("standard_")
+        policy_result = standard_results_to_display[policy_key]
+        policy_label = policy_result.get(
+            "selection_policy_label",
+            "Fixed at Backtest Start" if policy_key == "fixed"
+            else "Re-screen at Every Rebalance",
+        )
 
-        for policy_key, policy_result in standard_results_to_display.items():
-            policy_label = policy_result.get(
-                "selection_policy_label",
-                "Fixed at Backtest Start" if policy_key == "fixed"
-                else "Re-screen at Every Rebalance",
-            )
-
-            display_backtest_results(
-                result=policy_result,
-                title=f"Standard Walk-Forward Backtest · {policy_label}",
-                description=(
-                    "The historical dataset contains both the initial "
-                    "estimation window and the subsequent out-of-sample "
-                    "simulation. At every rebalance the estimation window "
-                    "rolls forward using only information available at that "
-                    "date. With Fixed selection, constituents are frozen at "
-                    "t0 and only weights are rebalanced; with Dynamic "
-                    "selection, the Momentum + Risk ranking is recomputed "
-                    "at every rebalance."
-                ),
-                lookback_label=policy_result["lookback_label"],
-                backtest_period_label=policy_result["period_label"],
-                rebalance_label=policy_result["rebalance_label"],
-                result_key=f"standard_{policy_key}",
-            )
+        display_backtest_results(
+            result=policy_result,
+            title=f"Standard Walk-Forward Backtest · {policy_label}",
+            description=(
+                "The historical dataset contains both the initial "
+                "estimation window and the subsequent out-of-sample "
+                "simulation. At every rebalance the estimation window "
+                "rolls forward using only information available at that "
+                "date. With Fixed selection, constituents are frozen at "
+                "t0 and only weights are rebalanced; with Dynamic "
+                "selection, the Momentum + Risk ranking is recomputed "
+                "at every rebalance."
+            ),
+            lookback_label=policy_result["lookback_label"],
+            backtest_period_label=policy_result["period_label"],
+            rebalance_label=policy_result["rebalance_label"],
+            result_key=f"standard_{policy_key}",
+        )
 
 
     # =====================================================
     # FIXED-HORIZON RESULTS
     # =====================================================
 
-    if fixed_result is not None:
+    if selected_view == "fixed":
 
         display_backtest_results(
             result=fixed_result,
@@ -7451,6 +7759,9 @@ with backtest_tab:
         )
 
 
+    if len(result_views) > 1:
+        render_backtest_result_navigation(result_views, "bottom")
+
     if standard_result is not None and fixed_result is not None:
         render_backtesting_comparison(standard_result, fixed_result)
 
@@ -7464,11 +7775,10 @@ with backtest_tab:
         and fixed_result is None
     ):
 
-        st.info(
-            "Configure Standard Walk-Forward, "
-            "Fixed Horizon, or both, then click "
-            "**Run Backtests**."
-        )
+        with st.container(key="kangemi_backtest_notice"):
+            st.markdown(
+                "Configure Standard Walk-Forward, Fixed Horizon, or both, then click **Run Backtests**."
+            )
 
 
 
