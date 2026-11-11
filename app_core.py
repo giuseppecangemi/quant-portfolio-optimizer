@@ -1872,6 +1872,9 @@ def prepare_rebalancing_history(
 
     turnover = calculate_turnover(df)
 
+    populated = df.ne(0).any(axis=0).to_numpy()
+    df = pd.concat([df.iloc[:, populated], df.iloc[:, ~populated]], axis=1)
+
     rename_map = {
         ticker: get_company_name(ticker)
         for ticker in df.columns
@@ -2447,7 +2450,33 @@ def run_fixed_horizon_engine(
                 "Net Return (%)": (float(curve["Portfolio Value"].iloc[-1]) / capital - 1) * 100,
             }
 
+    initial_ex_ante_kpis = {}
+    for key, history, mu, risk_matrix in (
+        ("max_sharpe_bt", max_sharpe_weights_history, expected_returns, covariance),
+        ("capm_bt", capm_weights_history, capm_mu, covariance),
+        ("ff3_bt", ff3_weights_history, ff3_mu, covariance),
+        ("ff5_bt", ff5_weights_history, ff5_mu, covariance),
+        ("ff3_factor_bt", ff3_factor_weights_history, ff3_mu, ff3_factor_cov),
+        ("ff5_factor_bt", ff5_factor_weights_history, ff5_mu, ff5_factor_cov),
+        ("min_vol_bt", min_vol_weights_history, expected_returns, covariance),
+        ("risk_parity_bt", risk_parity_weights_history, expected_returns, covariance),
+        ("hrp_bt", hrp_weights_history, expected_returns, covariance),
+        ("equal_weight_bt", equal_weight_weights_history, expected_returns, covariance),
+    ):
+        weights = history.iloc[0]
+        tickers_in_order = weights.index
+        expected = portfolio_return(weights.to_numpy(), mu.reindex(tickers_in_order))
+        volatility = portfolio_volatility(
+            weights.to_numpy(), risk_matrix.reindex(index=tickers_in_order, columns=tickers_in_order)
+        )
+        initial_ex_ante_kpis[key] = {
+            "expected_return": expected,
+            "volatility": volatility,
+            "sharpe": (expected - risk_free_rate) / volatility if volatility > 0 else 0.0,
+        }
+
     return {
+        "initial_ex_ante_kpis": initial_ex_ante_kpis,
         "transaction_cost_summary": transaction_cost_summary,
         "transaction_cost_preset": transaction_costs,
         "tickers":
@@ -2623,6 +2652,7 @@ def run_backtest_engine(
         max_sharpe_weights_history,
     ) = backtest_portfolio(
         prices,
+        capture_initial_ex_ante=True,
         strategy="max_sharpe",
         initial_capital=capital,
         lookback_days=lookback_days,
@@ -2644,6 +2674,7 @@ def run_backtest_engine(
         capm_weights_history,
     ) = backtest_portfolio(
         prices,
+        capture_initial_ex_ante=True,
         strategy="capm_max_sharpe",
         initial_capital=capital,
         lookback_days=lookback_days,
@@ -2666,7 +2697,8 @@ def run_backtest_engine(
         ff3_bt,
         ff3_weights_history,
     ) = backtest_portfolio(
-        prices, strategy="ff3_max_sharpe", market=market, initial_capital=capital,
+        prices,
+        capture_initial_ex_ante=True, strategy="ff3_max_sharpe", market=market, initial_capital=capital,
         lookback_days=lookback_days, rebalance_days=rebalance_days,
         risk_free_rate=risk_free_rate, max_weight=max_weight,
         selection_top_n=selection_top_n, selection_policy=selection_policy,
@@ -2684,7 +2716,8 @@ def run_backtest_engine(
 
     ff5_exposure_records = []
     ff5_bt, ff5_weights_history = backtest_portfolio(
-        prices, strategy="ff5_max_sharpe", market=market, initial_capital=capital,
+        prices,
+        capture_initial_ex_ante=True, strategy="ff5_max_sharpe", market=market, initial_capital=capital,
         lookback_days=lookback_days, rebalance_days=rebalance_days,
         risk_free_rate=risk_free_rate, max_weight=max_weight,
         selection_top_n=selection_top_n, selection_policy=selection_policy,
@@ -2699,7 +2732,8 @@ def run_backtest_engine(
     ff3_factor_records = []
     ff5_factor_records = []
     ff3_factor_bt, ff3_factor_weights_history = backtest_portfolio(
-        prices, strategy="ff3_factor_cov_max_sharpe", market=market,
+        prices,
+        capture_initial_ex_ante=True, strategy="ff3_factor_cov_max_sharpe", market=market,
         initial_capital=capital, lookback_days=lookback_days,
         rebalance_days=rebalance_days, risk_free_rate=risk_free_rate,
         max_weight=max_weight, selection_top_n=selection_top_n,
@@ -2710,7 +2744,8 @@ def run_backtest_engine(
         ff3_exposure_records=ff3_factor_records,
     )
     ff5_factor_bt, ff5_factor_weights_history = backtest_portfolio(
-        prices, strategy="ff5_factor_cov_max_sharpe", market=market,
+        prices,
+        capture_initial_ex_ante=True, strategy="ff5_factor_cov_max_sharpe", market=market,
         initial_capital=capital, lookback_days=lookback_days,
         rebalance_days=rebalance_days, risk_free_rate=risk_free_rate,
         max_weight=max_weight, selection_top_n=selection_top_n,
@@ -2733,6 +2768,7 @@ def run_backtest_engine(
         min_vol_weights_history,
     ) = backtest_portfolio(
         prices,
+        capture_initial_ex_ante=True,
         strategy="min_volatility",
         initial_capital=capital,
         lookback_days=lookback_days,
@@ -2754,6 +2790,7 @@ def run_backtest_engine(
         risk_parity_weights_history,
     ) = backtest_portfolio(
         prices,
+        capture_initial_ex_ante=True,
         strategy="risk_parity",
         initial_capital=capital,
         lookback_days=lookback_days,
@@ -2775,6 +2812,7 @@ def run_backtest_engine(
         hrp_weights_history,
     ) = backtest_portfolio(
         prices,
+        capture_initial_ex_ante=True,
         strategy="hrp",
         initial_capital=capital,
         lookback_days=lookback_days,
@@ -2796,6 +2834,7 @@ def run_backtest_engine(
         equal_weight_weights_history,
     ) = backtest_portfolio(
         prices,
+        capture_initial_ex_ante=True,
         strategy="equal_weight",
         initial_capital=capital,
         lookback_days=lookback_days,
@@ -4020,6 +4059,26 @@ def display_backtest_results(
                 "Minimum Volatility": "min_vol_bt", "Risk Parity": "risk_parity_bt",
                 "HRP": "hrp_bt", "Equal Weight": "equal_weight_bt",
             }[rebalance_strategy]
+            curve = result.get(curve_key)
+            if fixed_horizon:
+                ex_ante = result.get("initial_ex_ante_kpis", {}).get(curve_key)
+            else:
+                ex_ante = curve.attrs.get("initial_ex_ante_kpis") if curve is not None else None
+            if ex_ante is not None:
+                estimation_date = pd.Timestamp(
+                    ex_ante.get("estimation_end", result.get("estimation_end"))
+                ).strftime("%d/%m/%Y")
+                st.caption(f"Initial historical ex-ante estimates through {estimation_date} · annualized")
+                for column, (label, value, color) in zip(st.columns(3), (
+                    ("Expected Return", f"{ex_ante['expected_return']:.2%}", "green"),
+                    ("Volatility", f"{ex_ante['volatility']:.2%}", "red"),
+                    ("Sharpe Ratio", f"{ex_ante['sharpe']:.2f}", "blue"),
+                )):
+                    with column:
+                        colored_metric(label, value, color)
+            else:
+                st.info("Run this backtest again to generate historical ex-ante KPIs.")
+
             trade_log = result.get(curve_key, pd.DataFrame()).attrs.get("transaction_log")
             if trade_log is not None and "Executed Turnover" in trade_log:
                 turnover_series = trade_log.set_index("Rebalance Date")["Executed Turnover"]

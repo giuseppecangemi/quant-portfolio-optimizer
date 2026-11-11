@@ -46,6 +46,7 @@ scope = {
     "np": np, "pd": pd, "get_prices": lambda *a, **kw: prices[["A"]],
     "FTSE_MIB_TICKER": "fixture", "calculate_returns": returns.calculate_returns,
     "annualized_returns": returns.annualized_returns, "covariance_matrix": risk.covariance_matrix,
+    "portfolio_return": risk.portfolio_return, "portfolio_volatility": risk.portfolio_volatility,
     "capm_expected_returns": factors.capm_expected_returns,
     "estimate_factor_returns": mu,
     "factors_for_backtest_signal": factor_currency.factors_for_backtest_signal,
@@ -117,3 +118,99 @@ with patch.object(factor_eur, "load_estr_rates", return_value=rates):
             )
             assert np.isclose(history["Market Beta"].iloc[0], cov_weights.iloc[0] @ stats["Beta MKT"])
 print("PASS: all four EUR attributions reconcile with their own NAV in both backtests")
+
+# Audit all ten initial allocations against the historical estimation inputs.
+risk_free = 0.02
+engine_args = dict(ff3_factors=ff, ff5_factors=ff, market="Borsa Italiana", eurusd_prices=fx)
+run_fixed = scope["run_fixed_horizon_engine"]
+with patch.object(factor_eur, "load_estr_rates", return_value=rates):
+    original = run_fixed(["A", "B"], prices, 160, 48, risk_free, 1.0, 100.0, **engine_args)
+    oos_shock = prices.copy()
+    oos_shock.iloc[161:] *= [1.15, 0.85]
+    shocked = run_fixed(["A", "B"], oos_shock, 160, 48, risk_free, 1.0, 100.0, **engine_args)
+
+    formation = prices.iloc[:161]
+    daily = formation.pct_change().dropna()
+    historical_mu = daily.mean() * 252
+    historical_cov = daily.cov() * 252
+    capm_mu = factors.capm_expected_returns(daily, daily["A"], risk_free_rate=risk_free)
+    eligible = ff.loc[:dates[160] - pd.DateOffset(months=2)]
+    factor_mu = {
+        model: factor_currency.estimate_factor_returns(
+            formation, eligible, fx, market="Borsa Italiana", model=model
+        )
+        for model in ("ff3", "ff5")
+    }
+    factor_risk = {
+        model: factor_covariance.estimate_factor_covariance(
+            formation, eligible, model=model, market="Borsa Italiana", eurusd_prices=fx
+        )
+        for model in factor_mu
+    }
+
+assert original["estimation_end"] == dates[160]
+assert original["effective_start"] == dates[161]
+assert original["initial_ex_ante_kpis"] == shocked["initial_ex_ante_kpis"]
+assert not original["equal_weight_bt"].equals(shocked["equal_weight_bt"])
+assert len(original["initial_ex_ante_kpis"]) == 10
+for curve_key, kpis in original["initial_ex_ante_kpis"].items():
+    strategy = curve_key.removesuffix("_bt")
+    weights = original[f"{strategy}_weights_history"].iloc[0]
+    model = strategy.removesuffix("_factor")
+    mu = capm_mu if strategy == "capm" else factor_mu.get(model, historical_mu)
+    covariance = factor_risk[model] if strategy.endswith("_factor") else historical_cov
+    expected = float(weights @ mu)
+    volatility = float(np.sqrt(weights @ covariance @ weights))
+    np.testing.assert_allclose(
+        [kpis["expected_return"], kpis["volatility"], kpis["sharpe"]],
+        [expected, volatility, (expected - risk_free) / volatility],
+        rtol=1e-12, atol=1e-12,
+    )
+    held_prices = prices.loc[dates[161]:]
+    expected_nav = (held_prices / held_prices.iloc[0]) @ (100 * weights / weights.sum())
+    np.testing.assert_allclose(original[curve_key]["Portfolio Value"], expected_nav, rtol=1e-12)
+print("PASS: ten historical ex-ante KPIs match initial weights and remain invariant to OOS price shocks")
+
+# The first Walk-Forward signal uses the window ending before execution.
+from src.transaction_costs import PRESETS
+
+window = prices.iloc[:160]
+daily = window.pct_change().dropna()
+eligible = ff.loc[:dates[159] - pd.DateOffset(months=2)]
+with patch.object(factor_eur, "load_estr_rates", return_value=rates):
+    for strategy in ("max_sharpe", "capm_max_sharpe", "ff3_max_sharpe", "ff5_max_sharpe",
+                     "ff3_factor_cov_max_sharpe", "ff5_factor_cov_max_sharpe",
+                     "min_volatility", "risk_parity", "hrp", "equal_weight"):
+        options = dict(strategy=strategy, lookback_days=160, rebalance_days=20,
+                       risk_free_rate=risk_free, market_prices=prices["A"],
+                       transaction_costs=PRESETS["Base"], **engine_args)
+        baseline, baseline_weights = backtest.backtest_portfolio(prices, **options)
+        curve, weights = backtest.backtest_portfolio(prices, capture_initial_ex_ante=True, **options)
+        kpis = curve.attrs.pop("initial_ex_ante_kpis")
+        assert kpis["estimation_end"] == dates[159].date().isoformat()
+        assert weights.index[0] == dates[160]
+        pd.testing.assert_frame_equal(curve, baseline, check_exact=True)
+        pd.testing.assert_frame_equal(weights, baseline_weights, check_exact=True)
+        covariance = daily.cov() * 252
+        mu = daily.mean() * 252
+        if strategy.startswith("capm"):
+            mu = factors.capm_expected_returns(daily, daily["A"], risk_free_rate=risk_free)
+        elif strategy.startswith(("ff3", "ff5")):
+            model = strategy[:3]
+            mu = factor_currency.estimate_factor_returns(window, eligible, fx, market="Borsa Italiana", model=model)
+            if "factor_cov" in strategy:
+                covariance = factor_covariance.estimate_factor_covariance(
+                    window, eligible, model=model, market="Borsa Italiana", eurusd_prices=fx
+                )
+        w = weights.iloc[0]
+        expected = float(w @ mu)
+        volatility = float(np.sqrt(w @ covariance @ w))
+        np.testing.assert_allclose(
+            [kpis["expected_return"], kpis["volatility"], kpis["sharpe"]],
+            [expected, volatility, (expected - risk_free) / volatility], rtol=1e-12
+        )
+assert all("initial_ex_ante_kpis" in standard[key].attrs for key in (
+    "max_sharpe_bt", "capm_bt", "ff3_bt", "ff5_bt", "ff3_factor_bt", "ff5_factor_bt",
+    "min_vol_bt", "risk_parity_bt", "hrp_bt", "equal_weight_bt"
+))
+print("PASS: first Walk-Forward estimates match ten initial allocations and NAV is unchanged with costs")

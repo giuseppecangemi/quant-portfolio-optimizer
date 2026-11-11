@@ -7,6 +7,7 @@ from src.fama_french import estimate_ff3_eur_returns
 from src.fama_french_5 import estimate_ff5_eur_returns
 from src.factor_currency import estimate_factor_returns, factors_for_backtest_signal
 from src.transaction_costs import fund_orders
+from src.risk import portfolio_return, portfolio_volatility
 from src.screening import screen_prices_point_in_time, screen_tradable_point_in_time, screen_quant_point_in_time
 from src.optimization import (
     optimize_minimum_volatility,
@@ -37,6 +38,7 @@ def backtest_portfolio(
     selection_audit=None,
     active_factors=("Momentum", "Risk"),
     market="Borsa Italiana",
+    capture_initial_ex_ante=False,
 ):
     """
     Esegue un backtest walk-forward realistico.
@@ -247,6 +249,8 @@ def backtest_portfolio(
         # -------------------------------------------------
         # 2. CALCOLO PESI TARGET
         # -------------------------------------------------
+        initial_mu = expected_returns
+        risk_cov = covariance
         if strategy == "max_sharpe":
             target_weights = (
                 optimize_maximum_sharpe(
@@ -283,6 +287,7 @@ def backtest_portfolio(
                 market_returns,
                 risk_free_rate=risk_free_rate,
             )
+            initial_mu = capm_returns
             target_weights = (
                 optimize_maximum_sharpe(
                     capm_returns,
@@ -306,7 +311,7 @@ def backtest_portfolio(
             ff3_mu = ff3_expected.reindex(covariance.index)
             if ff3_mu.isna().any():
                 raise ValueError(f"Missing FF3 expected returns on {rebalance_date}.")
-            risk_cov = covariance
+            initial_mu = ff3_mu
             if strategy == "ff3_factor_cov_max_sharpe":
                 from src.factor_covariance import estimate_factor_covariance
                 risk_cov = estimate_factor_covariance(factor_prices, signal_factors, model="ff3", eurusd_prices=eurusd_prices, market=market)
@@ -329,7 +334,7 @@ def backtest_portfolio(
             ff5_mu = ff5_expected.reindex(covariance.index)
             if ff5_mu.isna().any():
                 raise ValueError(f"Missing FF5 expected returns on {rebalance_date}.")
-            risk_cov = covariance
+            initial_mu = ff5_mu
             if strategy == "ff5_factor_cov_max_sharpe":
                 from src.factor_covariance import estimate_factor_covariance
                 risk_cov = estimate_factor_covariance(factor_prices, signal_factors, model="ff5", eurusd_prices=eurusd_prices, market=market)
@@ -383,6 +388,18 @@ def backtest_portfolio(
             target_weights
             / target_weights.sum()
         )
+        if capture_initial_ex_ante and rebalance_start == start_position:
+            labels = risk_cov.index
+            weights = target_weights.reindex(labels).to_numpy()
+            expected = portfolio_return(weights, initial_mu.reindex(labels))
+            volatility = portfolio_volatility(weights, risk_cov.loc[labels, labels])
+            initial_ex_ante_kpis = {
+                "estimation_end": historical_universe.index[-1].date().isoformat(),
+                "expected_return": expected,
+                "volatility": volatility,
+                "sharpe": (expected - risk_free_rate) / volatility if volatility > 0 else 0.0,
+            }
+
         # Exposure FF3 ponderate sui pesi target effettivamente investiti.
         if strategy in ("ff3_max_sharpe", "ff3_factor_cov_max_sharpe") and ff3_exposure_records is not None:
             aligned = ff3_stats.reindex(target_weights.index)
@@ -532,6 +549,8 @@ def backtest_portfolio(
         "Rebalance Date"
     )
     backtest.attrs["initial_capital"] = float(initial_capital)
+    if capture_initial_ex_ante:
+        backtest.attrs["initial_ex_ante_kpis"] = initial_ex_ante_kpis
     if transaction_costs is not None:
         gross_series = pd.concat(gross_portfolio_values).reindex(backtest.index)
         backtest["Gross Portfolio Value"] = gross_series
