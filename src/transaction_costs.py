@@ -66,56 +66,34 @@ def apply_transaction_costs(gross_curve: pd.DataFrame, weights: pd.DataFrame,
     weights = weights.sort_index()
     returns = curve["Portfolio Value"].pct_change().fillna(0.0)
     net = float(capital)
-    prev_w = pd.Series(dtype=float)
-    prev_date = None
     records = []
     net_values = []
     net_returns = []
     all_tickers = prices.columns.union(weights.columns)
+    previous = pd.Series(0.0, index=all_tickers)
     for date, daily_r in returns.items():
         before = net
-        net *= (1 + float(daily_r))
+        net *= 1 + float(daily_r)
         if date in weights.index:
-            target = weights.loc[date].reindex(all_tickers).fillna(0.0).astype(float).clip(lower=0)
-            if isinstance(target, pd.DataFrame):
-                target = target.iloc[-1]
-            target = target / target.sum() if target.sum() > 0 else target
-            if prev_date is None:
-                old = pd.Series(0.0, index=all_tickers)
-            else:
-                p0 = prices.loc[prev_date].reindex(all_tickers)
-                p1 = prices.loc[date].reindex(all_tickers)
-                ratios = (p1 / p0).replace([np.inf, -np.inf], np.nan).fillna(1.0)
-                drift = prev_w.reindex(all_tickers).fillna(0.0) * ratios
-                old = drift / drift.sum() if drift.sum() > 0 else drift
-            delta = target - old
-            traded = (delta.abs() * net).loc[lambda x: x > 1e-9]
-            buy_notional = float(delta.clip(lower=0).sum() * net)
-            variable = float(traded.sum()) * (assumptions.half_spread_bps + assumptions.slippage_bps) / 10000
-            commissions = sum(max(assumptions.min_commission, assumptions.commission_rate * float(v)) for v in traded)
-            tax = buy_notional * assumptions.buy_tax_rate
-            total = float(variable + commissions + tax)
-            if total >= net:
-                raise ValueError("Trading costs exhaust portfolio capital")
-            net -= total
-            records.append({"Rebalance Date": date, "Orders": len(traded),
-                            "Traded Notional": float(traded.sum()), "Turnover": float(delta.abs().sum()),
-                            "Commission": float(commissions), "Spread and Slippage": float(variable),
-                            "Buy Tax": float(tax), "Total Cost": total})
-            prev_w = target
-            prev_date = date
+            target = weights.loc[[date]].iloc[-1].reindex(all_tickers).fillna(0.0).astype(float)
+            if (target < 0).any() or target.sum() <= 0:
+                raise ValueError("Invalid long-only target weights")
+            target /= target.sum()
+            execution = prices.loc[date].reindex(all_tickers)
+            active = target.gt(0) | previous.ne(0)
+            if not np.isfinite(execution[active]).all() or execution[active].le(0).any():
+                raise ValueError(f"Missing or invalid execution price on {date}")
+            pretrade = net
+            net, total, detail = fund_orders(pretrade, target, previous, execution, assumptions)
+            previous = (net * target).div(execution.where(target > 0)).fillna(0.0)
+            records.append({"Rebalance Date": date, **detail,
+                            "Turnover": detail["Traded Notional"] / pretrade,
+                            "Total Cost": total})
         net_values.append(net)
-        net_returns.append(net / before - 1 if before > 0 else 0.0)
+        net_returns.append(net / before - 1)
     net_curve = pd.DataFrame({"Portfolio Value": net_values, "Daily Return": net_returns}, index=curve.index)
-    # Includiamo i costi delle operazioni iniziali nel calcolo dello Sharpe Ratio
-    # e del massimo drawdown, utilizzando il capitale iniziale come punto
-    # di riferimento, senza introdurre una data fittizia nel calendario.
-    metric_curve = net_curve.copy()
-    metric_curve.loc[metric_curve.index[0], "Daily Return"] = net_values[0] / capital - 1
-    metrics = calculate_backtest_metrics(metric_curve, risk_free_rate)
-    metrics["Total Return"] = net_values[-1] / capital - 1
-    dd = np.asarray([capital] + net_values, dtype=float)
-    metrics["Max Drawdown"] = float((dd / np.maximum.accumulate(dd) - 1).min())
+    net_curve.attrs["initial_capital"] = float(capital)
+    metrics = calculate_backtest_metrics(net_curve, risk_free_rate)
     return metrics, pd.DataFrame(records), net_curve
 
 
@@ -145,3 +123,23 @@ def estimate_order_costs(quantity_changes, execution_prices, assumptions):
         "Commission": float(commission), "Spread and Slippage": float(execution),
         "Buy Tax": float(tax),
     }
+
+
+def fund_orders(capital, weights, previous_quantities, prices, assumptions):
+    """Solve the self-financing budget and verify it against the final orders."""
+    from scipy.optimize import brentq
+
+    def orders(budget):
+        quantities = (budget * weights).div(prices.where(weights > 0)).fillna(0.0)
+        return estimate_order_costs(quantities - previous_quantities, prices, assumptions)
+
+    cost, detail = orders(capital)
+    if cost == 0:
+        return capital, cost, detail
+    if orders(0.0)[0] >= capital:
+        raise ValueError("Trading costs exhaust portfolio capital")
+    budget = brentq(lambda amount: amount + orders(amount)[0] - capital, 0.0, capital)
+    cost, detail = orders(budget)
+    if budget <= 0 or not np.isclose(budget + cost, capital, atol=1e-8, rtol=1e-12):
+        raise ValueError("Trading costs have no consistent self-financing budget")
+    return budget, cost, detail

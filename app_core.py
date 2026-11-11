@@ -24,7 +24,7 @@ from pathlib import Path
 
 from src.ff3_attribution import compute_ff3_attribution
 from src.fama_french_5 import load_europe_ff5, load_us_ff5, fit_ff5, estimate_ff5_eur_returns
-from src.factor_currency import estimate_factor_returns
+from src.factor_currency import estimate_factor_returns, factors_for_backtest_signal
 from src.data import get_prices as _get_raw_prices
 from src.fama_french import (
     load_europe_ff3, load_us_ff3, fit_ff3, convert_eur_prices_to_usd,
@@ -112,13 +112,24 @@ FTSE_MIB_TICKER = "FTSEMIB.MI"  # Legacy identifier, dynamically updated below.
 ACTIVE_MARKETS = []
 ACTIVE_BENCHMARK = "FTSEMIB.MI"
 
-def get_prices(tickers, period="5y"):
+def factor_estimation_caption(model, result):
+    observations = result["stats"]["Observations"]
+    low, high = int(observations.min()), int(observations.max())
+    count = f"{low:,}" if low == high else f"{low:,}–{high:,}"
+    return (
+        f"{model} estimation: {result['period']} · "
+        f"{result['factor_observations']:,} dates in the factor archive · "
+        f"{count} observations used per asset."
+    )
+
+
+def get_prices(tickers, period="5y", *, preserve_missing=False):
     """Adjusted prices in the selected market's native quotation currency.
 
     USA equities and ^GSPC remain USD; Borsa Italiana remains EUR.
     No implicit EUR conversion is performed.
     """
-    return _get_raw_prices(tickers, period=period)
+    return _get_raw_prices(tickers, period=period, preserve_missing=preserve_missing)
 
 
 # =========================================================
@@ -509,10 +520,14 @@ def render_ff3_attribution(result, key_suffix=""):
     st.caption(
         "Ex-post additive contributions in EUR, linked to initial capital. "
         "Factor loadings are frozen between rebalances; 'Unexplained' is the "
-        "realized residual, not regression alpha. 'FX translation' reconciles "
-        "USD-denominated factors to EUR portfolio returns. "
+        "realized residual, not regression alpha. All factors and exposures are EUR-denominated. "
         f"Coverage: {covered}/{total} trading days."
     )
+    last_covered = attribution.get("last_covered_date")
+    last_factor = attribution.get("last_factor_date")
+    if last_covered is not None:
+        st.caption(f"Last attributed trading day: {pd.Timestamp(last_covered).date()} · "
+                   f"Last available converted factor date: {pd.Timestamp(last_factor).date() if last_factor is not None else 'N/A'}")
     if covered != total:
         st.warning("Incomplete factor/FX coverage: attribution totals cover only matching dates, "
                    "Unattributed days are reported separately at their actual EUR P&L; "
@@ -607,6 +622,8 @@ def _render_saved_backtest_summary(result, title, saved_costs=None):
         ("Maximum Sharpe", "max_bt_metrics"),
         ("CAPM Maximum Sharpe", "capm_bt_metrics"),
         ("FF3 Maximum Sharpe", "ff3_bt_metrics"),
+        ("FF3 Factor Cov Maximum Sharpe", "ff3_factor_bt_metrics"),
+        ("FF5 Factor Cov Maximum Sharpe", "ff5_factor_bt_metrics"),
         ("FF5 Maximum Sharpe", "ff5_bt_metrics"),
         ("Minimum Volatility", "min_bt_metrics"),
         ("Risk Parity", "risk_parity_bt_metrics"),
@@ -646,6 +663,8 @@ def _render_saved_backtest_summary(result, title, saved_costs=None):
         ("Maximum Sharpe", "max_sharpe_bt"),
         ("CAPM Maximum Sharpe", "capm_bt"),
         ("FF3 Maximum Sharpe", "ff3_bt"),
+        ("FF3 Factor Cov Maximum Sharpe", "ff3_factor_bt"),
+        ("FF5 Factor Cov Maximum Sharpe", "ff5_factor_bt"),
         ("FF5 Maximum Sharpe", "ff5_bt"),
         ("Minimum Volatility", "min_vol_bt"),
         ("Risk Parity", "risk_parity_bt"),
@@ -1619,7 +1638,7 @@ def render_backtesting_comparison(standard_results, fixed_result, key_prefix="li
 def calculate_drawdown(backtest_data):
 
     values = backtest_data["Portfolio Value"]
-    running_max = values.cummax()
+    running_max = values.cummax().clip(lower=backtest_data.attrs.get("initial_capital", values.iloc[0]))
 
     return (values / running_max) - 1
 
@@ -1815,7 +1834,7 @@ def run_fixed_horizon_engine(
     historical_fundamentals=None,
     selection_audit=None,
     active_factors=("Momentum", "Risk"),
-    market="Italia",
+    market="Borsa Italiana",
 ):
     """
     Fixed-Horizon Backtest.
@@ -1873,7 +1892,7 @@ def run_fixed_horizon_engine(
     # =====================================================
     if selection_top_n is not None:
         ranking, selected_tickers = screen_quant_point_in_time(
-            estimation_prices, test_prices.iloc[0], test_prices.index[0],
+            estimation_prices, estimation_prices.iloc[-1], estimation_prices.index[-1],
             historical_fundamentals, top_n=int(selection_top_n),
             min_observations=max(252, min(estimation_days + 1, 253)),
             active_factors=active_factors,
@@ -1895,12 +1914,13 @@ def run_fixed_horizon_engine(
                 "tradable assets at the Fixed-Horizon start."
             )
 
-        estimation_prices = estimation_prices[selected_tickers].dropna()
+        estimation_prices = estimation_prices[selected_tickers]
         test_prices = test_prices[selected_tickers].ffill()
         tickers = selected_tickers
     else:
-        estimation_prices = estimation_prices.dropna()
-        test_prices = test_prices.dropna()
+        if not np.isfinite(test_prices.iloc[0]).all() or test_prices.iloc[0].le(0).any():
+            raise ValueError("Missing or invalid execution price at the Fixed-Horizon start.")
+        test_prices = test_prices.ffill()
 
     # =====================================================
     # PORTFOLIO OPTIMIZATION AT T0
@@ -1936,7 +1956,7 @@ def run_fixed_horizon_engine(
     )
     market_series = market_prices.iloc[:, 0]
     estimation_market_prices = (
-        market_series.reindex(estimation_prices.index).dropna()
+        market_series.reindex(estimation_prices.dropna().index).dropna()
     )
     estimation_market_returns = (
         estimation_market_prices.pct_change().dropna()
@@ -1954,8 +1974,11 @@ def run_fixed_horizon_engine(
     )
 
     # FF3: stima esclusivamente sulla finestra di estimation precedente al test.
+    signal_date = estimation_prices.index[-1]
+    signal_ff3 = factors_for_backtest_signal(ff3_factors, signal_date)
+    signal_ff5 = factors_for_backtest_signal(ff5_factors, signal_date)
     ff3_mu, ff3_stats = estimate_factor_returns(
-        estimation_prices, ff3_factors, eurusd_prices, market=market, model="ff3", return_stats=True
+        estimation_prices, signal_ff3, eurusd_prices, market=market, model="ff3", return_stats=True
     )
     ff3_mu = ff3_mu.reindex(covariance.index)
     ff3_weights = optimize_maximum_sharpe(
@@ -1963,11 +1986,24 @@ def run_fixed_horizon_engine(
     )
 
     ff5_mu, ff5_stats = estimate_factor_returns(
-        estimation_prices, ff5_factors, eurusd_prices, market=market, model="ff5", return_stats=True
+        estimation_prices, signal_ff5, eurusd_prices, market=market, model="ff5", return_stats=True
     )
     ff5_mu = ff5_mu.reindex(covariance.index)
     ff5_weights = optimize_maximum_sharpe(
         ff5_mu, covariance, risk_free_rate=risk_free_rate, max_weight=max_weight
+    )
+
+    # Factor-implied covariance: same FF3/FF5 expected returns, different risk model.
+    from src.factor_covariance import estimate_factor_covariance
+    ff3_factor_cov = estimate_factor_covariance(estimation_prices, signal_ff3, model="ff3", eurusd_prices=eurusd_prices, market=market)
+    ff5_factor_cov = estimate_factor_covariance(estimation_prices, signal_ff5, model="ff5", eurusd_prices=eurusd_prices, market=market)
+    ff3_factor_weights = optimize_maximum_sharpe(
+        ff3_mu, ff3_factor_cov.reindex(index=covariance.index, columns=covariance.columns),
+        risk_free_rate=risk_free_rate, max_weight=max_weight,
+    )
+    ff5_factor_weights = optimize_maximum_sharpe(
+        ff5_mu, ff5_factor_cov.reindex(index=covariance.index, columns=covariance.columns),
+        risk_free_rate=risk_free_rate, max_weight=max_weight,
     )
 
     # Minimum Volatility calcolato una sola volta
@@ -2029,25 +2065,17 @@ def run_fixed_horizon_engine(
         portfolio_value = gross_value
         cost_log = pd.DataFrame()
         if transaction_costs is not None:
-            from src.transaction_costs import estimate_order_costs
-            budget = float(capital)
-            for _ in range(30):
-                desired_qty = budget * weights / start_prices
-                total_cost, detail = estimate_order_costs(
-                    desired_qty, start_prices, transaction_costs
-                )
-                new_budget = capital - total_cost
-                if new_budget <= 0:
-                    raise ValueError("Initial transaction costs exhaust capital")
-                if abs(new_budget - budget) < 1e-8:
-                    budget = new_budget
-                    break
-                budget = new_budget
+            from src.transaction_costs import fund_orders
+            budget, total_cost, detail = fund_orders(
+                float(capital), weights, pd.Series(0.0, index=weights.index),
+                start_prices, transaction_costs,
+            )
             quantities = budget * weights / start_prices
             portfolio_value = (test_prices * quantities).sum(axis=1)
             cost_log = pd.DataFrame([{
                 "Rebalance Date": test_prices.index[0], **detail,
                 "Total Cost": total_cost,
+                "Executed Turnover": detail["Traded Notional"] / capital,
             }])
 
         backtest = pd.DataFrame(
@@ -2067,6 +2095,7 @@ def run_fixed_horizon_engine(
             backtest.attrs["transaction_log"] = cost_log
             backtest["Daily Return"] = backtest["Portfolio Value"].pct_change().fillna(0.0)
             backtest.loc[backtest.index[0], "Daily Return"] = budget / capital - 1
+        backtest.attrs["initial_capital"] = float(capital)
         return backtest
 
     max_sharpe_bt = build_buy_and_hold(
@@ -2079,6 +2108,9 @@ def run_fixed_horizon_engine(
 
     ff3_bt = build_buy_and_hold(ff3_weights)
     ff5_bt = build_buy_and_hold(ff5_weights)
+    ff3_factor_bt = build_buy_and_hold(ff3_factor_weights)
+    ff5_factor_bt = build_buy_and_hold(ff5_factor_weights)
+
 
     min_vol_bt = build_buy_and_hold(
         min_vol_weights
@@ -2160,6 +2192,14 @@ def run_fixed_horizon_engine(
 
     ff5_weights_history = pd.DataFrame(
         [ff5_weights.reindex(test_prices.columns).fillna(0.0)],
+        index=[effective_start],
+    )
+    ff3_factor_weights_history = pd.DataFrame(
+        [ff3_factor_weights.reindex(test_prices.columns).fillna(0.0)],
+        index=[effective_start],
+    )
+    ff5_factor_weights_history = pd.DataFrame(
+        [ff5_factor_weights.reindex(test_prices.columns).fillna(0.0)],
         index=[effective_start],
     )
     ff5_aligned_stats = ff5_stats.reindex(ff5_weights.index)
@@ -2244,6 +2284,8 @@ def run_fixed_horizon_engine(
 
     ff3_bt_metrics = _cost_adjusted_metrics(ff3_bt, capital, risk_free_rate)
     ff5_bt_metrics = _cost_adjusted_metrics(ff5_bt, capital, risk_free_rate)
+    ff3_factor_bt_metrics = _cost_adjusted_metrics(ff3_factor_bt, capital, risk_free_rate)
+    ff5_factor_bt_metrics = _cost_adjusted_metrics(ff5_factor_bt, capital, risk_free_rate)
 
     min_bt_metrics = (
         _cost_adjusted_metrics(min_vol_bt, capital, risk_free_rate)
@@ -2277,6 +2319,7 @@ def run_fixed_horizon_engine(
         for name, curve in {
             "Max Sharpe": max_sharpe_bt, "CAPM": capm_bt,
             "FF3": ff3_bt, "FF5": ff5_bt,
+            "FF3 Factor Cov": ff3_factor_bt, "FF5 Factor Cov": ff5_factor_bt,
             "Min Volatility": min_vol_bt, "Risk Parity": risk_parity_bt,
             "HRP": hrp_bt, "Equal Weight": equal_weight_bt,
         }.items():
@@ -2319,6 +2362,12 @@ def run_fixed_horizon_engine(
         "max_sharpe_bt":
             max_sharpe_bt,
 
+        "ff3_factor_bt": ff3_factor_bt,
+        "ff3_factor_weights_history": ff3_factor_weights_history,
+        "ff3_factor_bt_metrics": ff3_factor_bt_metrics,
+        "ff5_factor_bt": ff5_factor_bt,
+        "ff5_factor_weights_history": ff5_factor_weights_history,
+        "ff5_factor_bt_metrics": ff5_factor_bt_metrics,
         "ff3_bt": ff3_bt,
         "ff3_weights_history": ff3_weights_history,
         "ff3_bt_metrics": ff3_bt_metrics,
@@ -2530,6 +2579,27 @@ def run_backtest_engine(
         ff5_factors=ff5_factors, eurusd_prices=eurusd_prices,
         ff5_exposure_records=ff5_exposure_records,
     )
+    ff3_factor_bt, ff3_factor_weights_history = backtest_portfolio(
+        prices, strategy="ff3_factor_cov_max_sharpe", market=market,
+        initial_capital=capital, lookback_days=lookback_days,
+        rebalance_days=rebalance_days, risk_free_rate=risk_free_rate,
+        max_weight=max_weight, selection_top_n=selection_top_n,
+        selection_policy=selection_policy, shared_window_cache=shared_window_cache,
+        historical_fundamentals=historical_fundamentals,
+        active_factors=active_factors, transaction_costs=transaction_costs,
+        ff3_factors=ff3_factors, eurusd_prices=eurusd_prices,
+    )
+    ff5_factor_bt, ff5_factor_weights_history = backtest_portfolio(
+        prices, strategy="ff5_factor_cov_max_sharpe", market=market,
+        initial_capital=capital, lookback_days=lookback_days,
+        rebalance_days=rebalance_days, risk_free_rate=risk_free_rate,
+        max_weight=max_weight, selection_top_n=selection_top_n,
+        selection_policy=selection_policy, shared_window_cache=shared_window_cache,
+        historical_fundamentals=historical_fundamentals,
+        active_factors=active_factors, transaction_costs=transaction_costs,
+        ff5_factors=ff5_factors, eurusd_prices=eurusd_prices,
+    )
+
     ff5_factor_exposure_history = pd.DataFrame(ff5_exposure_records)
     if not ff5_factor_exposure_history.empty:
         ff5_factor_exposure_history = ff5_factor_exposure_history.set_index("Rebalance Date")
@@ -2631,6 +2701,8 @@ def run_backtest_engine(
 
         ff3_bt = ff3_bt.reindex(max_sharpe_bt.index).dropna()
         ff5_bt = ff5_bt.reindex(max_sharpe_bt.index).dropna()
+        ff3_factor_bt = ff3_factor_bt.reindex(max_sharpe_bt.index).dropna()
+        ff5_factor_bt = ff5_factor_bt.reindex(max_sharpe_bt.index).dropna()
 
         capm_bt = (
             capm_bt
@@ -2676,6 +2748,8 @@ def run_backtest_engine(
         ff3_weights_history = ff3_weights_history.loc[
             ff3_weights_history.index <= effective_end_for_weights
         ]
+        ff3_factor_weights_history = ff3_factor_weights_history.loc[ff3_factor_weights_history.index <= effective_end_for_weights]
+        ff5_factor_weights_history = ff5_factor_weights_history.loc[ff5_factor_weights_history.index <= effective_end_for_weights]
         ff5_weights_history = ff5_weights_history.loc[
             ff5_weights_history.index <= effective_end_for_weights
         ]
@@ -2746,6 +2820,8 @@ def run_backtest_engine(
 
     ff3_bt_metrics = _cost_adjusted_metrics(ff3_bt, capital, risk_free_rate)
     ff5_bt_metrics = _cost_adjusted_metrics(ff5_bt, capital, risk_free_rate)
+    ff3_factor_bt_metrics = _cost_adjusted_metrics(ff3_factor_bt, capital, risk_free_rate)
+    ff5_factor_bt_metrics = _cost_adjusted_metrics(ff5_factor_bt, capital, risk_free_rate)
 
     capm_bt_metrics = (
         _cost_adjusted_metrics(capm_bt, capital, risk_free_rate)
@@ -2779,6 +2855,7 @@ def run_backtest_engine(
         for name, curve in {
             "Max Sharpe": max_sharpe_bt, "CAPM": capm_bt,
             "FF3": ff3_bt, "FF5": ff5_bt,
+            "FF3 Factor Cov": ff3_factor_bt, "FF5 Factor Cov": ff5_factor_bt,
             "Min Volatility": min_vol_bt, "Risk Parity": risk_parity_bt,
             "HRP": hrp_bt, "Equal Weight": equal_weight_bt,
         }.items():
@@ -2815,6 +2892,12 @@ def run_backtest_engine(
         "max_sharpe_bt":
             max_sharpe_bt,
 
+        "ff3_factor_bt": ff3_factor_bt,
+        "ff3_factor_weights_history": ff3_factor_weights_history,
+        "ff3_factor_bt_metrics": ff3_factor_bt_metrics,
+        "ff5_factor_bt": ff5_factor_bt,
+        "ff5_factor_weights_history": ff5_factor_weights_history,
+        "ff5_factor_bt_metrics": ff5_factor_bt_metrics,
         "ff3_bt": ff3_bt,
         "ff3_weights_history": ff3_weights_history,
         "ff3_bt_metrics": ff3_bt_metrics,
@@ -2976,6 +3059,12 @@ def display_backtest_results(
             **({"FF5 Maximum Sharpe": result["ff5_bt_metrics"]}
                if "ff5_bt_metrics" in result else {}),
 
+            **({"FF3 Factor Cov Maximum Sharpe": result["ff3_factor_bt_metrics"]}
+               if "ff3_factor_bt_metrics" in result else {}),
+
+            **({"FF5 Factor Cov Maximum Sharpe": result["ff5_factor_bt_metrics"]}
+               if "ff5_factor_bt_metrics" in result else {}),
+
             "Minimum Volatility":
                 result["min_bt_metrics"],
 
@@ -3080,6 +3169,18 @@ def display_backtest_results(
             x=result["ff5_bt"].index, y=result["ff5_bt"]["Portfolio Value"],
             mode="lines", name="FF5 Maximum Sharpe",
         ))
+
+    for factor_label, factor_key, factor_color in (
+        ("FF3 Factor Cov Maximum Sharpe", "ff3_factor_bt", "#00BFA5"),
+        ("FF5 Factor Cov Maximum Sharpe", "ff5_factor_bt", "#FFD166"),
+    ):
+        factor_curve = result.get(factor_key)
+        if isinstance(factor_curve, pd.DataFrame) and "Portfolio Value" in factor_curve.columns:
+            portfolio_fig.add_trace(go.Scatter(
+                x=factor_curve.index, y=factor_curve["Portfolio Value"],
+                mode="lines", name=factor_label,
+                line=dict(color=factor_color, width=2.5),
+            ))
 
     portfolio_fig.add_trace(
         go.Scatter(
@@ -3267,6 +3368,19 @@ def display_backtest_results(
             name="FF5 Maximum Sharpe",
         ))
 
+    for factor_label, factor_key, factor_color in (
+        ("FF3 Factor Cov Maximum Sharpe", "ff3_factor_bt", "#00BFA5"),
+        ("FF5 Factor Cov Maximum Sharpe", "ff5_factor_bt", "#FFD166"),
+    ):
+        factor_curve = result.get(factor_key)
+        if isinstance(factor_curve, pd.DataFrame) and "Portfolio Value" in factor_curve.columns:
+            factor_drawdown = calculate_drawdown(factor_curve)
+            drawdown_fig.add_trace(go.Scatter(
+                x=factor_drawdown.index, y=factor_drawdown,
+                mode="lines", name=factor_label,
+                line=dict(color=factor_color, width=2.5),
+            ))
+
     drawdown_fig.add_trace(
         go.Scatter(
             x=min_drawdown.index,
@@ -3381,6 +3495,8 @@ def display_backtest_results(
             "CAPM Maximum Sharpe",
             "FF3 Maximum Sharpe",
             "FF5 Maximum Sharpe",
+            "FF3 Factor Cov Maximum Sharpe",
+            "FF5 Factor Cov Maximum Sharpe",
             "Minimum Volatility",
             "Risk Parity",
             "HRP",
@@ -3414,6 +3530,12 @@ def display_backtest_results(
 
     elif rebalance_strategy == "FF5 Maximum Sharpe":
         selected_weights_history = result.get("ff5_weights_history", pd.DataFrame())
+
+    elif rebalance_strategy == "FF3 Factor Cov Maximum Sharpe":
+        selected_weights_history = result.get("ff3_factor_weights_history", pd.DataFrame())
+
+    elif rebalance_strategy == "FF5 Factor Cov Maximum Sharpe":
+        selected_weights_history = result.get("ff5_factor_weights_history", pd.DataFrame())
 
     elif (
         rebalance_strategy
@@ -3516,11 +3638,23 @@ def display_backtest_results(
     # TURNOVER
     # =====================================================
 
-    turnover_series = (
-        calculate_turnover(
-            selected_weights_history
-        )
-    )
+    curve_key = {
+        "Maximum Sharpe": "max_sharpe_bt", "CAPM Maximum Sharpe": "capm_bt",
+        "FF3 Maximum Sharpe": "ff3_bt", "FF5 Maximum Sharpe": "ff5_bt",
+        "FF3 Factor Cov Maximum Sharpe": "ff3_factor_bt",
+        "FF5 Factor Cov Maximum Sharpe": "ff5_factor_bt",
+        "Minimum Volatility": "min_vol_bt", "Risk Parity": "risk_parity_bt",
+        "HRP": "hrp_bt", "Equal Weight": "equal_weight_bt",
+    }[rebalance_strategy]
+    trade_log = result.get(curve_key, pd.DataFrame()).attrs.get("transaction_log")
+    if trade_log is not None and "Executed Turnover" in trade_log:
+        turnover_series = trade_log.set_index("Rebalance Date")["Executed Turnover"]
+        turnover_series = turnover_series.reindex(selected_weights_history.index)
+        turnover_label = "Executed turnover (buys + sells)"
+    else:
+        turnover_series = calculate_turnover(selected_weights_history)
+        turnover_label = "Target-weight turnover proxy"
+    st.caption(turnover_label)
 
     if len(turnover_series) > 1:
 
@@ -5939,7 +6073,7 @@ with factor_models_tab:
     st.subheader("Fama–French Three-Factor Model (FF3)")
     st.caption(
         "Region-specific daily MKT−RF, SMB and HML factors from the Kenneth French Data Library. "
-        "Assets are converted from EUR to USD before estimating factor exposures."
+        "European factors are converted to EUR using EURUSD and the ECB €STR rate before estimating factor exposures."
     )
     ff3_col1, ff3_col2 = st.columns([3, 1], vertical_alignment="bottom")
     with ff3_col1:
@@ -5949,11 +6083,12 @@ with factor_models_tab:
         )
     with ff3_col2:
         run_ff3 = st.button("Run FF3 Analysis", use_container_width=True)
+        run_ff3_factor = st.button("Run FF3 Factor Cov", use_container_width=True)
 
-    if run_ff3 and validate_portfolio(tickers, max_weight):
+    if (run_ff3 or run_ff3_factor) and validate_portfolio(tickers, max_weight):
         try:
             with st.spinner("Estimating regional Fama–French factors..."):
-                ff3_eur_prices = get_prices(tickers, period=ff3_period)
+                ff3_eur_prices = get_prices(tickers, period=ff3_period, preserve_missing=True)
                 ff3_factors = load_us_ff3() if market == "USA" else load_europe_ff3()
                 ff3_fx_prices = None if market == "USA" else get_prices(["EURUSD=X"], period=ff3_period)
                 ff3_mu_eur, ff3_stats = estimate_factor_returns(
@@ -5961,6 +6096,9 @@ with factor_models_tab:
                     market=market, model="ff3", return_stats=True,
                 )
                 ff3_cov = covariance_matrix(calculate_returns(ff3_eur_prices))
+                if run_ff3_factor:
+                    from src.factor_covariance import estimate_factor_covariance
+                    ff3_cov = estimate_factor_covariance(ff3_eur_prices, ff3_factors, model="ff3", eurusd_prices=ff3_fx_prices, market=market)
                 ff3_mu_eur = ff3_mu_eur.reindex(ff3_cov.index)
                 ff3_weights = optimize_maximum_sharpe(
                     ff3_mu_eur, ff3_cov,
@@ -5971,7 +6109,8 @@ with factor_models_tab:
                 ff3_table = prepare_portfolio_table(
                     ff3_weights, ff3_eur_prices, capital, use_fractional_shares
                 )
-                st.session_state.ff3_results = {
+                result_key = "ff3_factor_results" if run_ff3_factor else "ff3_results"
+                st.session_state[result_key] = {
                     "period": ff3_period, "stats": ff3_stats,
                     "expected_returns_eur": ff3_mu_eur,
                     "covariance": ff3_cov,
@@ -5986,13 +6125,20 @@ with factor_models_tab:
         except Exception as exc:
             st.error(f"FF3 analysis failed: {exc}")
 
-    ff3_result = st.session_state.ff3_results
+    factor_result = st.session_state.get("ff3_factor_results")
+    if factor_result is not None:
+        st.markdown("#### FF3 Factor Cov — Maximum Sharpe Portfolio")
+        st.caption(factor_estimation_caption("FF3", factor_result))
+        fc1, fc2, fc3 = st.columns(3)
+        fc1.metric("Expected Return", f"{factor_result['return']:.2%}")
+        fc2.metric("Volatility", f"{factor_result['volatility']:.2%}")
+        fc3.metric("Sharpe Ratio", f"{factor_result['sharpe']:.2f}")
+        render_diversification_var_kpis(factor_result["weights"], factor_result["covariance"], capital)
+        portfolio_allocation_title()
+        display_portfolio_table(factor_result["table"], factor_result["use_fractional_shares"])
+    ff3_result = st.session_state.get("ff3_results")
     if ff3_result is not None:
-        st.caption(
-            f"FF3 estimation: {ff3_result['period']} · "
-            f"{ff3_result['factor_observations']} factor dates · "
-            "EUR portfolio covariance and EUR risk-free rate."
-        )
+        st.caption(factor_estimation_caption("FF3", ff3_result))
         st.markdown("#### FF3 Maximum Sharpe Portfolio")
         ff3_m1, ff3_m2, ff3_m3 = st.columns(3)
         with ff3_m1:
@@ -6037,9 +6183,9 @@ with factor_models_tab:
     st.divider()
     st.subheader("Fama–French Five-Factor Model (FF5)")
     st.caption(
-        "European daily MKT−RF, SMB, HML, RMW and CMA factors. "
-        "The same EUR-to-USD conversion, EUR covariance and "
-        "Maximum Sharpe optimization used by FF3 are retained."
+        "Region-specific daily MKT−RF, SMB, HML, RMW and CMA factors from the "
+        "Kenneth French Data Library. European factors are converted to EUR "
+        "using EURUSD and the ECB €STR rate before estimating factor exposures."
     )
     ff5_c1, ff5_c2 = st.columns([3, 1], vertical_alignment="bottom")
     with ff5_c1:
@@ -6049,11 +6195,12 @@ with factor_models_tab:
         )
     with ff5_c2:
         run_ff5 = st.button("Run FF5 Analysis", use_container_width=True)
+        run_ff5_factor = st.button("Run FF5 Factor Cov", use_container_width=True)
 
-    if run_ff5 and validate_portfolio(tickers, max_weight):
+    if (run_ff5 or run_ff5_factor) and validate_portfolio(tickers, max_weight):
         try:
             with st.spinner("Estimating European FF5 factors..."):
-                ff5_eur_prices = get_prices(tickers, period=ff5_period)
+                ff5_eur_prices = get_prices(tickers, period=ff5_period, preserve_missing=True)
                 ff5_factors = load_us_ff5() if market == "USA" else load_europe_ff5()
                 ff5_fx_prices = None if market == "USA" else get_prices(["EURUSD=X"], period=ff5_period)
                 ff5_mu_eur, ff5_stats = estimate_factor_returns(
@@ -6061,6 +6208,9 @@ with factor_models_tab:
                     market=market, model="ff5", return_stats=True,
                 )
                 ff5_cov = covariance_matrix(calculate_returns(ff5_eur_prices))
+                if run_ff5_factor:
+                    from src.factor_covariance import estimate_factor_covariance
+                    ff5_cov = estimate_factor_covariance(ff5_eur_prices, ff5_factors, model="ff5", eurusd_prices=ff5_fx_prices, market=market)
                 ff5_mu_eur = ff5_mu_eur.reindex(ff5_cov.index)
                 ff5_weights = optimize_maximum_sharpe(
                     ff5_mu_eur, ff5_cov,
@@ -6071,7 +6221,8 @@ with factor_models_tab:
                 ff5_table = prepare_portfolio_table(
                     ff5_weights, ff5_eur_prices, capital, use_fractional_shares
                 )
-                st.session_state.ff5_results = {
+                result_key = "ff5_factor_results" if run_ff5_factor else "ff5_results"
+                st.session_state[result_key] = {
                     "period": ff5_period, "stats": ff5_stats,
                     "expected_returns_eur": ff5_mu_eur,
                     "covariance": ff5_cov,
@@ -6086,13 +6237,20 @@ with factor_models_tab:
         except Exception as exc:
             st.error(f"FF5 analysis failed: {exc}")
 
-    ff5_result = st.session_state.ff5_results
+    factor_result = st.session_state.get("ff5_factor_results")
+    if factor_result is not None:
+        st.markdown("#### FF5 Factor Cov — Maximum Sharpe Portfolio")
+        st.caption(factor_estimation_caption("FF5", factor_result))
+        fc1, fc2, fc3 = st.columns(3)
+        fc1.metric("Expected Return", f"{factor_result['return']:.2%}")
+        fc2.metric("Volatility", f"{factor_result['volatility']:.2%}")
+        fc3.metric("Sharpe Ratio", f"{factor_result['sharpe']:.2f}")
+        render_diversification_var_kpis(factor_result["weights"], factor_result["covariance"], capital)
+        portfolio_allocation_title()
+        display_portfolio_table(factor_result["table"], factor_result["use_fractional_shares"])
+    ff5_result = st.session_state.get("ff5_results")
     if ff5_result is not None:
-        st.caption(
-            f"FF5 estimation: {ff5_result['period']} · "
-            f"{ff5_result['factor_observations']} factor dates · "
-            "EUR portfolio covariance and EUR risk-free rate."
-        )
+        st.caption(factor_estimation_caption("FF5", ff5_result))
         st.markdown("#### FF5 Maximum Sharpe Portfolio")
         ff5_m1, ff5_m2, ff5_m3 = st.columns(3)
         with ff5_m1:
@@ -6500,6 +6658,10 @@ with backtest_tab:
 
     st.header(
         "Backtesting"
+    )
+    st.caption(
+        "FF3 and FF5 estimation uses factor returns dated at least two calendar months before each signal. "
+        "Historical publication dates and file versions are unverified."
     )
 
     st.caption(
@@ -7311,6 +7473,8 @@ with backtest_tab:
         "Maximum Sharpe": "max_sharpe_bt",
         "CAPM Maximum Sharpe": "capm_bt",
         "FF3 Maximum Sharpe": "ff3_bt",
+        "FF3 Factor Cov": "ff3_factor_bt",
+        "FF5 Factor Cov": "ff5_factor_bt",
         "FF5 Maximum Sharpe": "ff5_bt",
         "Minimum Volatility": "min_vol_bt",
         "Risk Parity": "risk_parity_bt",
@@ -7575,6 +7739,8 @@ with monte_carlo_tab:
         "Maximum Sharpe": "max_sharpe_bt",
         "CAPM Maximum Sharpe": "capm_bt",
         "FF3 Maximum Sharpe": "ff3_bt",
+        "FF3 Factor Cov": "ff3_factor_bt",
+        "FF5 Factor Cov": "ff5_factor_bt",
         "FF5 Maximum Sharpe": "ff5_bt",
         "Minimum Volatility": "min_vol_bt",
         "Risk Parity": "risk_parity_bt",

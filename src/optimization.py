@@ -1,3 +1,6 @@
+from itertools import combinations
+from math import comb
+
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
@@ -5,6 +8,25 @@ from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
 
 from src.risk import portfolio_return, portfolio_volatility
+
+
+def _validated_covariance(covariance, labels):
+    if (len(labels) == 0 or not labels.is_unique
+            or not covariance.index.is_unique or not covariance.columns.is_unique
+            or set(labels) != set(covariance.index) or set(labels) != set(covariance.columns)):
+        raise ValueError("Covariance must have one row and column per asset")
+    covariance = covariance.loc[labels, labels].astype(float)
+    values = covariance.to_numpy()
+    scale = np.max(np.abs(values))
+    if not np.isfinite(scale):
+        raise ValueError("Covariance must be finite")
+    if scale > 0:
+        scaled = values / scale
+        if not np.allclose(scaled, scaled.T, rtol=0, atol=1e-10):
+            raise ValueError("Covariance must be symmetric")
+        if np.linalg.eigvalsh(scaled)[0] < -1e-10:
+            raise ValueError("Covariance must be positive semidefinite")
+    return covariance, scale
 
 
 def optimize_minimum_volatility(
@@ -19,6 +41,7 @@ def optimize_minimum_volatility(
     per ogni singolo asset.
     """
 
+    covariance, scale = _validated_covariance(covariance, expected_returns.index)
     n_assets = len(expected_returns)
 
     initial_weights = np.ones(n_assets) / n_assets
@@ -36,13 +59,17 @@ def optimize_minimum_volatility(
         "fun": lambda weights: np.sum(weights) - 1
     }
 
+    if scale == 0:
+        return pd.Series(initial_weights, index=expected_returns.index)
+    matrix = covariance.to_numpy() / scale
     result = minimize(
-        portfolio_volatility,
+        lambda weights: float(weights @ matrix @ weights),
         initial_weights,
-        args=(covariance,),
+        jac=lambda weights: 2 * (matrix @ weights),
         method="SLSQP",
         bounds=bounds,
-        constraints=constraints
+        constraints=constraints,
+        options={"ftol": 1e-12},
     )
 
     if not result.success:
@@ -54,6 +81,32 @@ def optimize_minimum_volatility(
         result.x,
         index=expected_returns.index
     )
+
+
+def _maximum_sharpe_at_vertex(excess, matrix, labels, max_weight):
+    n_assets = len(labels)
+    # For non-positive excess returns a vertex maximizes Sharpe: for
+    # positive risk, the norm of a convex combination is at most the
+    # combination of norms, while the nonnegative loss is linear.
+    cap = min(max_weight, 1.0)
+    full = min(n_assets, int(np.floor(1 / cap + 1e-12)))
+    remainder = max(0.0, 1 - full * cap)
+    count = comb(n_assets, full) * (n_assets - full if remainder > 1e-12 else 1)
+    if count > 100_000:
+        raise ValueError("Maximum Sharpe with nonpositive excess returns has too many feasible vertices for exact enumeration")
+    best = None
+    best_score = -np.inf
+    for capped in combinations(range(n_assets), full):
+        free = (set(range(n_assets)) - set(capped)) if remainder > 1e-12 else (None,)
+        for last in free:
+            weights = np.zeros(n_assets)
+            weights[list(capped)] = cap
+            if last is not None:
+                weights[last] = remainder
+            score = float(weights @ excess / np.sqrt(weights @ matrix @ weights))
+            if score > best_score:
+                best, best_score = weights, score
+    return pd.Series(best, index=labels)
 
 
 def optimize_maximum_sharpe(
@@ -69,11 +122,13 @@ def optimize_maximum_sharpe(
     per ogni singolo asset.
     """
 
+    covariance, scale = _validated_covariance(covariance, expected_returns.index)
+    excess = expected_returns.to_numpy(float) - risk_free_rate
+    if not np.isfinite(excess).all():
+        raise ValueError("Expected excess returns must be finite")
     n_assets = len(expected_returns)
 
-    initial_weights = np.ones(n_assets) / n_assets
-
-    if max_weight < 1 / n_assets:
+    if not np.isfinite(max_weight) or max_weight < 1 / n_assets:
         raise ValueError(
             "Il peso massimo per asset è troppo basso "
             "rispetto al numero di asset."
@@ -86,33 +141,44 @@ def optimize_maximum_sharpe(
         "fun": lambda weights: np.sum(weights) - 1
     }
 
+    if scale == 0:
+        raise ValueError("Sharpe is undefined for a zero-risk covariance")
+    matrix = covariance.to_numpy() / scale
+    if np.linalg.eigvalsh(matrix)[0] <= 1e-10:
+        min_risk = optimize_minimum_volatility(expected_returns, covariance, max_weight).to_numpy()
+        if min_risk @ matrix @ min_risk <= 1e-12:
+            raise ValueError("Sharpe is undefined on a feasible zero-risk portfolio")
+
+    # The highest-return allocation under a common cap is obtained greedily.
+    by_return = np.argsort(-excess, kind="stable")
+    initial_weights = np.zeros(n_assets)
+    initial_weights[by_return] = np.clip(1 - max_weight * np.arange(n_assets), 0, max_weight)
+    if initial_weights @ excess <= 0:
+        return _maximum_sharpe_at_vertex(excess, matrix, expected_returns.index, max_weight)
+
+    normalized_excess = excess / np.max(np.abs(excess))
+    constraints = [constraints, {
+        "type": "ineq",
+        "fun": lambda weights: float(weights @ normalized_excess),
+        "jac": lambda weights: normalized_excess,
+    }]
+
     def negative_sharpe(weights):
+        return -float(weights @ normalized_excess / np.sqrt(weights @ matrix @ weights))
 
-        portfolio_ret = portfolio_return(
-            weights,
-            expected_returns
-        )
-
-        portfolio_vol = portfolio_volatility(
-            weights,
-            covariance
-        )
-
-        if portfolio_vol == 0:
-            return 0
-
-        sharpe = (
-            portfolio_ret - risk_free_rate
-        ) / portfolio_vol
-
-        return -sharpe
+    def gradient(weights):
+        marginal = matrix @ weights
+        variance = weights @ marginal
+        return ((weights @ normalized_excess) * marginal / variance - normalized_excess) / np.sqrt(variance)
 
     result = minimize(
         negative_sharpe,
         initial_weights,
+        jac=gradient,
         method="SLSQP",
         bounds=bounds,
-        constraints=constraints
+        constraints=constraints,
+        options={"ftol": 1e-12},
     )
 
     if not result.success:
@@ -158,7 +224,10 @@ def optimize_risk_parity(
             "rispetto al numero di asset."
         )
 
-    covariance_values = covariance.values
+    covariance, scale = _validated_covariance(covariance, covariance.index)
+    if scale == 0:
+        raise ValueError("Risk contributions are undefined for zero portfolio variance")
+    covariance_values = covariance.to_numpy() / scale
 
     initial_weights = (
         np.ones(n_assets) / n_assets
@@ -235,6 +304,8 @@ def optimize_risk_parity(
         )
 
     weights = result.x
+    if weights @ covariance_values @ weights <= 0:
+        raise ValueError("Risk contributions are undefined for zero portfolio variance")
 
     # Pulizia dei piccoli residui numerici.
     weights[

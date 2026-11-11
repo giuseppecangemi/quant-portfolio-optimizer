@@ -48,7 +48,8 @@ def fit_ff3(asset_usd_returns: pd.DataFrame, factors: pd.DataFrame,
     vengono stimati utilizzando le medie storiche dei fattori."""
     rows = []
     for ticker in asset_usd_returns.columns:
-        joined = pd.concat([asset_usd_returns[ticker].rename('Asset'), factors], axis=1,
+        joined = pd.concat([asset_usd_returns[ticker].rename('Asset'),
+                            factors[['MKT-RF', 'SMB', 'HML', 'RF']]], axis=1,
                            join='inner').dropna()
         if len(joined) < min_observations:
             raise ValueError(f"Insufficient common FF3 observations for {ticker}: {len(joined)}")

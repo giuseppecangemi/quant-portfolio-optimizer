@@ -29,7 +29,10 @@ def covariance_matrix(
     Calcola la matrice di covarianza annualizzata.
     """
 
-    return returns.cov() * periods_per_year
+    complete = returns.dropna()
+    if len(complete) < 2:
+        raise ValueError("At least two complete observations are required for covariance")
+    return complete.cov() * periods_per_year
 
 
 def portfolio_return(

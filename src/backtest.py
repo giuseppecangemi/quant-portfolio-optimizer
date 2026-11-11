@@ -1,9 +1,12 @@
+from hashlib import sha256
+
 import numpy as np
 import pandas as pd
 from src.factors import capm_expected_returns
 from src.fama_french import estimate_ff3_eur_returns
 from src.fama_french_5 import estimate_ff5_eur_returns
-from src.factor_currency import estimate_factor_returns
+from src.factor_currency import estimate_factor_returns, factors_for_backtest_signal
+from src.transaction_costs import fund_orders
 from src.screening import screen_prices_point_in_time, screen_tradable_point_in_time, screen_quant_point_in_time
 from src.optimization import (
     optimize_minimum_volatility,
@@ -33,7 +36,7 @@ def backtest_portfolio(
     historical_fundamentals=None,
     selection_audit=None,
     active_factors=("Momentum", "Risk"),
-    market="Italia",
+    market="Borsa Italiana",
 ):
     """
     Esegue un backtest walk-forward realistico.
@@ -50,6 +53,8 @@ def backtest_portfolio(
         Pesi target calcolati a ogni data di ribilanciamento.
     """
     valid_strategies = [
+        "ff3_factor_cov_max_sharpe",
+        "ff5_factor_cov_max_sharpe",
         "max_sharpe",
         "capm_max_sharpe",
         "ff3_max_sharpe",
@@ -121,14 +126,28 @@ def backtest_portfolio(
     fixed_selected_tickers = None
     if shared_window_cache is None:
         shared_window_cache = {}
+    # Reuse cached estimates only for the same inputs and market.
+    def digest(frame):
+        if frame is None:
+            return None
+        labels = tuple(frame.columns) if isinstance(frame, pd.DataFrame) else frame.name
+        return labels, sha256(pd.util.hash_pandas_object(frame, index=True).to_numpy().tobytes()).digest()
+
+    fingerprint = digest(prices)
+    factor_fingerprints = (market, digest(ff3_factors), digest(ff5_factors), digest(eurusd_prices))
+    if (shared_window_cache.get("_dataset") != fingerprint
+            or shared_window_cache.get("_fundamentals") is not historical_fundamentals):
+        shared_window_cache.clear()
+        shared_window_cache["_dataset"] = fingerprint
+        shared_window_cache["_fundamentals"] = historical_fundamentals
     if selection_top_n is not None and selection_policy == "fixed":
         initial_historical_universe = prices.iloc[
             start_position - lookback_days:
             start_position
         ]
-        fixed_key = ("fixed_selection_v3", tuple(prices.columns), prices.index[start_position], lookback_days, int(selection_top_n), tuple(active_factors))
+        fixed_key = ("fixed_selection_tplus1_v4", tuple(prices.columns), prices.index[start_position], lookback_days, int(selection_top_n), tuple(active_factors))
         if fixed_key not in shared_window_cache:
-            ranking, selected = screen_quant_point_in_time(initial_historical_universe, prices.iloc[start_position], prices.index[start_position], historical_fundamentals, top_n=int(selection_top_n), min_observations=max(252, min(lookback_days, 253)), active_factors=active_factors)
+            ranking, selected = screen_quant_point_in_time(initial_historical_universe, prices.iloc[start_position - 1], prices.index[start_position - 1], historical_fundamentals, top_n=int(selection_top_n), min_observations=max(252, min(lookback_days, 253)), active_factors=active_factors)
             shared_window_cache[fixed_key] = (list(selected), ranking.copy())
         cached_selection = shared_window_cache[fixed_key]
         fixed_selected_tickers = list(cached_selection[0])
@@ -158,7 +177,9 @@ def backtest_portfolio(
             prices.index[rebalance_start]
         )
         # -------------------------------------------------
-        # 1. DATI DISPONIBILI PRIMA DEL RIBILANCIAMENTO
+        # 1. Decisione alla chiusura di t-1, esecuzione alla chiusura di t.
+        #    Il prezzo di t non entra nello screening né nella stima.
+        #    DATI DISPONIBILI PRIMA DEL RIBILANCIAMENTO
         # -------------------------------------------------
         historical_universe = prices.iloc[
             rebalance_start - lookback_days:
@@ -171,9 +192,9 @@ def backtest_portfolio(
             if selection_policy == "fixed":
                 selected_tickers = fixed_selected_tickers.copy()
             else:
-                selection_key = ("dynamic_selection_v3", tuple(prices.columns), prices.index[rebalance_start], lookback_days, int(selection_top_n), tuple(active_factors))
+                selection_key = ("dynamic_selection_tplus1_v4", tuple(prices.columns), prices.index[rebalance_start], lookback_days, int(selection_top_n), tuple(active_factors))
                 if selection_key not in shared_window_cache:
-                    ranking, selected = screen_quant_point_in_time(historical_universe, prices.iloc[rebalance_start], prices.index[rebalance_start], historical_fundamentals, top_n=int(selection_top_n), min_observations=max(252, min(lookback_days, 253)), active_factors=active_factors)
+                    ranking, selected = screen_quant_point_in_time(historical_universe, prices.iloc[rebalance_start - 1], prices.index[rebalance_start - 1], historical_fundamentals, top_n=int(selection_top_n), min_observations=max(252, min(lookback_days, 253)), active_factors=active_factors)
                     shared_window_cache[selection_key] = (list(selected), ranking.copy())
                 selected_tickers = list(shared_window_cache[selection_key][0])
                 if selection_audit is not None:
@@ -201,11 +222,12 @@ def backtest_portfolio(
         else:
             selected_tickers = list(prices.columns)
             historical_prices = historical_universe.dropna()
+        factor_prices = historical_universe[selected_tickers]
         if len(historical_prices) < 2:
             raise ValueError(
                 f"Insufficient common history on {rebalance_date}."
             )
-        stats_key = ("window_stats", rebalance_start, tuple(historical_prices.columns), len(historical_prices))
+        stats_key = ("window_stats", lookback_days, rebalance_start, tuple(historical_prices.columns), len(historical_prices))
         if stats_key not in shared_window_cache:
             historical_returns = (
                 historical_prices
@@ -269,40 +291,50 @@ def backtest_portfolio(
                     max_weight=max_weight,
                 )
             )
-        elif strategy == "ff3_max_sharpe":
+        elif strategy in ("ff3_max_sharpe", "ff3_factor_cov_max_sharpe"):
             if ff3_factors is None or (market != "USA" and eurusd_prices is None):
                 raise ValueError("FF3 factors and EUR/USD prices are required.")
-            ff3_key = ("ff3_expected_returns", rebalance_start,
+            signal_factors = factors_for_backtest_signal(ff3_factors, factor_prices.index[-1])
+            ff3_key = ("ff3_expected_returns", factor_fingerprints, lookback_days, rebalance_start,
                        tuple(historical_prices.columns), len(historical_prices))
             if ff3_key not in shared_window_cache:
                 shared_window_cache[ff3_key] = estimate_factor_returns(
-                    historical_prices, ff3_factors, eurusd_prices,
+                    factor_prices, signal_factors, eurusd_prices,
                     market=market, model="ff3", return_stats=True
                 )
             ff3_expected, ff3_stats = shared_window_cache[ff3_key]
             ff3_mu = ff3_expected.reindex(covariance.index)
             if ff3_mu.isna().any():
                 raise ValueError(f"Missing FF3 expected returns on {rebalance_date}.")
+            risk_cov = covariance
+            if strategy == "ff3_factor_cov_max_sharpe":
+                from src.factor_covariance import estimate_factor_covariance
+                risk_cov = estimate_factor_covariance(factor_prices, signal_factors, model="ff3", eurusd_prices=eurusd_prices, market=market)
             target_weights = optimize_maximum_sharpe(
-                ff3_mu, covariance, risk_free_rate=risk_free_rate,
+                ff3_mu, risk_cov, risk_free_rate=risk_free_rate,
                 max_weight=max_weight
             )
-        elif strategy == "ff5_max_sharpe":
+        elif strategy in ("ff5_max_sharpe", "ff5_factor_cov_max_sharpe"):
             if ff5_factors is None or (market != "USA" and eurusd_prices is None):
                 raise ValueError("FF5 factors and EUR/USD prices are required.")
-            ff5_key = ("ff5_expected_returns", rebalance_start,
+            signal_factors = factors_for_backtest_signal(ff5_factors, factor_prices.index[-1])
+            ff5_key = ("ff5_expected_returns", factor_fingerprints, lookback_days, rebalance_start,
                        tuple(historical_prices.columns), len(historical_prices))
             if ff5_key not in shared_window_cache:
                 shared_window_cache[ff5_key] = estimate_factor_returns(
-                    historical_prices, ff5_factors, eurusd_prices,
+                    factor_prices, signal_factors, eurusd_prices,
                     market=market, model="ff5", return_stats=True
                 )
             ff5_expected, ff5_stats = shared_window_cache[ff5_key]
             ff5_mu = ff5_expected.reindex(covariance.index)
             if ff5_mu.isna().any():
                 raise ValueError(f"Missing FF5 expected returns on {rebalance_date}.")
+            risk_cov = covariance
+            if strategy == "ff5_factor_cov_max_sharpe":
+                from src.factor_covariance import estimate_factor_covariance
+                risk_cov = estimate_factor_covariance(factor_prices, signal_factors, model="ff5", eurusd_prices=eurusd_prices, market=market)
             target_weights = optimize_maximum_sharpe(
-                ff5_mu, covariance, risk_free_rate=risk_free_rate,
+                ff5_mu, risk_cov, risk_free_rate=risk_free_rate,
                 max_weight=max_weight
             )
         elif strategy == "min_volatility":
@@ -352,7 +384,7 @@ def backtest_portfolio(
             / target_weights.sum()
         )
         # Exposure FF3 ponderate sui pesi target effettivamente investiti.
-        if strategy == "ff3_max_sharpe" and ff3_exposure_records is not None:
+        if strategy in ("ff3_max_sharpe", "ff3_factor_cov_max_sharpe") and ff3_exposure_records is not None:
             aligned = ff3_stats.reindex(target_weights.index)
             exposure = {"Rebalance Date": pd.Timestamp(rebalance_date)}
             for label, beta in (("Market Beta", "Beta MKT"),
@@ -362,7 +394,7 @@ def backtest_portfolio(
                 exposure[label] = float((target_weights * values).sum())
             exposure["Active Assets"] = int((target_weights > 1e-10).sum())
             ff3_exposure_records.append(exposure)
-        if strategy == "ff5_max_sharpe" and ff5_exposure_records is not None:
+        if strategy in ("ff5_max_sharpe", "ff5_factor_cov_max_sharpe") and ff5_exposure_records is not None:
             aligned = ff5_stats.reindex(target_weights.index)
             exposure = {"Rebalance Date": pd.Timestamp(rebalance_date)}
             for label, beta in (("Market Beta", "Beta MKT"),
@@ -390,29 +422,18 @@ def backtest_portfolio(
         # Le operazioni di trading sono finanziate dal valore effettivo del portafoglio.
         # I costi vengono calcolati in base alle variazioni delle quantità di titoli
         # da acquistare o vendere, non alla variazione dei pesi target.
-        execution_cost = 0.0
+        executable = target_weights.gt(0) | previous_quantities.ne(0)
+        if not np.isfinite(rebalance_prices[executable]).all() or rebalance_prices[executable].le(0).any():
+            raise ValueError(f"Missing or invalid execution price on {rebalance_date}")
         if transaction_costs is not None:
-            from src.transaction_costs import estimate_order_costs
-            executable = target_weights.reindex(prices.columns).fillna(0.0)
-            # Risolviamo iterativamente il problema di punto fisso: i costi di transazione
-            # riducono il capitale disponibile per acquistare la nuova allocazione target.
-            available = float(current_portfolio_value)
-            for _ in range(30):
-                desired = (available * executable).div(rebalance_prices).fillna(0.0)
-                changes = desired - previous_quantities
-                execution_cost, detail = estimate_order_costs(
-                    changes, rebalance_prices, transaction_costs
-                )
-                next_available = float(current_portfolio_value) - execution_cost
-                if next_available <= 0:
-                    raise ValueError("Trading costs exhaust portfolio capital")
-                if abs(next_available - available) < 1e-8:
-                    available = next_available
-                    break
-                available = next_available
-            current_portfolio_value = available
+            pretrade_value = current_portfolio_value
+            current_portfolio_value, execution_cost, detail = fund_orders(
+                pretrade_value, target_weights, previous_quantities,
+                rebalance_prices, transaction_costs,
+            )
             cost_rows.append({"Rebalance Date": rebalance_date, **detail,
-                              "Total Cost": execution_cost})
+                              "Total Cost": execution_cost,
+                              "Executed Turnover": detail["Traded Notional"] / pretrade_value})
         allocated_capital = (
             current_portfolio_value
             * target_weights
@@ -460,6 +481,7 @@ def backtest_portfolio(
         # Evitiamo di duplicare la data iniziale
         # del periodo precedente.
         if portfolio_values:
+            portfolio_values[-1].iloc[-1] = period_values.iloc[0]
             period_values = (
                 period_values.iloc[1:]
             )
@@ -509,6 +531,7 @@ def backtest_portfolio(
     weights_history.index.name = (
         "Rebalance Date"
     )
+    backtest.attrs["initial_capital"] = float(initial_capital)
     if transaction_costs is not None:
         gross_series = pd.concat(gross_portfolio_values).reindex(backtest.index)
         backtest["Gross Portfolio Value"] = gross_series
@@ -541,7 +564,13 @@ def calculate_backtest_metrics(
     daily_returns = (
         backtest["Daily Return"]
         .dropna()
+        .copy()
     )
+    # Il rendimento della prima seduta deve includere i costi iniziali.
+    if "initial_capital" in backtest.attrs and len(daily_returns):
+        initial_capital = float(backtest.attrs["initial_capital"])
+        daily_returns.iloc[0] = float(backtest["Portfolio Value"].iloc[0]) / initial_capital - 1
+
     portfolio_value = (
         backtest["Portfolio Value"]
     )
@@ -552,9 +581,11 @@ def calculate_backtest_metrics(
     # -------------------------------------------------
     # TOTAL RETURN
     # -------------------------------------------------
-    initial_value = float(
-        portfolio_value.iloc[0]
-    )
+    # La prima osservazione può essere già al netto dei costi di esecuzione.
+    # Per i rendimenti del backtest la base è il capitale iniziale versato.
+    initial_value = float(backtest.attrs.get("initial_capital", portfolio_value.iloc[0]))
+    if not np.isfinite(initial_value) or initial_value <= 0:
+        raise ValueError("Initial capital must be finite and positive")
     final_value = float(
         portfolio_value.iloc[-1]
     )
@@ -602,30 +633,16 @@ def calculate_backtest_metrics(
     # -------------------------------------------------
     # SORTINO RATIO
     # -------------------------------------------------
-    downside_returns = daily_returns[
-        daily_returns < 0
-    ]
-    downside_deviation = (
-        downside_returns.std()
-        * np.sqrt(252)
-    )
-    if (
-        not np.isnan(
-            downside_deviation
-        )
-        and downside_deviation > 0
-    ):
-        sortino_ratio = (
-            annualized_return
-            - risk_free_rate
-        ) / downside_deviation
-    else:
-        sortino_ratio = 0.0
+    daily_target = risk_free_rate / 252
+    downside = np.minimum(daily_returns - daily_target, 0.0)
+    downside_deviation = float(np.sqrt(252 * np.mean(downside ** 2)))
+    sortino_ratio = ((annualized_return - risk_free_rate) / downside_deviation
+                     if downside_deviation > 0 else 0.0)
     # -------------------------------------------------
     # MAX DRAWDOWN
     # -------------------------------------------------
     running_max = (
-        portfolio_value.cummax()
+        portfolio_value.cummax().clip(lower=initial_value)
     )
     drawdown = (
         portfolio_value
