@@ -1,3 +1,4 @@
+import re
 from src.ml_ui import render_ml_forecasting, render_factor_ml_comparison
 from src.kangemi_ai import render_optimization_k
 from src.kangemi_factors_ai import render_factors_k
@@ -4064,6 +4065,14 @@ def display_backtest_results(
                     colored_metric(label, f"{value:.2%}", color)
 
             render_terminal_table(rebalance_table, rebalance_format, index_label="Rebalance Date")
+            export_name = "initial_optimal_allocation" if fixed_horizon else "rebalancing_history"
+            strategy_slug = re.sub(r"[^a-z0-9]+", "_", rebalance_strategy.lower()).strip("_")
+            st.download_button(
+                f"Download {history_title} (CSV)",
+                data=rebalance_table.to_csv(index_label="Rebalance Date").encode("utf-8-sig"),
+                file_name=f"{export_name}_{result_key}_{strategy_slug}.csv",
+                mime="text/csv", key=f"backtest_history_export_{result_key}", on_click="ignore",
+            )
 
     if cost_tab.open:
         with cost_tab:
@@ -7818,50 +7827,55 @@ with backtest_tab:
     if not drbt_sources:
         st.info("Run a standard backtest first to compare volatility overlays across strategies.")
     else:
-        drbt_source = st.selectbox("Backtest source", list(drbt_sources), key="drbt_source", help='Seleziona il backtest già eseguito da usare come riferimento: Standard Fixed, Standard Dynamic oppure Fixed Horizon, se disponibili. Il motore di ottimizzazione originale non cambia.')
-        drbt_base = drbt_sources[drbt_source]
-        drbt_available = {name: key for name, key in drbt_strategy_keys.items()
-                          if key in drbt_base and isinstance(drbt_base[key], (pd.DataFrame, pd.Series))
-                          and len(drbt_base[key]) > 0}
-        drbt_strategies = st.multiselect(
-            "Portfolio strategies", list(drbt_available),
-            default=list(drbt_available), key="drbt_strategies",
-            help='Seleziona uno, più o tutti gli otto portafogli. Ogni modello di volatilità viene confrontato con lo Standard della stessa strategia.'
-        )
-        drbt_a, drbt_b, drbt_c, drbt_d = st.columns(4)
-        with drbt_a:
-            drbt_target = st.number_input("Target volatility (%)", 5., 50., 15., 1., key="drbt_target", help='Obiettivo di volatilità annualizzata del portafoglio. L’esposizione obiettivo è il minimo tra 100% e target diviso volatilità prevista. Non garantisce che la volatilità realizzata rispetti il target.')
-        with drbt_b:
-            drbt_horizon = st.selectbox("Forecast horizon (sessions)", [5, 21, 63], index=1, key="drbt_horizon", help='Numero di sedute a cui si riferisce la previsione di volatilità: 5 circa una settimana, 21 circa un mese, 63 circa un trimestre. Non è la frequenza dei ribilanciamenti.')
-        with drbt_c:
-            drbt_update = st.selectbox("Forecast refresh (sessions)", [1, 5, 21], index=1, key="drbt_update", help='Ogni quante sedute si aggiorna la previsione: 1 ogni seduta, 5 circa ogni settimana, 21 circa ogni mese. Le decisioni hanno effetto dalla seduta successiva.')
-        with drbt_d:
-            drbt_train = st.number_input("Pre-test volatility estimation (sessions)", 252, 1000, 252, 21, key="drbt_train", help='Sedute precedenti al test usate per inizializzare la volatilità: 252 sono circa un anno di Borsa. Nessuna seduta fuori campione viene esclusa. La storia è una proxy calcolata con i pesi iniziali.')
-        drbt_e, drbt_f, drbt_g = st.columns(3)
-        with drbt_e:
-            drbt_band = st.number_input("Execute exposure change from (pp)", 5., 50., 10., 1., key="drbt_band", help='Soglia minima in punti percentuali per ridurre l’esposizione. Esempio: partendo dal 100%, con soglia 15 pp si interviene se l’esposizione obiettivo è al massimo 85%.')
-        with drbt_f:
-            drbt_review = st.number_input("Review from (pp)", 0., 20., 5., 1., key="drbt_review", help='Soglia di attenzione in punti percentuali. Se lo scostamento supera questa soglia il sistema segnala REVIEW, senza necessariamente eseguire un’operazione. Deve essere inferiore alla soglia di esecuzione.')
-        with drbt_g:
-            drbt_cash = st.number_input("Cash annual yield (%)", 0., 15., 0., 0.5, key="drbt_cash", help='Rendimento annualizzato attribuito alla quota in liquidità. Con 0% il capitale non investito non genera interessi nella simulazione.')
-        drbt_reentry = st.number_input(
-            "Restore exposure from (pp)", 1.0, float(drbt_band),
-            min(5.0, float(drbt_band)), 1.0, key="drbt_reentry",
-            help='Soglia minima in punti percentuali per aumentare l’esposizione quando la volatilità prevista scende. Una soglia inferiore a quella di vendita permette un rientro più rapido.'
-        )
-        drbt_models = st.multiselect(
-            "Forecast models", ["EWMA", "GARCH(1,1)", "GJR-GARCH", "EGARCH"],
-            default=["EWMA", "GARCH(1,1)"], key="drbt_models"
-        , help='Modelli di previsione: EWMA pesa maggiormente i rendimenti recenti; GARCH(1,1) stima volatilità persistente; GJR-GARCH ed EGARCH considerano anche reazioni asimmetriche agli shock.')
-        drbt_cost_choice = st.selectbox(
-            "Incremental exposure trading costs", ["Optimistic", "Base", "Conservative"],
-            index=1, key="drbt_cost_choice"
-        , help='Scenario di commissioni, spread e slippage per le operazioni aggiuntive di gestione del rischio. I costi già inclusi nello Standard non vengono duplicati.')
-        st.caption("Volatility is initialized from pre-test asset returns with each strategy's first weights. "
-                   "All OOS dates are retained. This is a fixed-weight pre-test volatility proxy, not a reconstructed "
-                   "historical strategy. Forecasts use lagged portfolio returns; exposure decisions take effect next session. "
-                   "Only incremental overlay costs are charged. No taxes or full constituent-level execution.")
-        if st.button("Run Dynamic Risk Backtest", type="primary", key="drbt_run"):
+        with st.container(key="kangemi_controls_dynamic_risk"):
+            drbt_source = st.selectbox("Backtest source", list(drbt_sources), key="drbt_source", help='Seleziona il backtest già eseguito da usare come riferimento: Standard Fixed, Standard Dynamic oppure Fixed Horizon, se disponibili. Il motore di ottimizzazione originale non cambia.')
+            drbt_base = drbt_sources[drbt_source]
+            drbt_available = {name: key for name, key in drbt_strategy_keys.items()
+                              if key in drbt_base and isinstance(drbt_base[key], (pd.DataFrame, pd.Series))
+                              and len(drbt_base[key]) > 0}
+            drbt_strategies = st.multiselect(
+                "Portfolio strategies", list(drbt_available),
+                default=list(drbt_available), key="drbt_strategies",
+                help='Seleziona uno, più o tutti gli otto portafogli. Ogni modello di volatilità viene confrontato con lo Standard della stessa strategia.'
+            )
+            drbt_a, drbt_b, drbt_c, drbt_d = st.columns(4)
+            with drbt_a:
+                drbt_target = st.number_input("Target volatility (%)", 5., 50., 15., 1., key="drbt_target", help='Obiettivo di volatilità annualizzata del portafoglio. L’esposizione obiettivo è il minimo tra 100% e target diviso volatilità prevista. Non garantisce che la volatilità realizzata rispetti il target.')
+            with drbt_b:
+                drbt_horizon = st.selectbox("Forecast horizon (sessions)", [5, 21, 63], index=1, key="drbt_horizon", help='Numero di sedute a cui si riferisce la previsione di volatilità: 5 circa una settimana, 21 circa un mese, 63 circa un trimestre. Non è la frequenza dei ribilanciamenti.')
+            with drbt_c:
+                drbt_update = st.selectbox("Forecast refresh (sessions)", [1, 5, 21], index=1, key="drbt_update", help='Ogni quante sedute si aggiorna la previsione: 1 ogni seduta, 5 circa ogni settimana, 21 circa ogni mese. Le decisioni hanno effetto dalla seduta successiva.')
+            with drbt_d:
+                drbt_train = st.number_input("Pre-test volatility estimation (sessions)", 252, 1000, 252, 21, key="drbt_train", help='Sedute precedenti al test usate per inizializzare la volatilità: 252 sono circa un anno di Borsa. Nessuna seduta fuori campione viene esclusa. La storia è una proxy calcolata con i pesi iniziali.')
+            drbt_e, drbt_f, drbt_g = st.columns(3)
+            with drbt_e:
+                drbt_band = st.number_input("Execute exposure change from (pp)", 5., 50., 10., 1., key="drbt_band", help='Soglia minima in punti percentuali per ridurre l’esposizione. Esempio: partendo dal 100%, con soglia 15 pp si interviene se l’esposizione obiettivo è al massimo 85%.')
+            with drbt_f:
+                drbt_review = st.number_input("Review from (pp)", 0., 20., 5., 1., key="drbt_review", help='Soglia di attenzione in punti percentuali. Se lo scostamento supera questa soglia il sistema segnala REVIEW, senza necessariamente eseguire un’operazione. Deve essere inferiore alla soglia di esecuzione.')
+            with drbt_g:
+                drbt_cash = st.number_input("Cash annual yield (%)", 0., 15., 0., 0.5, key="drbt_cash", help='Rendimento annualizzato attribuito alla quota in liquidità. Con 0% il capitale non investito non genera interessi nella simulazione.')
+            drbt_reentry = st.number_input(
+                "Restore exposure from (pp)", 1.0, float(drbt_band),
+                min(5.0, float(drbt_band)), 1.0, key="drbt_reentry",
+                help='Soglia minima in punti percentuali per aumentare l’esposizione quando la volatilità prevista scende. Una soglia inferiore a quella di vendita permette un rientro più rapido.'
+            )
+            drbt_models = st.multiselect(
+                "Forecast models", ["EWMA", "GARCH(1,1)", "GJR-GARCH", "EGARCH"],
+                default=["EWMA", "GARCH(1,1)"], key="drbt_models"
+            , help='Modelli di previsione: EWMA pesa maggiormente i rendimenti recenti; GARCH(1,1) stima volatilità persistente; GJR-GARCH ed EGARCH considerano anche reazioni asimmetriche agli shock.')
+            drbt_cost_choice = st.selectbox(
+                "Incremental exposure trading costs", ["Optimistic", "Base", "Conservative"],
+                index=1, key="drbt_cost_choice"
+            , help='Scenario di commissioni, spread e slippage per le operazioni aggiuntive di gestione del rischio. I costi già inclusi nello Standard non vengono duplicati.')
+            st.caption("Volatility is initialized from pre-test asset returns with each strategy's first weights. "
+                       "All OOS dates are retained. This is a fixed-weight pre-test volatility proxy, not a reconstructed "
+                       "historical strategy. Forecasts use lagged portfolio returns; exposure decisions take effect next session. "
+                       "Only incremental overlay costs are charged. No taxes or full constituent-level execution.")
+            _, drbt_action, _ = st.columns([1, 2, 1])
+            run_dynamic_risk = drbt_action.button(
+                "Run Dynamic Risk Backtest", type="primary", key="drbt_run", width="stretch",
+            )
+        if run_dynamic_risk:
             if not drbt_strategies or not drbt_models:
                 st.warning("Select at least one portfolio strategy and one forecast model.")
             elif drbt_review >= drbt_band:
