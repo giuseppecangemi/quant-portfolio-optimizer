@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 source = (ROOT / "app_core.py").read_text()
 tree=ast.parse(source)
-names={'render_fama_french_model','render_fama_french_result','factor_estimation_caption'}
+names={'render_fama_french_model','render_fama_french_result','factor_estimation_caption','download_portfolio_weights'}
 defs='\n\n'.join(ast.get_source_segment(source,n) for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in names)
 app=AppTest.from_string('''
 import streamlit as st
@@ -60,3 +60,5 @@ assert any('FF3 Factor Cov' in m.value for m in app.markdown)
 app.button[1].click().run()
 assert not app.exception and 'ff5_results' in app.session_state
 print('PASS: explicit Run, covariance branch, both results stay visible and no fetch on selector changes')
+
+assert len(app.get("download_button")) == 3

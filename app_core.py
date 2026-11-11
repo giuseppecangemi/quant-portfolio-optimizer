@@ -1392,6 +1392,17 @@ def style_portfolio_table(
     return styled_df
 
 
+def download_portfolio_weights(weights, portfolio_key):
+    export = weights.rename("Target Weight").rename_axis("Ticker").to_frame()
+    export.insert(0, "Instrument", [get_company_name(ticker) for ticker in export.index])
+    st.download_button(
+        "Download Portfolio Weights (CSV)",
+        data=export.to_csv().encode("utf-8-sig"),
+        file_name=f"portfolio_weights_{portfolio_key}.csv",
+        mime="text/csv", key=f"portfolio_weights_export_{portfolio_key}", on_click="ignore",
+    )
+
+
 def display_portfolio_table(
     df,
     use_fractional_shares,
@@ -5692,6 +5703,7 @@ with optimization_tab:
                     r["min_table"],
                     r["use_fractional_shares"],
                 )
+                download_portfolio_weights(r["min_weights"], "min")
 
                 summary_col1, summary_col2 = (
                     st.columns(2)
@@ -5761,6 +5773,7 @@ with optimization_tab:
                     r["max_table"],
                     r["use_fractional_shares"],
                 )
+                download_portfolio_weights(r["max_weights"], "max")
 
                 summary_col1, summary_col2 = (
                     st.columns(2)
@@ -5839,6 +5852,7 @@ with optimization_tab:
                     r["risk_parity_table"],
                     r["use_fractional_shares"],
                 )
+                download_portfolio_weights(r["risk_parity_weights"], "risk_parity")
 
                 risk_summary_col1, risk_summary_col2 = (
                     st.columns(2)
@@ -5949,6 +5963,7 @@ with optimization_tab:
                     r["hrp_table"],
                     r["use_fractional_shares"],
                 )
+                download_portfolio_weights(r["hrp_weights"], "hrp")
 
                 hrp_summary_col1, hrp_summary_col2 = st.columns(2)
 
@@ -6170,6 +6185,8 @@ def render_fama_french_result(model, result, capital, use_factor_cov):
     render_diversification_var_kpis(result["weights"], result["covariance"], capital)
     portfolio_allocation_title()
     display_portfolio_table(result["table"], result["use_fractional_shares"])
+    covariance_key = "factor_cov" if use_factor_cov else "historical_cov"
+    download_portfolio_weights(result["weights"], f"{model.lower()}_{covariance_key}")
     for column, (label, value, color) in zip(st.columns(2), (
         ("Total Invested", result["total_invested"], "purple"),
         ("Residual Cash", capital - result["total_invested"], "yellow"),
@@ -6357,6 +6374,7 @@ with factor_models_tab:
                 render_diversification_var_kpis(cr["weights"], cr["covariance"], capital)
                 portfolio_allocation_title()
                 display_portfolio_table(cr["table"], cr["use_fractional_shares"])
+                download_portfolio_weights(cr["weights"], "capm")
 
                 s1, s2 = st.columns(2)
                 with s1:
