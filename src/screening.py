@@ -123,6 +123,7 @@ def _download_price_batch(
             data = yf.download(
                 tickers=tickers,
                 period=period,
+                interval="1d",
                 auto_adjust=True,
                 progress=False,
                 threads=False,
@@ -138,12 +139,27 @@ def _download_price_batch(
             last_error = "Empty batch response"
 
         except Exception as exc:
-            last_error = f"{type(exc).__name__}: {exc}"
+            last_error = type(exc).__name__
 
         if attempt < PRICE_BATCH_RETRIES:
             time.sleep(PRICE_RETRY_SLEEP_SECONDS * (attempt + 1))
 
     return pd.DataFrame(), last_error or "Batch download failed"
+
+
+def _clean_downloaded_prices(series):
+    """Reject unusable prices before counting screening observations."""
+    index = pd.to_datetime(series.index, errors="coerce")
+    cleaned = pd.Series(pd.to_numeric(series, errors="coerce").to_numpy(), index=index)
+    cleaned = cleaned.loc[~cleaned.index.isna()]
+    cleaned = cleaned.loc[np.isfinite(cleaned) & cleaned.gt(0)]
+    return cleaned.loc[~cleaned.index.duplicated(keep="last")].sort_index()
+
+
+def _history_status(raw, cleaned):
+    dates = f", {cleaned.index[0].date()} to {cleaned.index[-1].date()}" if len(cleaned) else ""
+    return (f"{len(cleaned)} valid / {len(raw)} raw rows{dates}; "
+            f"requires {MIN_PRICE_OBSERVATIONS} valid prices")
 
 
 def download_universe_prices(
@@ -183,11 +199,12 @@ def download_universe_prices(
                 status[ticker] = "Missing from batch response"
                 continue
 
-            series = close_frame[ticker].dropna()
+            raw = close_frame[ticker]
+            series = _clean_downloaded_prices(raw)
 
             if len(series) < MIN_PRICE_OBSERVATIONS:
                 status[ticker] = (
-                    f"Insufficient price history ({len(series)} observations)"
+                    f"Insufficient price history ({_history_status(raw, series)})"
                 )
                 continue
 
@@ -202,46 +219,27 @@ def download_universe_prices(
     ]
 
     for ticker in missing:
+        bulk = status[ticker]
+        request = f"ticker={ticker}, period={period}, interval=1d, adjusted"
         try:
-            data = yf.download(
-                tickers=ticker,
-                period=period,
-                auto_adjust=True,
-                progress=False,
-                threads=False,
+            data = yf.Ticker(ticker).history(
+                period=period, interval="1d", auto_adjust=True, timeout=20, raise_errors=True,
             )
-
             close_frame = _extract_close_frame(data, [ticker])
-
-            if close_frame.empty or ticker not in close_frame.columns:
-                # Non dichiariamo "invalid ticker": non possiamo dedurlo
-                # da una risposta vuota di Yahoo.
-                if status[ticker].startswith("Batch download failed"):
-                    status[ticker] += " | Individual retry returned no data"
-                else:
-                    status[ticker] = "No price data after individual retry"
-                continue
-
-            series = close_frame[ticker].dropna()
-
-            if len(series) < MIN_PRICE_OBSERVATIONS:
-                status[ticker] = (
-                    f"Insufficient price history ({len(series)} observations)"
-                )
-                continue
-
-            prices[ticker] = series.astype(float)
-            status[ticker] = "OK"
-
+            if data.empty:
+                retry = "Empty provider response"
+            elif ticker not in close_frame.columns:
+                retry = "Missing adjusted Close field"
+            else:
+                raw = close_frame[ticker]
+                series = _clean_downloaded_prices(raw)
+                retry = _history_status(raw, series)
+                if len(series) >= MIN_PRICE_OBSERVATIONS:
+                    prices[ticker] = series.astype(float)
+                    retry = "Recovered: " + retry
         except Exception as exc:
-            previous = status.get(ticker, "")
-            detail = f"Individual retry failed: {type(exc).__name__}"
-
-            status[ticker] = (
-                f"{previous} | {detail}"
-                if previous
-                else detail
-            )
+            retry = f"Provider request failed ({type(exc).__name__})"
+        status[ticker] = f"{request} | Batch: {bulk} | Individual: {retry}"
 
     return prices, status
 

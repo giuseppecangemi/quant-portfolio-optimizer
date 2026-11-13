@@ -1,3 +1,4 @@
+from src.trading_signals_ui import render as render_trading_signals
 import re
 from src.ml_ui import render_ml_forecasting, render_factor_ml_comparison
 from src.kangemi_ai import render_optimization_k
@@ -66,7 +67,7 @@ from src.backtest import (
     backtest_portfolio,
     calculate_backtest_metrics,
 )
-from src.robustness import run_rolling_robustness
+from src.robustness import STRATEGIES as ROBUSTNESS_STRATEGIES, run_rolling_robustness
 from src.transaction_costs import PRESETS, CostAssumptions
 from src.volatility_forecasting import (analyze_volatility, backtest_volatility, load_volatility_prices, ARCH_AVAILABLE, portfolio_log_returns, filtered_garch_volatility, forecast_volatility_path, compare_volatility_models, portfolio_risk_contributions)
 
@@ -172,6 +173,9 @@ def _json_safe(value):
     if isinstance(value, pd.Series):
         return {
             "__type__": "series",
+            "attrs": _json_safe({key: value.attrs[key] for key in
+                                 ("initial_capital", "transaction_log", "estimation_end")
+                                 if key in value.attrs}),
             "name": _json_safe(value.name),
             "index": [_json_safe(x) for x in value.index.tolist()],
             "data": [_json_safe(x) for x in value.tolist()],
@@ -180,6 +184,9 @@ def _json_safe(value):
     if isinstance(value, pd.DataFrame):
         return {
             "__type__": "dataframe",
+            "attrs": _json_safe({key: value.attrs[key] for key in
+                                 ("initial_capital", "transaction_log", "estimation_end")
+                                 if key in value.attrs}),
             "index": [_json_safe(x) for x in value.index.tolist()],
             "columns": [_json_safe(x) for x in value.columns.tolist()],
             "data": [
@@ -284,6 +291,8 @@ def build_experiment_snapshot(
 
     selected_assets = []
     for ticker in tickers:
+        match = current_instruments[current_instruments["ticker"] == ticker]
+    if match.empty:
         match = instruments[instruments["ticker"] == ticker]
         selected_assets.append(
             {
@@ -446,11 +455,14 @@ def _json_restore(value):
     if value_type == "series":
         index = [_json_restore(x) for x in value.get("index", [])]
         data = [_json_restore(x) for x in value.get("data", [])]
-        return pd.Series(
+        restored = pd.Series(
             data,
             index=index,
             name=_json_restore(value.get("name")),
         )
+
+        restored.attrs.update(_json_restore(value.get("attrs", {})))
+        return restored
 
     if value_type == "dataframe":
         index = [_json_restore(x) for x in value.get("index", [])]
@@ -459,7 +471,9 @@ def _json_restore(value):
             [_json_restore(cell) for cell in row]
             for row in value.get("data", [])
         ]
-        return pd.DataFrame(data, index=index, columns=columns)
+        restored = pd.DataFrame(data, index=index, columns=columns)
+        restored.attrs.update(_json_restore(value.get("attrs", {})))
+        return restored
 
     return {
         key: _json_restore(item)
@@ -1392,7 +1406,52 @@ def style_portfolio_table(
     return styled_df
 
 
-def download_portfolio_weights(weights, portfolio_key):
+def capture_portfolio_configuration(tickers, market):
+    screening = st.session_state.get("screening_results") or {}
+    quant = selection_mode == "Quant Selection"
+    return {
+        "selection_mode": selection_mode,
+        "market": market,
+        "universe": list(current_market_instruments["ticker"]) if quant else list(tickers),
+        "screening_period": screening.get("period") if quant else None,
+        "top_n": screening.get("top_n") if quant else None,
+        "active_factors": screening.get("active_factors", []) if quant else [],
+        "screening_market_matches": not quant or screening.get("market") == market,
+    }
+
+
+def download_portfolio_weights(weights, portfolio_key, result=None, prefix=""):
+    if result is not None:
+        from src.trading_signals_ui import stage as stage_trading_portfolio
+        expected = result.get("expected_returns_eur", result.get("expected_returns"))
+        cov = result["covariance"]
+        metadata = {
+            "configuration": {
+                **result["selection_configuration"],
+                "period": result["period"], "currency": "EUR",
+                "optimizer": {"min":"Minimum Volatility", "max":"Maximum Sharpe",
+                              "risk_parity":"Risk Parity", "hrp":"HRP"}.get(portfolio_key, "Maximum Sharpe"),
+                "return_model": portfolio_key.split("_")[0].upper() if not prefix else "Historical",
+                "covariance_method": "Factor" if portfolio_key.endswith("factor_cov") else "Historical",
+                "risk_free_rate": result.get("risk_free_rate"),
+                "max_weight": result.get("max_weight"),
+            } if "selection_configuration" in result else None,
+            "period": result["period"], "currency": "EUR",
+            "optimized_at": result.get("optimized_at"),
+            "risk_free_rate": result.get("risk_free_rate"),
+            "max_weight": result.get("max_weight"),
+            "expected_returns": expected.to_json() if expected is not None else None,
+            "covariance": cov.to_json(orient="split") if hasattr(cov, "to_json") else cov.tolist(),
+            "covariance_method": "Factor" if portfolio_key.endswith("factor_cov") else "Historical",
+            "return_model": portfolio_key.split("_")[0].upper() if not prefix else "Historical",
+            "expected_return": float(result[prefix + "return"]),
+            "volatility": float(result[prefix + "volatility"]),
+            "sharpe": float(result[prefix + "sharpe"]),
+            "factor_statistics": result["stats"].to_json(orient="split") if "stats" in result else None,
+        }
+        stage_trading_portfolio(weights, portfolio_key,
+                                {t: get_company_name(t) for t in weights.index}, metadata)
+
     export = weights.rename("Target Weight").rename_axis("Ticker").to_frame()
     export.insert(0, "Instrument", [get_company_name(ticker) for ticker in export.index])
     st.download_button(
@@ -4542,6 +4601,17 @@ market_instruments = (
     .sort_values("name")
     .copy()
 )
+# Yahoo identifiers verified for current screening. Keep the historical
+# candidate catalog separate from current symbol aliases.
+current_instruments = instruments.copy()
+italian = current_instruments["market"].eq("Borsa Italiana")
+current_instruments.loc[italian, "ticker"] = current_instruments.loc[italian, "ticker"].replace({
+    "AQF.MI": "ECNL.MI", "GEF.MI": "GE.MI", "MUT.MI": "MOL.MI",
+    "SECO.MI": "IOT.MI", "SO.MI": "SGF.MI", "TFI.MI": "TFIN.MI", "TIS.MI": "TSL.MI",
+})
+current_market_instruments = current_instruments.loc[
+    current_instruments["market"].eq(market)
+].drop_duplicates(subset="ticker").sort_values("name")
 benchmark_by_market = {
     "Borsa Italiana": ("FTSE MIB (Italy)", "FTSEMIB.MI"),
     "USA": ("S&P 500 (USA)", "^GSPC"),
@@ -4598,11 +4668,11 @@ else:
     quant_tickers = [
         ticker
         for ticker in st.session_state.quant_selected_tickers
-        if ticker in set(market_instruments["ticker"])
+        if ticker in set(current_market_instruments["ticker"])
     ]
 
-    selected_instruments = market_instruments[
-        market_instruments["ticker"].isin(quant_tickers)
+    selected_instruments = current_market_instruments[
+        current_market_instruments["ticker"].isin(quant_tickers)
     ]
 
     tickers = selected_instruments["ticker"].tolist()
@@ -4827,18 +4897,19 @@ with st.sidebar.expander(
 # =========================================================
 
 with st.container(key="kangemi_main_navigation"):
-    asset_selection_tab, optimization_tab, factor_models_tab, backtest_tab, monte_carlo_tab, robustness_tab, volatility_tab, ml_tab, saved_experiments_tab = st.tabs(
+    asset_selection_tab, optimization_tab, factor_models_tab, backtest_tab, robustness_tab, trading_signals_tab, monte_carlo_tab, volatility_tab, ml_tab, saved_experiments_tab = st.tabs(
         [
             "Asset Selection",
             "Portfolio Optimization",
             "Factor Models",
             "Backtesting",
-            "Monte Carlo Simulation",
             "Robustness Analysis",
+            "Trading Signals",
+            "Monte Carlo Simulation",
             "Volatility Analytics",
             "ML Return Forecasting",
             "Saved Experiments",
-        ]
+        ], key="main_navigation", on_change="rerun"
     )
 
 
@@ -4852,7 +4923,7 @@ def cached_screening_correlation_prices(
     period: str,
 ) -> pd.DataFrame:
     """Load price histories for selected assets, retaining missing observations."""
-    subset = instruments[instruments["ticker"].isin(selected_tickers)].copy()
+    subset = current_instruments[current_instruments["ticker"].isin(selected_tickers)].copy()
     prices = build_price_matrix(subset, period=period)
     if prices.empty:
         raise ValueError("No historical prices were returned.")
@@ -4946,7 +5017,7 @@ with asset_selection_tab:
         ):
             try:
                 screening_results, quant_selected = screen_universe(
-                    market_instruments,
+                    current_market_instruments,
                     period=screening_period,
                     top_n=int(screening_top_n),
                     min_components=len(quant_factors),
@@ -5499,6 +5570,9 @@ with optimization_tab:
                     )
 
                     st.session_state.optimization_results = {
+                        "selection_configuration": capture_portfolio_configuration(tickers, market),
+                        "optimized_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                        "max_weight": max_weight,
                         "period":
                             optimization_period,
 
@@ -5703,7 +5777,7 @@ with optimization_tab:
                     r["min_table"],
                     r["use_fractional_shares"],
                 )
-                download_portfolio_weights(r["min_weights"], "min")
+                download_portfolio_weights(r["min_weights"], "min", r, "min_")
 
                 summary_col1, summary_col2 = (
                     st.columns(2)
@@ -5773,7 +5847,7 @@ with optimization_tab:
                     r["max_table"],
                     r["use_fractional_shares"],
                 )
-                download_portfolio_weights(r["max_weights"], "max")
+                download_portfolio_weights(r["max_weights"], "max", r, "max_")
 
                 summary_col1, summary_col2 = (
                     st.columns(2)
@@ -5852,7 +5926,7 @@ with optimization_tab:
                     r["risk_parity_table"],
                     r["use_fractional_shares"],
                 )
-                download_portfolio_weights(r["risk_parity_weights"], "risk_parity")
+                download_portfolio_weights(r["risk_parity_weights"], "risk_parity", r, "risk_parity_")
 
                 risk_summary_col1, risk_summary_col2 = (
                     st.columns(2)
@@ -5963,7 +6037,7 @@ with optimization_tab:
                     r["hrp_table"],
                     r["use_fractional_shares"],
                 )
-                download_portfolio_weights(r["hrp_weights"], "hrp")
+                download_portfolio_weights(r["hrp_weights"], "hrp", r, "hrp_")
 
                 hrp_summary_col1, hrp_summary_col2 = st.columns(2)
 
@@ -6152,6 +6226,9 @@ def render_fama_french_model(model, tickers, market, capital, max_weight,
                 table = prepare_portfolio_table(weights, prices, capital, use_fractional_shares)
                 st.session_state[result_key] = {
                     "period": period, "stats": stats, "expected_returns_eur": expected,
+                    "selection_configuration": capture_portfolio_configuration(tickers, market),
+                    "optimized_at": pd.Timestamp.now(tz="UTC").isoformat(), "max_weight": max_weight,
+                    "risk_free_rate": risk_free_rate,
                     "covariance": covariance, "weights": weights, "table": table,
                     "return": annual_return, "volatility": volatility,
                     "sharpe": (annual_return - risk_free_rate) / volatility if volatility > 0 else 0.0,
@@ -6186,7 +6263,7 @@ def render_fama_french_result(model, result, capital, use_factor_cov):
     portfolio_allocation_title()
     display_portfolio_table(result["table"], result["use_fractional_shares"])
     covariance_key = "factor_cov" if use_factor_cov else "historical_cov"
-    download_portfolio_weights(result["weights"], f"{model.lower()}_{covariance_key}")
+    download_portfolio_weights(result["weights"], f"{model.lower()}_{covariance_key}", result)
     for column, (label, value, color) in zip(st.columns(2), (
         ("Total Invested", result["total_invested"], "purple"),
         ("Residual Cash", capital - result["total_invested"], "yellow"),
@@ -6319,7 +6396,10 @@ with factor_models_tab:
                         capm_total_invested = capm_table["Invested"].sum()
 
                         st.session_state.factor_model_results = {
-                            "period": capm_period,
+                            "selection_configuration": capture_portfolio_configuration(tickers, market),
+                        "optimized_at": pd.Timestamp.now(tz="UTC").isoformat(),
+                            "max_weight": max_weight,
+                            "period": capm_period, "risk_free_rate": risk_free_rate,
                             "stats": capm_stats,
                             "expected_returns": capm_mu,
                             "covariance": capm_covariance,
@@ -6374,7 +6454,7 @@ with factor_models_tab:
                 render_diversification_var_kpis(cr["weights"], cr["covariance"], capital)
                 portfolio_allocation_title()
                 display_portfolio_table(cr["table"], cr["use_fractional_shares"])
-                download_portfolio_weights(cr["weights"], "capm")
+                download_portfolio_weights(cr["weights"], "capm", cr)
 
                 s1, s2 = st.columns(2)
                 with s1:
@@ -6754,56 +6834,44 @@ with factor_models_tab:
 with robustness_tab:
     st.header("Robustness Analysis")
     st.caption(
-        "Historical rolling out-of-sample validation. Each window independently "
-        "re-estimates CAPM, FF3 and FF5 using the existing backtesting engine."
+        "Rolling out-of-sample windows use the Walk-Forward engine and the selected market. "
+        "The market universe is based on today's instrument list. Overlapping windows share observations."
     )
-    st.info(
-        "Historical Quant Selection uses the active factors; default is Momentum + Risk. "
-        "Today's instrument list may still introduce survivorship bias. "
-        "Overlapping windows are not independent observations."
-    )
-    rb1, rb2, rb3 = st.columns(3)
-    with rb1:
-        rb_start = st.number_input("First OOS year", min_value=2010, max_value=2026, value=2010, step=1, key="rb_start")
-        rb_end = st.number_input("Last complete OOS year", min_value=2010, max_value=2025, value=2025, step=1, key="rb_end")
-    with rb2:
-        rb_est = st.selectbox("Estimation Window", [1, 2, 3, 5, 7, 10], index=3, format_func=lambda x: f"{x} years", key="rb_est")
-        rb_horizon = st.selectbox("Investment Horizon", [3, 6, 12, 24, 36, 60, 120], index=2, format_func=lambda x: f"{x} months", key="rb_horizon")
-    with rb3:
-        rb_step = st.selectbox("Rolling Step", [1, 3, 6, 12], index=3, format_func=lambda x: f"{x} months", key="rb_step")
-        rb_policy = st.selectbox("Selection Policy", ["Fixed", "Dynamic"], key="rb_policy")
+    with st.container(key="kangemi_controls_robustness"):
+        rb1, rb2, rb3 = st.columns(3)
+        with rb1:
+            rb_start = st.number_input("First OOS year", min_value=2010, max_value=2026, value=2010, step=1, key="rb_start")
+            rb_end = st.number_input("Last complete OOS year", min_value=2010, max_value=2025, value=2025, step=1, key="rb_end")
+        with rb2:
+            rb_est = st.selectbox("Estimation Window", [1, 2, 3, 5, 7, 10], index=3, format_func=lambda x: f"{x} years", key="rb_est")
+            rb_horizon = st.selectbox("Investment Horizon", [3, 6, 12, 24, 36, 60, 120], index=2, format_func=lambda x: f"{x} months", key="rb_horizon")
+        with rb3:
+            rb_step = st.selectbox("Rolling Step", [1, 3, 6, 12], index=3, format_func=lambda x: f"{x} months", key="rb_step")
+            rb_policy = st.selectbox("Selection Policy", ["Fixed", "Dynamic"], key="rb_policy")
 
-    rb_top = st.number_input("Historical Top N", min_value=2, max_value=100, value=20, step=1, key="rb_top")
-    rb_rebalance = st.selectbox("Rebalance Frequency", [21, 63, 126, 252], index=1,
-                                format_func=lambda x: {21: "Monthly", 63: "Quarterly", 126: "Semiannual", 252: "Annual"}[x], key="rb_rebalance")
-    st.caption("The historical universe comes from the selected market, not the current Top N selection.")
-    with st.expander("Transaction costs — empirical-informed scenarios", expanded=True):
-        rb_cost_preset = st.selectbox("Cost scenario", list(PRESETS), index=1, key="rb_cost_preset")
-        rb_assumption = PRESETS[rb_cost_preset]
+        rb_top = st.number_input("Historical Top N", min_value=2, max_value=100, value=20, step=1, key="rb_top")
+        rb_rebalance = st.selectbox("Rebalance Frequency", [21, 63, 126, 252], index=1,
+                                    format_func=lambda x: {21: "Monthly", 63: "Quarterly", 126: "Semiannual", 252: "Annual"}[x], key="rb_rebalance")
+        rb_models_selected = st.multiselect(
+            "Portfolio models", list(ROBUSTNESS_STRATEGIES),
+            default=["CAPM", "FF3", "FF5", "FF3 Factor Cov", "FF5 Factor Cov", "Equal Weight"],
+            key="rb_models",
+        )
+        rb_cost_preset = st.selectbox("Cost scenario", ["None", *PRESETS],
+                                     index=["None", *PRESETS].index("Base"), key="rb_cost_preset")
+        rb_assumption = PRESETS.get(rb_cost_preset)
         st.caption(
-            f"Per order: max(€{rb_assumption.min_commission:.2f}, "
-            f"{rb_assumption.commission_rate:.2%} × notional); "
-            f"half-spread {rb_assumption.half_spread_bps:.0f} bps + "
-            f"slippage {rb_assumption.slippage_bps:.0f} bps on traded notional. "
-            "Costs include initial purchase and actual rebalance trades. "
-            "No blanket transaction tax: issuer/date-specific tax treatment requires separate data."
+            "Historical screening uses Momentum and Risk. FF3 and FF5 use the same "
+            "two-calendar-month publication buffer as the main backtests. EUR factor windows require €STR coverage."
         )
-        st.caption(
-            "Broker commission reference: Interactive Brokers Europe fixed/tiered schedules. "
-            "Spread/slippage values are sensitivity assumptions informed by market microstructure "
-            "research (Frazzini, Israel & Moskowitz, Trading Costs, 2018), "
-            "NOT instrument-specific measured quotes. "
-            "Same-close execution, fractional shares and no financing/FX costs remain limitations."
-        )
-        st.markdown(
-            "Sources: [IBKR EU commissions](https://www.interactivebrokers.ie/en/pricing/commissions-stocks.php) · "
-            "[Frazzini et al. (2018)](https://papers.ssrn.com/sol3/papers.cfm?abstract_id=3229719)"
-        )
+        _, rb_action, _ = st.columns([1, 2, 1])
+        run_robustness = rb_action.button("Run Rolling Robustness", type="primary", key="rb_run", width="stretch")
 
-
-    if st.button("Run Rolling Robustness", type="primary", key="rb_run"):
+    if run_robustness:
         if rb_start > rb_end:
             st.error("First OOS year must not exceed the last OOS year.")
+        elif not rb_models_selected:
+            st.error("Select at least one portfolio model.")
         else:
             try:
                 rb_tickers = market_instruments["ticker"].dropna().astype(str).tolist()
@@ -6817,8 +6885,8 @@ with robustness_tab:
                         step_months=int(rb_step), top_n=int(rb_top),
                         selection_policy=rb_policy.lower(),
                         rebalance_days=int(rb_rebalance),
-                        capital=10000.0, risk_free_rate=0.02,
-                        max_weight=max(0.20, 1.0 / int(rb_top)),
+                        capital=capital, risk_free_rate=risk_free_rate,
+                        max_weight=max_weight, market=market, models=rb_models_selected,
                         progress=lambda value: rb_progress.progress(value),
                         transaction_costs=rb_assumption,
                     )
@@ -6832,223 +6900,261 @@ with robustness_tab:
         st.caption(
             f"Downloaded history: {rb_info['first_price']} to {rb_info['last_price']} · "
             f"Universe: {rb_info['asset_columns']} tickers with some data · "
-            f"Candidate windows: {rb_info['candidate_windows']}"
+            f"Candidate windows: {rb_info['candidate_windows']} · "
+            f"Benchmark: {rb_info.get('benchmark', 'FTSE MIB')}"
         )
-        if not rb_results.empty and "Net Total Return" in rb_results.columns:
-            st.subheader("Transaction costs — gross vs net")
-            st.caption(
-                "Cost-adjusted results are computed from actual changes in target holdings at each "
-                "rebalance. FTSE MIB remains an index reference without simulated ETF fees or tracking error. "
-                "All figures are historical scenario estimates, not executable trade confirmations."
-            )
-            rb_cost_rows = rb_results[rb_results["Model"] != "Benchmark"].copy()
-            rb_cost_rows["Return drag (pp)"] = (
-                rb_cost_rows["Total Return"] - rb_cost_rows["Net Total Return"]
-            ) * 100
-            rb_cost_summary = rb_cost_rows.groupby("Model").agg(
-                Windows=("Total Return", "count"),
-                Gross_Return=("Total Return", "mean"),
-                Net_Return=("Net Total Return", "mean"),
-                Mean_Cost_EUR=("Transaction Costs EUR", "mean"),
-                Mean_Orders=("Orders", "mean"),
-                Return_Drag_pp=("Return drag (pp)", "mean"),
-                Net_Sharpe=("Net Sharpe Ratio", "mean"),
-                Net_Drawdown=("Net Max Drawdown", "mean"),
-            ).reindex(["CAPM", "FF3", "FF5", "Equal Weight"])
-            st.dataframe(rb_cost_summary.style.format({
-                "Gross_Return": "{:+.2%}", "Net_Return": "{:+.2%}",
-                "Mean_Cost_EUR": "€{:,.2f}", "Mean_Orders": "{:.1f}",
-                "Return_Drag_pp": "{:.2f}", "Net_Sharpe": "{:.2f}",
-                "Net_Drawdown": "{:.2%}",
-            }), use_container_width=True)
-            rb_cost_chart = rb_cost_summary[["Gross_Return", "Net_Return"]] * 100
-            st.bar_chart(rb_cost_chart, y_label="Average annual OOS return (%)")
-            st.download_button(
-                "Download transaction cost comparison (CSV)",
-                rb_cost_rows.to_csv(index=False).encode("utf-8"),
-                file_name="rolling_robustness_transaction_costs.csv", mime="text/csv",
-                key="rb_cost_download",
-            )
         if not rb_results.empty:
-            # The benchmark is an explicit fifth strategy, not a portfolio model.
-            # Keep only OOS dates shared by all five strategies for the primary comparison.
-            rb_models = ["CAPM", "FF3", "FF5", "Equal Weight", "Benchmark"]
-            rb_available = rb_results[rb_results["Model"].isin(rb_models)].copy()
-            rb_complete_dates = (
-                rb_available.groupby("OOS Start")["Model"]
-                .agg(lambda x: set(rb_models).issubset(set(x)))
+            rb_results = rb_results.replace({"Model": {"FTSE MIB": "Benchmark"}}).rename(columns={
+                "Transaction Costs EUR": "Transaction Costs", "Traded Notional EUR": "Traded Notional",
+            })
+        rb_models = [*rb_info.get("models", ["CAPM", "FF3", "FF5", "Equal Weight"]), "Benchmark"]
+        style_backtest_analysis_tabs()
+        with st.container(key="backtest_analysis_tabs_robustness"):
+            overview_tab, cost_tab, windows_tab, diagnostics_tab = st.tabs(
+                ["OOS Comparison", "Transaction Costs", "Completed Windows", "Diagnostics"],
+                key="rb_results_view", on_change="rerun",
             )
-            rb_complete_dates = rb_complete_dates[rb_complete_dates].index
-            rb_common = rb_available[rb_available["OOS Start"].isin(rb_complete_dates)].copy()
-            st.subheader("Like-for-like comparison (same OOS windows)")
-            st.caption(
-                f"{len(rb_complete_dates)} common windows with all five strategies; "
-                "missing-model windows are excluded only from this comparison, not from the raw results."
-            )
-            if not rb_common.empty:
-                rb_common["Positive Window"] = rb_common["Total Return"] > 0
-                summary = rb_common.groupby("Model").agg(
-                    Windows=("Total Return", "count"),
-                    Median_Return=("Total Return", "median"),
-                    Mean_Return=("Total Return", "mean"),
-                    Positive_Rate=("Positive Window", "mean"),
-                    Median_Sharpe=("Sharpe Ratio", "median"),
-                    Worst_Drawdown=("Max Drawdown", "min"),
-                )
-                benchmark_returns = rb_common.loc[
-                    rb_common["Model"] == "Benchmark", ["OOS Start", "Total Return"]
-                ].set_index("OOS Start")["Total Return"]
-                rb_common["Benchmark OOS Return"] = rb_common["OOS Start"].map(benchmark_returns)
-                rb_common["Outperformance"] = rb_common["Total Return"] > rb_common["Benchmark OOS Return"]
-                rb_common["Excess OOS Return"] = rb_common["Total Return"] - rb_common["Benchmark OOS Return"]
-                extra = rb_common.groupby("Model").agg(
-                    Benchmark_Win_Rate=("Outperformance", "mean"),
-                    Mean_Excess_Return=("Excess OOS Return", "mean"),
-                )
-                summary = summary.join(extra).reindex(rb_models)
-                st.dataframe(summary.style.format({
-                    "Median_Return": "{:.2%}", "Mean_Return": "{:.2%}",
-                    "Positive_Rate": "{:.1%}", "Benchmark_Win_Rate": "{:.1%}",
-                    "Mean_Excess_Return": "{:+.2%}",
-                    "Median_Sharpe": "{:.2f}", "Worst_Drawdown": "{:.2%}",
-                }), use_container_width=True)
-                # Risk diagnostics are descriptive and use the same completed OOS
-                # windows for all five strategies. No financial engine changes.
-                st.subheader("Risk-adjusted performance — common windows")
-                st.caption(
-                    "Sharpe and drawdown statistics summarize individual OOS windows, "
-                    "not one continuously invested multi-year portfolio. "
-                    "Higher Sharpe and less negative drawdown are preferable."
-                )
-                rb_risk_summary = rb_common.groupby("Model").agg(
-                    Windows=("Sharpe Ratio", "count"),
-                    Mean_Return=("Total Return", "mean"),
-                    Mean_Sharpe=("Sharpe Ratio", "mean"),
-                    Median_Sharpe=("Sharpe Ratio", "median"),
-                    Mean_Drawdown=("Max Drawdown", "mean"),
-                    Median_Drawdown=("Max Drawdown", "median"),
-                    Worst_Drawdown=("Max Drawdown", "min"),
-                ).reindex(rb_models)
-                st.dataframe(
-                    rb_risk_summary.style.format({
-                        "Mean_Return": "{:+.2%}",
-                        "Mean_Sharpe": "{:.2f}",
-                        "Median_Sharpe": "{:.2f}",
-                        "Mean_Drawdown": "{:.2%}",
-                        "Median_Drawdown": "{:.2%}",
-                        "Worst_Drawdown": "{:.2%}",
-                    }),
-                    use_container_width=True,
-                )
-                rb_risk_col1, rb_risk_col2 = st.columns(2)
-                with rb_risk_col1:
-                    st.markdown("**Annual OOS Sharpe Ratio**")
-                    st.line_chart(
-                        rb_common.pivot_table(
-                            index="OOS Start", columns="Model", values="Sharpe Ratio"
-                        ).reindex(columns=rb_models),
-                        y_label="Sharpe Ratio",
+        if overview_tab.open:
+            with overview_tab:
+                if not rb_results.empty:
+                    rb_available = rb_results[rb_results["Model"].isin(rb_models)].copy()
+                    basis = st.segmented_control("Return basis", ["Net", "Gross"], default="Net",
+                                                 required=True, key="rb_return_basis")
+                    if basis == "Net":
+                        for metric in ("Total Return", "Sharpe Ratio", "Max Drawdown"):
+                            rb_available[metric] = rb_available[f"Net {metric}"]
+                        rb_available["Excess OOS Return"] = rb_available["Total Return"] - rb_available["Benchmark Return"]
+                    else:
+                        rb_available["Excess OOS Return"] = rb_available["Excess Return"]
+                    rb_available = rb_available.dropna(subset=["Total Return", "Sharpe Ratio", "Max Drawdown"])
+                    rb_complete_dates = (
+                        rb_available.groupby("OOS Start")["Model"]
+                        .agg(lambda x: set(rb_models).issubset(set(x)))
                     )
-                with rb_risk_col2:
-                    st.markdown("**Annual OOS Maximum Drawdown**")
-                    st.line_chart(
-                        rb_common.pivot_table(
-                            index="OOS Start", columns="Model", values="Max Drawdown"
-                        ).reindex(columns=rb_models) * 100,
-                        y_label="Maximum Drawdown (%)",
-                    )
-
-                st.subheader("Paired comparison vs Equal Weight")
-                st.caption(
-                    "Each cell counts windows in which the model beats Equal Weight "
-                    "on the SAME OOS dates. Ties do not count as wins."
-                )
-                rb_return_wide = rb_common.pivot(index="OOS Start", columns="Model", values="Total Return")
-                rb_sharpe_wide = rb_common.pivot(index="OOS Start", columns="Model", values="Sharpe Ratio")
-                rb_drawdown_wide = rb_common.pivot(index="OOS Start", columns="Model", values="Max Drawdown")
-                rb_pairs = []
-                for rb_model in ["CAPM", "FF3", "FF5", "Benchmark"]:
-                    rb_valid = (
-                        rb_return_wide[[rb_model, "Equal Weight"]].notna().all(axis=1)
-                        & rb_sharpe_wide[[rb_model, "Equal Weight"]].notna().all(axis=1)
-                        & rb_drawdown_wide[[rb_model, "Equal Weight"]].notna().all(axis=1)
-                    )
-                    rb_n = int(rb_valid.sum())
-                    if not rb_n:
-                        continue
-                    rb_pairs.append({
-                        "Model": rb_model,
-                        "Compared windows": rb_n,
-                        "Higher return": int((rb_return_wide.loc[rb_valid, rb_model] > rb_return_wide.loc[rb_valid, "Equal Weight"]).sum()),
-                        "Higher Sharpe": int((rb_sharpe_wide.loc[rb_valid, rb_model] > rb_sharpe_wide.loc[rb_valid, "Equal Weight"]).sum()),
-                        "Smaller drawdown": int((rb_drawdown_wide.loc[rb_valid, rb_model] > rb_drawdown_wide.loc[rb_valid, "Equal Weight"]).sum()),
-                        "Mean return difference (pp)": float((rb_return_wide.loc[rb_valid, rb_model] - rb_return_wide.loc[rb_valid, "Equal Weight"]).mean() * 100),
-                        "Mean Sharpe difference": float((rb_sharpe_wide.loc[rb_valid, rb_model] - rb_sharpe_wide.loc[rb_valid, "Equal Weight"]).mean()),
-                        "Mean drawdown difference (pp)": float((rb_drawdown_wide.loc[rb_valid, rb_model] - rb_drawdown_wide.loc[rb_valid, "Equal Weight"]).mean() * 100),
-                    })
-                if rb_pairs:
-                    rb_pair_df = pd.DataFrame(rb_pairs).set_index("Model")
-                    for rb_col in ["Higher return", "Higher Sharpe", "Smaller drawdown"]:
-                        rb_pair_df[rb_col] = rb_pair_df.apply(
-                            lambda r: f"{int(r[rb_col])}/{int(r['Compared windows'])}", axis=1
-                        )
-                    st.dataframe(rb_pair_df.style.format({
-                        "Mean return difference (pp)": "{:+.2f}",
-                        "Mean Sharpe difference": "{:+.2f}",
-                        "Mean drawdown difference (pp)": "{:+.2f}",
-                    }), use_container_width=True)
+                    rb_complete_dates = rb_complete_dates[rb_complete_dates].index
+                    rb_common = rb_available[rb_available["OOS Start"].isin(rb_complete_dates)].copy()
+                    for column, (label, value, color) in zip(st.columns(3), (
+                        ("Candidate Windows", rb_info["candidate_windows"], "blue"),
+                        ("Common Windows", len(rb_complete_dates), "green"),
+                        ("Portfolios Selected", len(rb_models) - 1, "purple"),
+                    )):
+                        with column:
+                            colored_metric(label, str(value), color)
+                    st.subheader("Like-for-like comparison (same OOS windows)")
                     st.caption(
-                        "A positive drawdown difference means a shallower loss than Equal Weight; "
-                        "a negative difference means a deeper loss."
+                        f"{len(rb_complete_dates)} common windows across the selected portfolios and benchmark; "
+                        "missing-model windows are excluded only from this comparison, not from the raw results."
                     )
+                    if not rb_common.empty:
+                        rb_common["Positive Window"] = rb_common["Total Return"] > 0
+                        summary = rb_common.groupby("Model").agg(
+                            Windows=("Total Return", "count"),
+                            Median_Return=("Total Return", "median"),
+                            Mean_Return=("Total Return", "mean"),
+                            Positive_Rate=("Positive Window", "mean"),
+                            Median_Sharpe=("Sharpe Ratio", "median"),
+                            Worst_Drawdown=("Max Drawdown", "min"),
+                        )
+                        benchmark_returns = rb_common.loc[
+                            rb_common["Model"] == "Benchmark", ["OOS Start", "Total Return"]
+                        ].set_index("OOS Start")["Total Return"]
+                        rb_common["Benchmark OOS Return"] = rb_common["OOS Start"].map(benchmark_returns)
+                        rb_common["Outperformance"] = rb_common["Total Return"] > rb_common["Benchmark OOS Return"]
+                        rb_common["Excess OOS Return"] = rb_common["Total Return"] - rb_common["Benchmark OOS Return"]
+                        extra = rb_common.groupby("Model").agg(
+                            Benchmark_Win_Rate=("Outperformance", "mean"),
+                            Mean_Excess_Return=("Excess OOS Return", "mean"),
+                        )
+                        summary = summary.join(extra).reindex(rb_models)
+                        render_terminal_table(summary, {
+                            "Median_Return": "{:.2%}", "Mean_Return": "{:.2%}",
+                            "Positive_Rate": "{:.1%}", "Benchmark_Win_Rate": "{:.1%}",
+                            "Mean_Excess_Return": "{:+.2%}",
+                            "Median_Sharpe": "{:.2f}", "Worst_Drawdown": "{:.2%}",
+                        }, index_label="Model", signed=("Median_Return", "Mean_Return", "Worst_Drawdown"))
+                        # Risk diagnostics are descriptive and use the same completed OOS
+                        # windows for the selected portfolios. No financial engine changes.
+                        st.subheader("Risk-adjusted performance — common windows")
+                        st.caption(
+                            "Sharpe and drawdown statistics summarize individual OOS windows, "
+                            "not one continuously invested multi-year portfolio. "
+                            "Higher Sharpe and less negative drawdown are preferable."
+                        )
+                        rb_risk_summary = rb_common.groupby("Model").agg(
+                            Windows=("Sharpe Ratio", "count"),
+                            Mean_Return=("Total Return", "mean"),
+                            Mean_Sharpe=("Sharpe Ratio", "mean"),
+                            Median_Sharpe=("Sharpe Ratio", "median"),
+                            Mean_Drawdown=("Max Drawdown", "mean"),
+                            Median_Drawdown=("Max Drawdown", "median"),
+                            Worst_Drawdown=("Max Drawdown", "min"),
+                        ).reindex(rb_models)
+                        st.dataframe(
+                            rb_risk_summary.style.format({
+                                "Mean_Return": "{:+.2%}",
+                                "Mean_Sharpe": "{:.2f}",
+                                "Median_Sharpe": "{:.2f}",
+                                "Mean_Drawdown": "{:.2%}",
+                                "Median_Drawdown": "{:.2%}",
+                                "Worst_Drawdown": "{:.2%}",
+                            }),
+                            use_container_width=True,
+                        )
+                        rb_risk_col1, rb_risk_col2 = st.columns(2)
+                        with rb_risk_col1:
+                            st.markdown("**OOS Sharpe Ratio**")
+                            st.line_chart(
+                                rb_common.pivot_table(
+                                    index="OOS Start", columns="Model", values="Sharpe Ratio"
+                                ).reindex(columns=rb_models),
+                                y_label="Sharpe Ratio",
+                            )
+                        with rb_risk_col2:
+                            st.markdown("**OOS Maximum Drawdown**")
+                            st.line_chart(
+                                rb_common.pivot_table(
+                                    index="OOS Start", columns="Model", values="Max Drawdown"
+                                ).reindex(columns=rb_models) * 100,
+                                y_label="Maximum Drawdown (%)",
+                            )
 
-                st.subheader("Stress windows — weakest benchmark returns")
-                st.caption(
-                    "The three lowest-return benchmark windows among the common dates. "
-                    "These are selected mechanically, not predefined crisis labels. "
-                    "With overlapping windows, observations are not independent."
-                )
-                rb_stress_dates = rb_return_wide["Benchmark"].nsmallest(3).index
-                rb_stress = rb_common[rb_common["OOS Start"].isin(rb_stress_dates)].copy()
-                rb_stress["OOS Start"] = rb_stress["OOS Start"].astype(str)
-                rb_stress = rb_stress[["OOS Start", "Model", "Total Return", "Sharpe Ratio", "Max Drawdown"]]
-                rb_stress["Model"] = pd.Categorical(rb_stress["Model"], categories=rb_models, ordered=True)
-                rb_stress = rb_stress.sort_values(["OOS Start", "Model"])
-                st.dataframe(rb_stress.style.format({
-                    "Total Return": "{:+.2%}",
-                    "Sharpe Ratio": "{:.2f}",
-                    "Max Drawdown": "{:.2%}",
-                }), use_container_width=True, hide_index=True)
-                st.download_button(
-                    "Download risk comparison (CSV)",
-                    rb_risk_summary.reset_index().to_csv(index=False).encode("utf-8"),
-                    file_name="rolling_robustness_risk_comparison.csv", mime="text/csv",
-                    key="rb_risk_export",
-                )
+                        st.subheader("Paired comparison vs Equal Weight")
+                        st.caption(
+                            "Each cell counts windows in which the model beats Equal Weight "
+                            "on the SAME OOS dates. Ties do not count as wins."
+                        )
+                        rb_return_wide = rb_common.pivot(index="OOS Start", columns="Model", values="Total Return")
+                        rb_sharpe_wide = rb_common.pivot(index="OOS Start", columns="Model", values="Sharpe Ratio")
+                        rb_drawdown_wide = rb_common.pivot(index="OOS Start", columns="Model", values="Max Drawdown")
+                        rb_pairs = []
+                        for rb_model in (m for m in rb_models if m != "Equal Weight" and "Equal Weight" in rb_models):
+                            rb_valid = (
+                                rb_return_wide[[rb_model, "Equal Weight"]].notna().all(axis=1)
+                                & rb_sharpe_wide[[rb_model, "Equal Weight"]].notna().all(axis=1)
+                                & rb_drawdown_wide[[rb_model, "Equal Weight"]].notna().all(axis=1)
+                            )
+                            rb_n = int(rb_valid.sum())
+                            if not rb_n:
+                                continue
+                            rb_pairs.append({
+                                "Model": rb_model,
+                                "Compared windows": rb_n,
+                                "Higher return": int((rb_return_wide.loc[rb_valid, rb_model] > rb_return_wide.loc[rb_valid, "Equal Weight"]).sum()),
+                                "Higher Sharpe": int((rb_sharpe_wide.loc[rb_valid, rb_model] > rb_sharpe_wide.loc[rb_valid, "Equal Weight"]).sum()),
+                                "Smaller drawdown": int((rb_drawdown_wide.loc[rb_valid, rb_model] > rb_drawdown_wide.loc[rb_valid, "Equal Weight"]).sum()),
+                                "Mean return difference (pp)": float((rb_return_wide.loc[rb_valid, rb_model] - rb_return_wide.loc[rb_valid, "Equal Weight"]).mean() * 100),
+                                "Mean Sharpe difference": float((rb_sharpe_wide.loc[rb_valid, rb_model] - rb_sharpe_wide.loc[rb_valid, "Equal Weight"]).mean()),
+                                "Mean drawdown difference (pp)": float((rb_drawdown_wide.loc[rb_valid, rb_model] - rb_drawdown_wide.loc[rb_valid, "Equal Weight"]).mean() * 100),
+                            })
+                        if rb_pairs:
+                            rb_pair_df = pd.DataFrame(rb_pairs).set_index("Model")
+                            for rb_col in ["Higher return", "Higher Sharpe", "Smaller drawdown"]:
+                                rb_pair_df[rb_col] = rb_pair_df.apply(
+                                    lambda r: f"{int(r[rb_col])}/{int(r['Compared windows'])}", axis=1
+                                )
+                            st.dataframe(rb_pair_df.style.format({
+                                "Mean return difference (pp)": "{:+.2f}",
+                                "Mean Sharpe difference": "{:+.2f}",
+                                "Mean drawdown difference (pp)": "{:+.2f}",
+                            }), use_container_width=True)
+                            st.caption(
+                                "A positive drawdown difference means a shallower loss than Equal Weight; "
+                                "a negative difference means a deeper loss."
+                            )
 
-                st.subheader("OOS return by start date — common windows")
-                chart_data = rb_common.pivot_table(
-                    index="OOS Start", columns="Model", values="Total Return"
-                ).reindex(columns=rb_models)
-                st.line_chart(chart_data * 100, y_label="Total Return (%)")
-                st.subheader("Excess return vs benchmark — common windows")
-                excess_chart = rb_common[rb_common["Model"] != "Benchmark"].pivot_table(
-                    index="OOS Start", columns="Model", values="Excess OOS Return"
-                ).reindex(columns=rb_models[:-1])
-                st.bar_chart(excess_chart * 100, y_label="Excess Return (percentage points)")
-            else:
-                st.warning("No windows contain all five strategies. Review skipped-window diagnostics.")
-            st.subheader("All completed windows (unfiltered)")
-            st.dataframe(rb_results, use_container_width=True, hide_index=True)
-            st.download_button("Download robustness results (CSV)", rb_results.to_csv(index=False).encode("utf-8"),
-                               file_name="rolling_robustness_results.csv", mime="text/csv", key="rb_export")
-        else:
-            st.warning("No valid OOS windows were completed. Inspect the data coverage and skipped-window diagnostics.")
-        if not rb_skipped.empty:
-            with st.expander(f"Skipped windows / model failures ({len(rb_skipped)})"):
-                st.dataframe(rb_skipped, use_container_width=True, hide_index=True)
-                st.download_button("Download diagnostics (CSV)", rb_skipped.to_csv(index=False).encode("utf-8"),
-                                   file_name="rolling_robustness_diagnostics.csv", mime="text/csv", key="rb_errors")
+                        st.subheader("Stress windows — weakest benchmark returns")
+                        st.caption(
+                            "The three lowest-return benchmark windows among the common dates. "
+                            "These are selected mechanically, not predefined crisis labels. "
+                            "With overlapping windows, observations are not independent."
+                        )
+                        rb_stress_dates = rb_return_wide["Benchmark"].nsmallest(3).index
+                        rb_stress = rb_common[rb_common["OOS Start"].isin(rb_stress_dates)].copy()
+                        rb_stress["OOS Start"] = rb_stress["OOS Start"].astype(str)
+                        rb_stress = rb_stress[["OOS Start", "Model", "Total Return", "Sharpe Ratio", "Max Drawdown"]]
+                        rb_stress["Model"] = pd.Categorical(rb_stress["Model"], categories=rb_models, ordered=True)
+                        rb_stress = rb_stress.sort_values(["OOS Start", "Model"])
+                        st.dataframe(rb_stress.style.format({
+                            "Total Return": "{:+.2%}",
+                            "Sharpe Ratio": "{:.2f}",
+                            "Max Drawdown": "{:.2%}",
+                        }), use_container_width=True, hide_index=True)
+                        st.download_button(
+                            "Download risk comparison (CSV)",
+                            rb_risk_summary.reset_index().to_csv(index=False).encode("utf-8"),
+                            file_name="rolling_robustness_risk_comparison.csv", mime="text/csv",
+                            key="rb_risk_export",
+                        )
+
+                        st.subheader("OOS return by start date — common windows")
+                        chart_data = rb_common.pivot_table(
+                            index="OOS Start", columns="Model", values="Total Return"
+                        ).reindex(columns=rb_models)
+                        st.line_chart(chart_data * 100, y_label="Total Return (%)")
+                        st.subheader("Excess return vs benchmark — common windows")
+                        excess_chart = rb_common[rb_common["Model"] != "Benchmark"].pivot_table(
+                            index="OOS Start", columns="Model", values="Excess OOS Return"
+                        ).reindex(columns=rb_models[:-1])
+                        st.bar_chart(excess_chart * 100, y_label="Excess Return (percentage points)")
+                    else:
+                        st.warning("No windows contain all selected portfolios and the benchmark. Review skipped-window diagnostics.")
+                else:
+                    st.info("No completed windows are available. See Diagnostics.")
+        if cost_tab.open:
+            with cost_tab:
+                if not rb_results.empty and rb_results["Model"].ne("Benchmark").any():
+                    st.caption(
+                        "Cost-adjusted results are computed from actual changes in target holdings at each "
+                        "rebalance. The benchmark has no simulated trading costs. "
+                        "All figures are historical scenario estimates, not executable trade confirmations."
+                    )
+                    rb_cost_rows = rb_results[rb_results["Model"] != "Benchmark"].copy()
+                    rb_cost_rows["Return drag (pp)"] = (
+                        rb_cost_rows["Total Return"] - rb_cost_rows["Net Total Return"]
+                    ) * 100
+                    rb_cost_summary = rb_cost_rows.groupby("Model").agg(
+                        Windows=("Total Return", "count"),
+                        Gross_Return=("Total Return", "mean"),
+                        Net_Return=("Net Total Return", "mean"),
+                        Mean_Cost=("Transaction Costs", "mean"),
+                        Mean_Orders=("Orders", "mean"),
+                        Return_Drag_pp=("Return drag (pp)", "mean"),
+                        Net_Sharpe=("Net Sharpe Ratio", "mean"),
+                        Net_Drawdown=("Net Max Drawdown", "mean"),
+                    ).reindex([model for model in rb_models if model != "Benchmark" and model in rb_cost_rows["Model"].values])
+                    currency = "$" if rb_info.get("market") == "USA" else "€"
+                    render_terminal_table(rb_cost_summary.rename(columns={"Mean_Cost": "Mean Cost"}), {
+                        "Gross_Return": "{:+.2%}", "Net_Return": "{:+.2%}",
+                        "Mean Cost": currency + "{:,.2f}", "Mean_Orders": "{:.1f}",
+                        "Return_Drag_pp": "{:.2f}", "Net_Sharpe": "{:.2f}",
+                        "Net_Drawdown": "{:.2%}",
+                    }, index_label="Model", signed=("Gross_Return", "Net_Return", "Net_Drawdown"))
+                    rb_cost_chart = rb_cost_summary[["Gross_Return", "Net_Return"]] * 100
+                    st.bar_chart(rb_cost_chart, y_label="Mean OOS window return (%)")
+                    st.download_button(
+                        "Download transaction cost comparison (CSV)",
+                        rb_cost_rows.to_csv(index=False).encode("utf-8"),
+                        file_name="rolling_robustness_transaction_costs.csv", mime="text/csv",
+                        key="rb_cost_download",
+                    )
+                else:
+                    st.info("No cost results are available.")
+        if windows_tab.open:
+            with windows_tab:
+                if not rb_results.empty:
+                    st.subheader("All completed windows (unfiltered)")
+                    st.dataframe(rb_results, use_container_width=True, hide_index=True)
+                    st.download_button("Download robustness results (CSV)", rb_results.to_csv(index=False).encode("utf-8"),
+                                       file_name="rolling_robustness_results.csv", mime="text/csv", key="rb_export")
+                else:
+                    st.info("No completed windows are available.")
+        if diagnostics_tab.open:
+            with diagnostics_tab:
+                if not rb_skipped.empty:
+                    with st.expander(f"Skipped windows / model failures ({len(rb_skipped)})"):
+                        st.dataframe(rb_skipped, use_container_width=True, hide_index=True)
+                        st.download_button("Download diagnostics (CSV)", rb_skipped.to_csv(index=False).encode("utf-8"),
+                                           file_name="rolling_robustness_diagnostics.csv", mime="text/csv", key="rb_errors")
 
 
 def _drbt_pretest_returns(prices, weights_history, test_start, required):
@@ -8143,7 +8249,31 @@ with backtest_tab:
 # =========================================================
 # MONTE CARLO SIMULATION (INDEPENDENT TAB)
 # =========================================================
-with monte_carlo_tab:
+with monte_carlo_tab, st.container(key="kangemi_monte_carlo"):
+    st.markdown("""
+    <style>
+    .st-key-kangemi_monte_carlo :is(h2,h3,[data-testid="stMetricValue"]) {
+        font-family: ui-monospace, Menlo, Consolas, monospace;
+    }
+    .st-key-kangemi_monte_carlo [data-testid="stMetric"] {
+        background: #151b25;
+        border-color: #303d50;
+    }
+    .st-key-kangemi_monte_carlo [data-testid="stExpander"] summary {
+        background: #151b25;
+    }
+    </style>
+    """, unsafe_allow_html=True)
+
+    def mc_chart_theme(figure):
+        figure.update_layout(
+            template="plotly_dark", paper_bgcolor="#101319", plot_bgcolor="#101319",
+            title_font=dict(color="#ffbf69", family="Menlo, Consolas, monospace"),
+            colorway=["#ffbf69", "#7bcaff", "#63d8b0", "#c6a6ff", "#ff8490"],
+        )
+        figure.update_xaxes(gridcolor="#242c37")
+        figure.update_yaxes(gridcolor="#242c37")
+
     st.header("Monte Carlo Simulation")
     st.caption(
         "Simulazioni statistiche condizionate ai rendimenti fuori campione del backtest. "
@@ -8190,47 +8320,48 @@ with monte_carlo_tab:
         if not mc_available:
             st.warning("Nessuna curva valida trovata nel backtest selezionato.")
         else:
-            mc_selected = st.multiselect(
-                "Strategie di portafoglio", list(mc_available),
-                default=list(mc_available), key="mc_strategies",
-                help="Seleziona uno o più portafogli da simulare. Le strategie vengono confrontate "
-                     "usando gli stessi shock casuali, preservando la dipendenza storica tra di esse."
-            )
-            c1, c2, c3, c4 = st.columns(4)
-            with c1:
-                mc_years = st.selectbox("Orizzonte (anni)", [1, 3, 5], key="mc_years",
-                    help="Numero di anni futuri simulati: 252 sedute per anno.")
-            with c2:
-                mc_paths = st.selectbox("Numero simulazioni", [500, 1000, 2000, 3000], index=1, key="mc_paths",
-                    help="Numero di traiettorie casuali. Un numero maggiore rende più stabili le stime, "
-                         "ma aumenta i tempi di calcolo.")
-            with c3:
-                mc_capital = st.number_input("Capitale iniziale (€)", min_value=100.0,
-                    value=10000.0, step=1000.0, key="mc_capital",
-                    help="Capitale ipotetico da cui partono tutte le simulazioni. "
-                         "Le curve storiche vengono convertite in rendimenti prima della simulazione.")
-            with c4:
-                mc_method = st.selectbox("Metodo di simulazione",
-                    ["Block bootstrap", "IID bootstrap", "Multivariate Gaussian"], key="mc_method",
-                    help="Block bootstrap: estrae blocchi consecutivi di sedute storiche e conserva parte "
-                         "della dipendenza temporale. IID: estrae singole sedute indipendenti. "
-                         "Gaussian: simula rendimenti normali multivariati con media e covarianza storiche.")
-            c5, c6, c7 = st.columns(3)
-            with c5:
-                mc_block = st.selectbox("Lunghezza blocco (sedute)", [3, 5, 10, 21], index=1,
-                    disabled=mc_method != "Block bootstrap", key="mc_block",
-                    help="Nel block bootstrap, numero di sedute consecutive estratte insieme. "
-                         "Blocchi più lunghi preservano più struttura temporale, ma riducono la varietà dei campioni.")
-            with c6:
-                mc_drift = st.number_input("Aggiustamento rendimento annuo (pp)",
-                    min_value=-30.0, max_value=30.0, value=0.0, step=1.0, key="mc_drift",
-                    help="Stress test sulla media dei rendimenti: -5 sottrae circa 5 punti percentuali "
-                         "all'anno al rendimento medio giornaliero utilizzato nelle simulazioni. "
-                         "Non modifica la volatilità o le correlazioni stimate.")
-            with c7:
-                mc_seed = st.number_input("Seed casuale", min_value=0, max_value=1000000,
-                    value=42, step=1, key="mc_seed",
-                    help="Permette di riprodurre gli stessi scenari casuali con gli stessi parametri.")
+            with st.container(key="kangemi_controls_mc_simulation"):
+                mc_selected = st.multiselect(
+                    "Strategie di portafoglio", list(mc_available),
+                    default=list(mc_available), key="mc_strategies",
+                    help="Seleziona uno o più portafogli da simulare. Le strategie vengono confrontate "
+                         "usando gli stessi shock casuali, preservando la dipendenza storica tra di esse."
+                )
+                c1, c2, c3, c4 = st.columns(4)
+                with c1:
+                    mc_years = st.selectbox("Orizzonte (anni)", [1, 3, 5], key="mc_years",
+                        help="Numero di anni futuri simulati: 252 sedute per anno.")
+                with c2:
+                    mc_paths = st.selectbox("Numero simulazioni", [500, 1000, 2000, 3000], index=1, key="mc_paths",
+                        help="Numero di traiettorie casuali. Un numero maggiore rende più stabili le stime, "
+                             "ma aumenta i tempi di calcolo.")
+                with c3:
+                    mc_capital = st.number_input("Capitale iniziale (€)", min_value=100.0,
+                        value=10000.0, step=1000.0, key="mc_capital",
+                        help="Capitale ipotetico da cui partono tutte le simulazioni. "
+                             "Le curve storiche vengono convertite in rendimenti prima della simulazione.")
+                with c4:
+                    mc_method = st.selectbox("Metodo di simulazione",
+                        ["Block bootstrap", "IID bootstrap", "Multivariate Gaussian"], key="mc_method",
+                        help="Block bootstrap: estrae blocchi consecutivi di sedute storiche e conserva parte "
+                             "della dipendenza temporale. IID: estrae singole sedute indipendenti. "
+                             "Gaussian: simula rendimenti normali multivariati con media e covarianza storiche.")
+                c5, c6, c7 = st.columns(3)
+                with c5:
+                    mc_block = st.selectbox("Lunghezza blocco (sedute)", [3, 5, 10, 21], index=1,
+                        disabled=mc_method != "Block bootstrap", key="mc_block",
+                        help="Nel block bootstrap, numero di sedute consecutive estratte insieme. "
+                             "Blocchi più lunghi preservano più struttura temporale, ma riducono la varietà dei campioni.")
+                with c6:
+                    mc_drift = st.number_input("Aggiustamento rendimento annuo (pp)",
+                        min_value=-30.0, max_value=30.0, value=0.0, step=1.0, key="mc_drift",
+                        help="Stress test sulla media dei rendimenti: -5 sottrae circa 5 punti percentuali "
+                             "all'anno al rendimento medio giornaliero utilizzato nelle simulazioni. "
+                             "Non modifica la volatilità o le correlazioni stimate.")
+                with c7:
+                    mc_seed = st.number_input("Seed casuale", min_value=0, max_value=1000000,
+                        value=42, step=1, key="mc_seed",
+                        help="Permette di riprodurre gli stessi scenari casuali con gli stessi parametri.")
 
             if mc_selected:
                 try:
@@ -8240,6 +8371,12 @@ with monte_carlo_tab:
                         f"{mc_returns_preview.index.max():%d/%m/%Y} · "
                         f"{len(mc_returns_preview)} rendimenti giornalieri · {len(mc_selected)} strategie."
                     )
+                    st.caption("Si usano solo intervalli tra valorizzazioni consecutive nel calendario osservato "
+                               "con entrambi i NAV presenti per tutte le strategie.")
+                    missing_entry = set(mc_selected) - mc_returns_preview.attrs["entry_multipliers"].keys()
+                    if missing_entry:
+                        st.warning("Capitale iniziale storico non disponibile per: " + ", ".join(sorted(missing_entry))
+                                   + ". Per queste curve si simula un portafoglio già investito.")
                     if len(mc_returns_preview) < 252:
                         st.warning("Campione inferiore a un anno: le code della distribuzione e i risultati "
                                    "su 3–5 anni possono essere molto instabili.")
@@ -8249,7 +8386,29 @@ with monte_carlo_tab:
                 except ValueError as mc_error:
                     st.warning(str(mc_error))
 
+            with st.expander("Research & Validation — Export Audit Data"):
+                if st.button("Prepare Monte Carlo Audit Data", disabled=not mc_selected):
+                    try:
+                        from src.monte_carlo_export import build_audit_archive
+
+                        calibration = mc_aligned_returns({name: mc_available[name] for name in mc_selected})
+                        archive = build_audit_archive(
+                            mc_source, {name: mc_keys[name] for name in mc_selected}, calibration,
+                            dict(method=mc_method, years=mc_years, n_paths=mc_paths,
+                                 initial_capital=mc_capital, block_size=mc_block, seed=mc_seed,
+                                 annual_drift_adjustment=mc_drift/100, sessions_per_year=252),
+                            dict(source=mc_source_name, market=mc_source.get("market"),
+                                 experiment_id=None, robustness_seed=st.session_state.get("mc_rb_seed", 42),
+                                 robustness_paths=st.session_state.get("mc_rb_paths", 500),
+                                 robustness_min_obs=st.session_state.get("mc_rb_min", 100)),
+                        )
+                        st.download_button("Export Monte Carlo Audit Data", archive,
+                                           "monte_carlo_audit.zip", "application/zip")
+                    except (ValueError, TypeError) as exc:
+                        st.error(str(exc))
+
             if st.button("Run Monte Carlo Simulation", type="primary", key="mc_run", disabled=not mc_selected):
+                st.session_state.pop("mc_results", None)
                 try:
                     mc_returns = mc_aligned_returns({name: mc_available[name] for name in mc_selected})
                     with st.spinner("Simulazione degli scenari in corso..."):
@@ -8288,7 +8447,7 @@ with monte_carlo_tab:
                 mc_green_cols = ["Median final (€)", "Mean final (€)",
                                  "P5 final (€)", "P95 final (€)"]
                 mc_red_cols = ["Probability of loss (%)", "VaR 95% (€)",
-                               "ES 95% (€)", "Probability MDD ≤ -20% (%)"]
+                               "ES 95% (€)", "Daily VaR 95% (€)", "Daily ES 95% (€)", "Probability MDD ≤ -20% (%)"]
 
                 def _mc_dark_gradient(column, low_rgb, high_rgb):
                     numeric = pd.to_numeric(column, errors="coerce")
@@ -8312,7 +8471,8 @@ with monte_carlo_tab:
                         )
                     return styles
 
-                mc_styled = mc_saved["metrics"].style.format({
+                mc_display = mc_saved["metrics"].drop(columns=["Daily VaR 95% (%)", "Daily ES 95% (%)"], errors="ignore")
+                mc_styled = mc_display.style.format({
                     "Median final (€)": "€{:,.2f}", "Mean final (€)": "€{:,.2f}",
                     "P5 final (€)": "€{:,.2f}", "P95 final (€)": "€{:,.2f}",
                     "Probability of loss (%)": "{:.1f}%", "VaR 95% (€)": "€{:,.2f}",
@@ -8324,15 +8484,22 @@ with monte_carlo_tab:
                         low_rgb=(18, 28, 25), high_rgb=(29, 111, 68),
                     )
                 for mc_col in mc_red_cols:
+                    if mc_col not in mc_display:
+                        continue
                     mc_styled = mc_styled.apply(
                         _mc_dark_gradient, subset=[mc_col], axis=0,
                         low_rgb=(28, 22, 26), high_rgb=(124, 38, 49),
                     )
                 st.dataframe(mc_styled, use_container_width=True)
-                st.caption("VaR 95%: perdita rispetto al capitale iniziale al 5° percentile. "
-                           "ES 95%: perdita media nei peggiori 5% degli scenari. "
+                st.caption("Il costo d’ingresso storico, se noto, è applicato una sola volta in proporzione al capitale. "
+                           "I costi successivi restano incorporati nei rendimenti netti del NAV. "
+                           "VaR 95%: perdita rispetto al capitale iniziale al 5° percentile. "
+                           "ES 95%: perdita media sulla massa esatta del 5%, con peso frazionario al confine. "
                            "Le perdite sono riportate come zero se il corrispondente risultato è positivo. "
                            "MDD: massimo drawdown all'interno di ciascuna traiettoria.")
+                st.caption("Daily VaR ed ES usano tutti gli shock giornalieri simulati su capitale fisso, "
+                           "senza il costo iniziale. Sono misure incondizionate. La VaR di orizzonte "
+                           "può essere zero anche con VaR giornaliera positiva, se il P5 terminale supera il capitale iniziale.")
                 mc_view = st.selectbox("Strategia da visualizzare", list(mc_saved["percentiles"]),
                                        key="mc_view_strategy")
                 mc_p = mc_saved["percentiles"][mc_view]
@@ -8371,12 +8538,13 @@ with monte_carlo_tab:
                     fill="tonexty", fillcolor="rgba(56,189,248,0.13)" if mc_show_paths else "rgba(56,189,248,0.22)",
                     line=dict(width=0), name="25°–75° percentile"))
                 mc_fig.add_trace(go.Scatter(x=mc_p.index, y=mc_p["Median"],
-                    line=dict(color="#38bdf8", width=3), name="Mediana"))
+                    line=dict(color="#ffbf69", width=3), name="Mediana"))
                 mc_fig.add_hline(y=float(mc_saved["capital"]), line_dash="dash",
                     line_color="rgba(255,255,255,0.55)", annotation_text="Capitale iniziale")
                 mc_fig.update_layout(title=f"{mc_view} — ventaglio delle traiettorie simulate",
                     xaxis_title="Sedute future", yaxis_title="Valore portafoglio (€)",
                     template="plotly_dark", hovermode="x unified")
+                mc_chart_theme(mc_fig)
                 st.plotly_chart(mc_fig, use_container_width=True, key="mc_fan_chart")
                 mc_hist = go.Figure()
                 for mc_name in mc_saved["finals"].columns:
@@ -8387,6 +8555,7 @@ with monte_carlo_tab:
                 mc_hist.update_layout(title="Distribuzione dei valori finali",
                     xaxis_title="Valore finale (€)", yaxis_title="Numero di scenari",
                     barmode="overlay", template="plotly_dark")
+                mc_chart_theme(mc_hist)
                 st.plotly_chart(mc_hist, use_container_width=True, key="mc_distribution")
                 st.download_button("Download Monte Carlo Metrics (CSV)",
                     mc_saved["metrics"].to_csv().encode("utf-8"),
@@ -8406,23 +8575,25 @@ with monte_carlo_tab:
                 "Block bootstrap, IID bootstrap e normale multivariata. "
                 "Questa analisi non cambia le simulazioni principali."
             )
-            rb1, rb2, rb3 = st.columns(3)
-            with rb1:
-                mc_rb_paths = st.selectbox("Simulazioni per combinazione", [300, 500, 1000], index=1,
-                    key="mc_rb_paths", help="Numero di scenari per ogni coppia campione/metodo. "
-                    "Più scenari riducono il rumore Monte Carlo, ma aumentano i tempi di calcolo.")
-            with rb2:
-                mc_rb_min = st.selectbox("Minimo sedute per sottocampione", [60, 100, 126, 252], index=1,
-                    key="mc_rb_min", help="I sottocampioni troppo corti sono esclusi. "
-                    "Con un anno di storico, le stime delle code restano comunque fragili.")
-            with rb3:
-                mc_rb_seed = st.number_input("Seed del confronto", min_value=0, max_value=1000000,
-                    value=42, step=1, key="mc_rb_seed", help="Rende replicabile il confronto statistico.")
-            st.caption("Campioni: intero periodo, prima metà, seconda metà e ultimo 75% "
-                       "(quando contengono abbastanza osservazioni). Sono parzialmente sovrapposti: "
-                       "non costituiscono test indipendenti né una validazione walk-forward.")
+            with st.container(key="kangemi_controls_mc_robustness"):
+                rb1, rb2, rb3 = st.columns(3)
+                with rb1:
+                    mc_rb_paths = st.selectbox("Simulazioni per combinazione", [300, 500, 1000], index=1,
+                        key="mc_rb_paths", help="Numero di scenari per ogni coppia campione/metodo. "
+                        "Più scenari riducono il rumore Monte Carlo, ma aumentano i tempi di calcolo.")
+                with rb2:
+                    mc_rb_min = st.selectbox("Minimo sedute per sottocampione", [60, 100, 126, 252], index=1,
+                        key="mc_rb_min", help="I sottocampioni troppo corti sono esclusi. "
+                        "Con un anno di storico, le stime delle code restano comunque fragili.")
+                with rb3:
+                    mc_rb_seed = st.number_input("Seed del confronto", min_value=0, max_value=1000000,
+                        value=42, step=1, key="mc_rb_seed", help="Rende replicabile il confronto statistico.")
+                st.caption("Campioni: intero periodo, prima metà, seconda metà e ultimo 75% "
+                           "(quando contengono abbastanza osservazioni). Sono parzialmente sovrapposti: "
+                           "non costituiscono test indipendenti né una validazione walk-forward.")
             if st.button("Run Robustness Comparison", type="primary", key="mc_rb_run",
                          disabled=not mc_selected):
+                st.session_state.pop("mc_rb_results", None)
                 try:
                     mc_rb_returns = mc_aligned_returns({name: mc_available[name] for name in mc_selected})
                     n_rb = len(mc_rb_returns)
@@ -8485,8 +8656,9 @@ with monte_carlo_tab:
                 rb_strategy = st.selectbox("Strategia per il confronto", rb_table["Strategy"].unique(),
                     key="mc_rb_view_strategy")
                 rb_metric_options = ["Median final (€)", "Probability of loss (%)",
-                                     "VaR 95% (€)", "ES 95% (€)",
+                                     "VaR 95% (€)", "ES 95% (€)", "Daily VaR 95% (€)", "Daily ES 95% (€)",
                                      "Probability MDD ≤ -20% (%)"]
+                rb_metric_options = [metric for metric in rb_metric_options if metric in rb_table]
                 rb_metric = st.selectbox("Metrica da confrontare", rb_metric_options,
                     key="mc_rb_metric")
                 rb_view = rb_table.loc[rb_table["Strategy"] == rb_strategy]
@@ -8501,6 +8673,7 @@ with monte_carlo_tab:
                 rb_fig.update_layout(title=f"{rb_strategy} — {rb_metric}",
                     xaxis_title="Campione storico", yaxis_title=rb_metric,
                     barmode="group", template="plotly_dark")
+                mc_chart_theme(rb_fig)
                 st.plotly_chart(rb_fig, use_container_width=True, key="mc_rb_chart")
                 st.dataframe(rb_pivot.style.format("{:,.2f}"), use_container_width=True)
                 st.caption("La differenza tra campioni misura la sensibilità al periodo storico; "
@@ -8894,3 +9067,8 @@ with ml_tab:
 with ml_tab:
     st.divider()
     render_factor_ml_comparison(tickers, risk_free_rate, max_weight, capital)
+
+
+if trading_signals_tab.open:
+    with trading_signals_tab:
+        render_trading_signals(colored_metric)

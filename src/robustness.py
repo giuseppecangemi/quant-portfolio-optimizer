@@ -10,14 +10,20 @@ import numpy as np
 import yfinance as yf
 
 from src.backtest import backtest_portfolio, calculate_backtest_metrics
-from src.transaction_costs import CostAssumptions, apply_transaction_costs
-from src.fama_french import load_europe_ff3
-from src.fama_french_5 import load_europe_ff5
+from src.transaction_costs import CostAssumptions
+from src.fama_french import load_europe_ff3, load_us_ff3
+from src.fama_french_5 import load_europe_ff5, load_us_ff5
 
 STRATEGIES = {
+    "Maximum Sharpe": "max_sharpe",
     "CAPM": "capm_max_sharpe",
     "FF3": "ff3_max_sharpe",
     "FF5": "ff5_max_sharpe",
+    "FF3 Factor Cov": "ff3_factor_cov_max_sharpe",
+    "FF5 Factor Cov": "ff5_factor_cov_max_sharpe",
+    "Minimum Volatility": "min_volatility",
+    "Risk Parity": "risk_parity",
+    "HRP": "hrp",
     "Equal Weight": "equal_weight",
 }
 
@@ -70,6 +76,7 @@ def run_rolling_robustness(
     rebalance_days: int = 63, capital: float = 10000.0,
     risk_free_rate: float = 0.02, max_weight: float = 0.20,
     progress=None, transaction_costs: CostAssumptions | None = None,
+    *, market: str = "Borsa Italiana", models: list[str] | None = None,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     """Return (metrics, skipped_windows, download_info).
 
@@ -86,13 +93,21 @@ def run_rolling_robustness(
     if top_n is not None and max_weight * top_n < 1 - 1e-10:
         raise ValueError("Max asset weight is incompatible with the requested Top N.")
 
+    models = list(STRATEGIES) if models is None else list(dict.fromkeys(models))
+    if not models or any(model not in STRATEGIES for model in models):
+        raise ValueError("Select at least one valid portfolio model.")
+    if market not in {"Borsa Italiana", "USA"}:
+        raise ValueError("Unsupported market.")
+
     first_anchor = pd.Timestamp(year=start_year, month=1, day=1)
     last_boundary = pd.Timestamp(year=end_year + 1, month=1, day=1)
     download_start = first_anchor - pd.DateOffset(years=estimation_years, days=12)
     download_end = last_boundary + pd.Timedelta(days=7)
     prices = _download_close(tickers, download_start, download_end)
     benchmark = _download_close([benchmark_ticker], download_start, download_end)
-    fx = _download_close(["EURUSD=X"], download_start, download_end)
+    factor_models = [model for model in models if model.startswith(("FF3", "FF5"))]
+    fx = (_download_close(["EURUSD=X"], download_start, download_end)
+          if factor_models and market != "USA" else None)
     if prices.empty:
         raise ValueError("No historical asset prices were downloaded.")
     if benchmark.empty:
@@ -100,14 +115,23 @@ def run_rolling_robustness(
 
     ff3, ff5 = None, None
     factor_errors = {}
-    try:
-        ff3 = load_europe_ff3()
-    except Exception as exc:
-        factor_errors["FF3"] = str(exc)
-    try:
-        ff5 = load_europe_ff5()
-    except Exception as exc:
-        factor_errors["FF5"] = str(exc)
+    for model, loader in (
+        ("FF3", load_us_ff3 if market == "USA" else load_europe_ff3),
+        ("FF5", load_us_ff5 if market == "USA" else load_europe_ff5),
+    ):
+        variants = [label for label in factor_models if label.startswith(model)]
+        if not variants:
+            continue
+        try:
+            if market != "USA" and (fx is None or fx.empty):
+                raise ValueError("EUR/USD historical prices are unavailable.")
+            data = loader()
+            if model == "FF3":
+                ff3 = data
+            else:
+                ff5 = data
+        except Exception as exc:
+            factor_errors.update(dict.fromkeys(variants, str(exc)))
 
     records, skipped = [], []
     anchors = []
@@ -119,6 +143,8 @@ def run_rolling_robustness(
         raise ValueError("No complete OOS windows fit in the chosen period.")
 
     for window_i, anchor in enumerate(anchors):
+        if progress is not None:
+            progress(window_i / len(anchors))
         horizon_end = anchor + pd.DateOffset(months=horizon_months)
         estimation_start = anchor - pd.DateOffset(years=estimation_years)
         # Calendar window, no leakage from later periods.
@@ -135,19 +161,18 @@ def run_rolling_robustness(
             continue
         # The engine expects lookback observations immediately preceding the first OOS day.
         lookback = len(before)
-        # Extra terminal date is needed for the engine's loop boundary.
+        # Confirm the requested horizon has elapsed without using later prices in the engine.
         next_trading = prices.index[prices.index >= horizon_end]
         if len(next_trading) == 0:
             skipped.append({"OOS Start": anchor.date().isoformat(), "Reason": "Missing post-horizon boundary"})
             continue
-        window = prices.loc[(prices.index >= estimation_start) & (prices.index <= next_trading[0])].copy()
         if window.shape[1] < 2:
             skipped.append({"OOS Start": anchor.date().isoformat(), "Reason": "Fewer than two assets"})
             continue
         # Independent buy-and-hold benchmark for this OOS window.
         # Uses the first and last dates available in the asset trading calendar.
         benchmark_window = benchmark.iloc[:, 0].reindex(after).ffill().dropna()
-        if len(benchmark_window) >= 2 and benchmark_window.iloc[0] > 0:
+        if len(benchmark_window) == len(after) and benchmark_window.iloc[0] > 0:
             benchmark_curve = pd.DataFrame({
                 "Portfolio Value": capital * benchmark_window / benchmark_window.iloc[0],
             })
@@ -157,7 +182,7 @@ def run_rolling_robustness(
             records.append({
                 "OOS Start": anchor.date().isoformat(),
                 "OOS End": (horizon_end - pd.Timedelta(days=1)).date().isoformat(),
-                "Model": "FTSE MIB",
+                "Model": "Benchmark",
                 "Total Return": benchmark_total_return,
                 "Sharpe Ratio": float(benchmark_metrics["Sharpe Ratio"]),
                 "Max Drawdown": float(benchmark_metrics["Max Drawdown"]),
@@ -173,15 +198,17 @@ def run_rolling_robustness(
                 "Net Total Return": benchmark_total_return,
                 "Net Sharpe Ratio": float(benchmark_metrics["Sharpe Ratio"]),
                 "Net Max Drawdown": float(benchmark_metrics["Max Drawdown"]),
-                "Transaction Costs EUR": 0.0,
-                "Traded Notional EUR": 0.0,
+                "Transaction Costs": 0.0,
+                "Traded Notional": 0.0,
                 "Orders": 0,
                 "Rebalances": 0,
             })
         else:
-            skipped.append({"OOS Start": anchor.date().isoformat(), "Model": "FTSE MIB", "Reason": "Insufficient benchmark OOS history"})
+            skipped.append({"OOS Start": anchor.date().isoformat(), "Model": "Benchmark", "Reason": "Insufficient benchmark OOS history"})
 
-        for label, strategy in STRATEGIES.items():
+        window_cache = {}
+        for label in models:
+            strategy = STRATEGIES[label]
             if label in factor_errors:
                 skipped.append({"OOS Start": anchor.date().isoformat(), "Model": label, "Reason": factor_errors[label]})
                 continue
@@ -191,26 +218,22 @@ def run_rolling_robustness(
                     lookback_days=lookback, rebalance_days=rebalance_days,
                     risk_free_rate=risk_free_rate, max_weight=max_weight,
                     market_prices=benchmark, selection_top_n=top_n,
-                    selection_policy=selection_policy, shared_window_cache={},
+                    selection_policy=selection_policy, shared_window_cache=window_cache,
+                    market=market, transaction_costs=transaction_costs, capture_initial_ex_ante=True,
                     ff3_factors=ff3, ff5_factors=ff5, eurusd_prices=fx,
                 )
-                curve = curve.loc[(curve.index >= anchor) & (curve.index < horizon_end)]
-                if len(curve) < 2:
-                    raise ValueError("No OOS portfolio curve")
-                # Metric function works on the original engine's portfolio curve.
-                metrics = calculate_backtest_metrics(curve, risk_free_rate)
-                b = benchmark.iloc[:, 0].loc[(benchmark.index >= curve.index[0]) & (benchmark.index <= curve.index[-1])].dropna()
-                if len(b) < 2:
-                    raise ValueError("Missing benchmark in the OOS window")
-                benchmark_return = float(b.iloc[-1] / b.iloc[0] - 1)
-
-                net_metrics = None
-                trade_log = pd.DataFrame()
-                if transaction_costs is not None:
-                    net_metrics, trade_log, _ = apply_transaction_costs(
-                        curve, weights.loc[(weights.index >= curve.index[0]) & (weights.index <= curve.index[-1])],
-                        window, capital, transaction_costs, risk_free_rate,
-                    )
+                net_metrics = calculate_backtest_metrics(curve, risk_free_rate)
+                gross_nav = curve.get("Gross Portfolio Value", curve["Portfolio Value"])
+                gross_curve = gross_nav.to_frame("Portfolio Value")
+                gross_curve["Daily Return"] = gross_nav.pct_change().fillna(0.0)
+                gross_curve.attrs["initial_capital"] = capital
+                metrics = calculate_backtest_metrics(gross_curve, risk_free_rate)
+                aligned_benchmark = benchmark.iloc[:, 0].reindex(curve.index).ffill()
+                benchmark_return = (float(aligned_benchmark.iloc[-1] / aligned_benchmark.iloc[0] - 1)
+                                    if aligned_benchmark.notna().all() and aligned_benchmark.iloc[0] > 0
+                                    else np.nan)
+                trade_log = curve.attrs.get("transaction_log", pd.DataFrame())
+                ex_ante = curve.attrs["initial_ex_ante_kpis"]
 
                 # Diagnostics only: reproduce the first rebalance's complete-case
                 # history without changing selection, optimization or returns.
@@ -242,23 +265,29 @@ def run_rolling_robustness(
                     "Excess Return": float(metrics["Total Return"]) - benchmark_return,
                     "Beat Benchmark": float(metrics["Total Return"]) > benchmark_return,
                     "Initial Selected Assets": len(initial_assets),
+                    "Execution Start": curve.index[0].date().isoformat(),
+                    "Execution End": curve.index[-1].date().isoformat(),
+                    "Estimation End": ex_ante["estimation_end"],
+                    "Initial Expected Return": ex_ante["expected_return"],
+                    "Initial Volatility": ex_ante["volatility"],
+                    "Initial Sharpe": ex_ante["sharpe"],
                     "Requested Estimation Days": requested_days,
                     "Effective Common Estimation Days": common_days,
                     "Estimation Coverage": round(coverage, 4),
                     "Effective Estimation Start": earliest_common,
                     "Estimation Coverage Warning": coverage_warning,
-                    "Net Total Return": float(net_metrics["Total Return"]) if net_metrics else np.nan,
-                    "Net Sharpe Ratio": float(net_metrics["Sharpe Ratio"]) if net_metrics else np.nan,
-                    "Net Max Drawdown": float(net_metrics["Max Drawdown"]) if net_metrics else np.nan,
-                    "Transaction Costs EUR": float(trade_log["Total Cost"].sum()) if not trade_log.empty else 0.0,
-                    "Traded Notional EUR": float(trade_log["Traded Notional"].sum()) if not trade_log.empty else 0.0,
+                    "Net Total Return": float(net_metrics["Total Return"]),
+                    "Net Sharpe Ratio": float(net_metrics["Sharpe Ratio"]),
+                    "Net Max Drawdown": float(net_metrics["Max Drawdown"]),
+                    "Transaction Costs": float(trade_log["Total Cost"].sum()) if not trade_log.empty else 0.0,
+                    "Traded Notional": float(trade_log["Traded Notional"].sum()) if not trade_log.empty else 0.0,
                     "Orders": int(trade_log["Orders"].sum()) if not trade_log.empty else 0,
-                    "Rebalances": len(trade_log),
+                    "Rebalances": max(0, len(weights) - 1),
                 })
             except Exception as exc:
                 skipped.append({"OOS Start": anchor.date().isoformat(), "Model": label, "Reason": str(exc)[:260]})
-        if progress is not None:
-            progress((window_i + 1) / len(anchors))
+    if progress is not None:
+        progress(1.0)
     info = {
         "requested_start": download_start.date().isoformat(),
         "first_price": prices.index.min().date().isoformat(),
@@ -266,5 +295,12 @@ def run_rolling_robustness(
         "asset_columns": len(prices.columns),
         "candidate_windows": len(anchors),
         "factor_errors": factor_errors,
+        "models": models,
+        "market": market,
+        "benchmark": benchmark_ticker,
+        "currency": "USD" if market == "USA" else "EUR",
     }
-    return pd.DataFrame(records), pd.DataFrame(skipped), info
+    results = pd.DataFrame(records)
+    if not results.empty:
+        results["Currency"] = info["currency"]
+    return results, pd.DataFrame(skipped), info
