@@ -1,5 +1,6 @@
 """Market-aware Fama-French expected returns. Prices must be native currency."""
 import pandas as pd
+from src.eur_risk_free import ESTR_ONLY
 from src.fama_french import fit_ff3
 from src.factor_eur import convert_window_factors
 from src.fama_french_5 import fit_ff5
@@ -11,12 +12,12 @@ def factors_for_backtest_signal(factors, signal_date):
     return factors.loc[factors.index <= cutoff]
 
 
-def factor_sample(prices, factors, eurusd_prices, *, market):
+def factor_sample(prices, factors, eurusd_prices, *, market, eur_rf_mode=ESTR_ONLY):
     prices = prices.sort_index()
     if market == "Borsa Italiana":
         if eurusd_prices is None:
             raise ValueError("EURUSD required for European USD-denominated factors")
-        available = convert_window_factors(factors, eurusd_prices, prices)
+        available = convert_window_factors(factors, eurusd_prices, prices, eur_rf_mode=eur_rf_mode)
     elif market == "USA":
         available = factors.loc[factors.index < prices.index[-1]]
     else:
@@ -34,10 +35,10 @@ def factor_sample(prices, factors, eurusd_prices, *, market):
     return returns.loc[common], available.loc[common]
 
 
-def estimate_factor_returns(prices, factors, eurusd_prices=None, *, market, model, return_stats=False):
+def estimate_factor_returns(prices, factors, eurusd_prices=None, *, market, model, return_stats=False, eur_rf_mode=ESTR_ONLY):
     if model not in ("ff3", "ff5"):
         raise ValueError(f"Unsupported model: {model}")
-    returns, available = factor_sample(prices, factors, eurusd_prices, market=market)
+    returns, available = factor_sample(prices, factors, eurusd_prices, market=market, eur_rf_mode=eur_rf_mode)
     stats = (fit_ff3 if model == "ff3" else fit_ff5)(returns, available)
     column = f"{model.upper()} Expected Return USD"
     expected = stats[column].reindex(prices.columns)

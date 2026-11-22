@@ -9,6 +9,7 @@ import pandas as pd
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
+from src.eur_risk_free import ESTR_ONLY
 from src import backtest, factor_currency, factor_covariance, factor_eur, factors, optimization, returns, risk
 
 dates = pd.bdate_range("2024-01-01", periods=210)
@@ -43,6 +44,7 @@ path = ROOT / "app_core.py"
 wanted = {"run_fixed_horizon_engine", "_cost_adjusted_metrics", "build_benchmark_backtest"}
 tree = ast.parse(path.read_text())
 scope = {
+    "ESTR_ONLY": ESTR_ONLY,
     "np": np, "pd": pd, "get_prices": lambda *a, **kw: prices[["A"]],
     "FTSE_MIB_TICKER": "fixture", "calculate_returns": returns.calculate_returns,
     "annualized_returns": returns.annualized_returns, "covariance_matrix": risk.covariance_matrix,

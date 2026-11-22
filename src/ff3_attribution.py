@@ -5,6 +5,7 @@ return. Attribution is linked additively to the initial portfolio capital.
 """
 import numpy as np
 import pandas as pd
+from src.eur_risk_free import ESTR_ONLY
 from src.factor_eur import convert_factors_to_eur
 
 FF3_LOADINGS = {"Market": ("Market Beta", "MKT-RF"),
@@ -15,17 +16,17 @@ COMPONENTS = (*FF3_LOADINGS, 'Risk-free', 'Unexplained')
 MISSING_COMPONENT = 'Unattributed days'
 
 
-def compute_ff3_attribution(equity_eur, exposures, factors_usd, eurusd, *, rates=None, initial_capital=None):
+def compute_ff3_attribution(equity_eur, exposures, factors_usd, eurusd, *, rates=None, initial_capital=None, eur_rf_mode=ESTR_ONLY):
     return _compute_attribution(equity_eur, exposures, factors_usd, eurusd, FF3_LOADINGS,
-                                rates=rates, initial_capital=initial_capital)
+                                rates=rates, initial_capital=initial_capital, eur_rf_mode=eur_rf_mode)
 
 
-def compute_ff5_attribution(equity_eur, exposures, factors_usd, eurusd, *, rates=None, initial_capital=None):
+def compute_ff5_attribution(equity_eur, exposures, factors_usd, eurusd, *, rates=None, initial_capital=None, eur_rf_mode=ESTR_ONLY):
     return _compute_attribution(equity_eur, exposures, factors_usd, eurusd, FF5_LOADINGS,
-                                rates=rates, initial_capital=initial_capital)
+                                rates=rates, initial_capital=initial_capital, eur_rf_mode=eur_rf_mode)
 
 
-def _compute_attribution(equity_eur, exposures, factors_usd, eurusd, factor_loadings, *, rates, initial_capital):
+def _compute_attribution(equity_eur, exposures, factors_usd, eurusd, factor_loadings, *, rates, initial_capital, eur_rf_mode):
     components = (*factor_loadings, 'Risk-free', 'Unexplained')
     exposure_columns, factor_columns = map(list, zip(*factor_loadings.values()))
     if not isinstance(equity_eur, (pd.Series, pd.DataFrame)) or exposures is None:
@@ -46,7 +47,7 @@ def _compute_attribution(equity_eur, exposures, factors_usd, eurusd, factor_load
     factors = factors[~factors.index.duplicated(keep='last')].sort_index()
     # Convert only factor observations that genuinely exist. No factor extrapolation.
     factors = factors.loc[equity.index[0]:equity.index[-1]]
-    factors_eur = convert_factors_to_eur(factors, eurusd, rates=rates, min_observations=0)
+    factors_eur = convert_factors_to_eur(factors, eurusd, rates=rates, min_observations=0, eur_rf_mode=eur_rf_mode)
     fac = factors_eur.reindex(equity.index)
     interval_start = pd.Series(factors_eur.attrs['interval_starts'], dtype='datetime64[ns]')
     same_interval = equity.index.to_series().shift().eq(interval_start.reindex(equity.index))

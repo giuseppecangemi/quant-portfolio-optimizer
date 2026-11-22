@@ -28,6 +28,7 @@ from pathlib import Path
 
 from src.ff3_attribution import compute_ff3_attribution, compute_ff5_attribution
 from src.fama_french_5 import load_europe_ff5, load_us_ff5, fit_ff5, estimate_ff5_eur_returns
+from src.eur_risk_free import EONIA_ESTR, ESTR_ONLY
 from src.factor_currency import estimate_factor_returns, factors_for_backtest_signal
 from src.data import get_prices as _get_raw_prices
 from src.fama_french import (
@@ -527,6 +528,16 @@ def _saved_table(df, percentage_columns=None, money_columns=None):
         st.dataframe(df, use_container_width=True)
 
 
+def select_eur_rf_methodology(market, key):
+    if market != "Borsa Italiana":
+        return ESTR_ONLY
+    labels = {
+        ESTR_ONLY: "€STR only — Legacy baseline",
+        EONIA_ESTR: "EONIA → €STR — Extended historical coverage",
+    }
+    return st.selectbox("EUR Risk-Free Methodology", list(labels), format_func=labels.__getitem__, key=key)
+
+
 def add_factor_attributions(result, market, ff3_factors, ff5_factors, eurusd):
     if market == "USA":
         return
@@ -539,7 +550,7 @@ def add_factor_attributions(result, market, ff3_factors, ff5_factors, eurusd):
                 result[f"{strategy}_performance_attribution"] = compute(
                     result[f"{strategy}_bt"], result[f"{model}_factor_cov_exposure_history" if strategy != model
                                                          else f"{model}_factor_exposure_history"],
-                    factors, eurusd,
+                    factors, eurusd, eur_rf_mode=result.get("eur_rf_mode", ESTR_ONLY),
                 )
             except (ValueError, KeyError, TypeError) as error:
                 result[f"{strategy}_attribution_error"] = str(error)
@@ -1894,42 +1905,9 @@ def build_benchmark_backtest(
     initial_capital,
 ):
 
-    series = (
-        benchmark_prices.iloc[:, 0]
-        .copy()
-    )
+    from src.backtest_inputs import benchmark_curve
 
-    series = series.loc[
-        (series.index >= start_date)
-        & (series.index <= end_date)
-    ].dropna()
-
-    if len(series) < 2:
-        raise ValueError(
-            "Not enough FTSE MIB data "
-            "for the selected backtest period."
-        )
-
-    normalized_value = (
-        series / series.iloc[0]
-    ) * initial_capital
-
-    benchmark_backtest = pd.DataFrame(
-        {
-            "Portfolio Value":
-                normalized_value
-        }
-    )
-
-    benchmark_backtest["Daily Return"] = (
-        benchmark_backtest[
-            "Portfolio Value"
-        ]
-        .pct_change()
-        .fillna(0.0)
-    )
-
-    return benchmark_backtest
+    return benchmark_curve(benchmark_prices, start_date, end_date, initial_capital)
 
 
 def calculate_turnover(weights_history):
@@ -2083,6 +2061,7 @@ def run_fixed_horizon_engine(
     active_factors=("Momentum", "Risk"),
     market="Borsa Italiana",
     ml_configs=None,
+    eur_rf_mode=ESTR_ONLY,
 ):
     """
     Fixed-Horizon Backtest.
@@ -2215,7 +2194,7 @@ def run_fixed_horizon_engine(
     signal_ff3 = factors_for_backtest_signal(ff3_factors, signal_date)
     signal_ff5 = factors_for_backtest_signal(ff5_factors, signal_date)
     ff3_mu, ff3_stats = estimate_factor_returns(
-        estimation_prices, signal_ff3, eurusd_prices, market=market, model="ff3", return_stats=True
+        estimation_prices, signal_ff3, eurusd_prices, market=market, model="ff3", return_stats=True, eur_rf_mode=eur_rf_mode
     )
     ff3_mu = ff3_mu.reindex(covariance.index)
     ff3_weights = optimize_maximum_sharpe(
@@ -2223,7 +2202,7 @@ def run_fixed_horizon_engine(
     )
 
     ff5_mu, ff5_stats = estimate_factor_returns(
-        estimation_prices, signal_ff5, eurusd_prices, market=market, model="ff5", return_stats=True
+        estimation_prices, signal_ff5, eurusd_prices, market=market, model="ff5", return_stats=True, eur_rf_mode=eur_rf_mode
     )
     ff5_mu = ff5_mu.reindex(covariance.index)
     ff5_weights = optimize_maximum_sharpe(
@@ -2234,11 +2213,11 @@ def run_fixed_horizon_engine(
     from src.factor_covariance import estimate_factor_covariance, factor_risk_record
     ff3_factor_cov, ff3_risk = estimate_factor_covariance(
         estimation_prices, signal_ff3, model="ff3", eurusd_prices=eurusd_prices, market=market,
-        return_components=True,
+        return_components=True, eur_rf_mode=eur_rf_mode,
     )
     ff5_factor_cov, ff5_risk = estimate_factor_covariance(
         estimation_prices, signal_ff5, model="ff5", eurusd_prices=eurusd_prices, market=market,
-        return_components=True,
+        return_components=True, eur_rf_mode=eur_rf_mode,
     )
     ff3_factor_weights = optimize_maximum_sharpe(
         ff3_mu, ff3_factor_cov.reindex(index=covariance.index, columns=covariance.columns),
@@ -2679,6 +2658,7 @@ def run_fixed_horizon_engine(
         "ff5_factor_weights_history": ff5_factor_weights_history,
         "ff5_factor_cov_exposure_history": ff5_factor_cov_exposure_history,
         "ff5_factor_bt_metrics": ff5_factor_bt_metrics,
+        "eur_rf_mode": eur_rf_mode if market == "Borsa Italiana" else None,
         "ff3_bt": ff3_bt,
         "ff3_weights_history": ff3_weights_history,
         "ff3_bt_metrics": ff3_bt_metrics,
@@ -2805,8 +2785,17 @@ def run_backtest_engine(
     active_factors=("Momentum", "Risk"),
     market="Italia",
     ml_configs=None,
+    eur_rf_mode=ESTR_ONLY,
 ):
 
+    from src.backtest_inputs import prepare_walk_forward_window
+
+    prepared = prepare_walk_forward_window(
+        prices, lookback_days, selection_policy=selection_policy, models=(),
+        rebalance_days=rebalance_days, transaction_costs=transaction_costs,
+        risk_free_rate=risk_free_rate, max_weight=max_weight, top_n=selection_top_n, capital=capital,
+    )
+    prices = prepared.prices
     # Il benchmark viene condiviso tra le politiche e le strategie.
     if market_prices is None:
         market_prices = get_prices([FTSE_MIB_TICKER], period=benchmark_period)
@@ -2864,7 +2853,7 @@ def run_backtest_engine(
         ff3_weights_history,
     ) = backtest_portfolio(
         prices,
-        capture_initial_ex_ante=True, strategy="ff3_max_sharpe", market=market, initial_capital=capital,
+        capture_initial_ex_ante=True, strategy="ff3_max_sharpe", market=market, eur_rf_mode=eur_rf_mode, initial_capital=capital,
         lookback_days=lookback_days, rebalance_days=rebalance_days,
         risk_free_rate=risk_free_rate, max_weight=max_weight,
         selection_top_n=selection_top_n, selection_policy=selection_policy,
@@ -2883,7 +2872,7 @@ def run_backtest_engine(
     ff5_exposure_records = []
     ff5_bt, ff5_weights_history = backtest_portfolio(
         prices,
-        capture_initial_ex_ante=True, strategy="ff5_max_sharpe", market=market, initial_capital=capital,
+        capture_initial_ex_ante=True, strategy="ff5_max_sharpe", market=market, eur_rf_mode=eur_rf_mode, initial_capital=capital,
         lookback_days=lookback_days, rebalance_days=rebalance_days,
         risk_free_rate=risk_free_rate, max_weight=max_weight,
         selection_top_n=selection_top_n, selection_policy=selection_policy,
@@ -2899,7 +2888,7 @@ def run_backtest_engine(
     ff5_factor_records = []
     ff3_factor_bt, ff3_factor_weights_history = backtest_portfolio(
         prices,
-        capture_initial_ex_ante=True, strategy="ff3_factor_cov_max_sharpe", market=market,
+        capture_initial_ex_ante=True, strategy="ff3_factor_cov_max_sharpe", market=market, eur_rf_mode=eur_rf_mode,
         initial_capital=capital, lookback_days=lookback_days,
         rebalance_days=rebalance_days, risk_free_rate=risk_free_rate,
         max_weight=max_weight, selection_top_n=selection_top_n,
@@ -2911,7 +2900,7 @@ def run_backtest_engine(
     )
     ff5_factor_bt, ff5_factor_weights_history = backtest_portfolio(
         prices,
-        capture_initial_ex_ante=True, strategy="ff5_factor_cov_max_sharpe", market=market,
+        capture_initial_ex_ante=True, strategy="ff5_factor_cov_max_sharpe", market=market, eur_rf_mode=eur_rf_mode,
         initial_capital=capital, lookback_days=lookback_days,
         rebalance_days=rebalance_days, risk_free_rate=risk_free_rate,
         max_weight=max_weight, selection_top_n=selection_top_n,
@@ -3265,6 +3254,7 @@ def run_backtest_engine(
         "ff5_factor_weights_history": ff5_factor_weights_history,
         "ff5_factor_cov_exposure_history": ff5_factor_cov_exposure_history,
         "ff5_factor_bt_metrics": ff5_factor_bt_metrics,
+        "eur_rf_mode": eur_rf_mode if market == "Borsa Italiana" else None,
         "ff3_bt": ff3_bt,
         "ff3_weights_history": ff3_weights_history,
         "ff3_bt_metrics": ff3_bt_metrics,
@@ -3520,6 +3510,8 @@ def render_backtest_parameters(result, lookback_label, backtest_period_label, re
         ("Backtest Start", start),
         ("Effective Backtest", f"{start} → {end}"),
     )
+    if result.get("eur_rf_mode"):
+        fields += (("EUR Risk-Free Methodology", result["eur_rf_mode"]),)
     items = "".join(
         f"<div><dt>{label}</dt><dd>{escape(str(value))}</dd></div>"
         for label, value in fields
@@ -3713,6 +3705,24 @@ def display_backtest_results(
         st.info("These results predate FF3 backtesting. Run Backtests again to include FF3.")
         return
 
+    from src.benchmark_ui import render_benchmark_details
+    from src.benchmarks import LEGACY_BENCHMARK, benchmark_label, benchmark_run_label
+
+    benchmark_selection = result.get("selected_benchmarks", [LEGACY_BENCHMARK])
+    etf_runs = result.get("etf_benchmarks", {})
+    observed_only = any(run.get("status") == "COMPLETE_WITH_IMPUTATION" for run in etf_runs.values()) and st.checkbox(
+        "Observed benchmark prices only", key=f"{result_key}_observed_benchmark",
+    )
+    if observed_only:
+        etf_runs = {name: run for name, run in etf_runs.items()
+                    if run.get("status") != "COMPLETE_WITH_IMPUTATION"}
+    show_index = LEGACY_BENCHMARK in benchmark_selection
+    index_label = (benchmark_label(LEGACY_BENCHMARK, result["benchmark_market"])
+                   if "benchmark_market" in result else LEGACY_BENCHMARK)
+
+    value_currency = "USD" if result.get("benchmark_market") == "USA" else "EUR"
+    value_symbol = "$" if value_currency == "USD" else "€"
+
     st.header(title)
 
     st.caption(description)
@@ -3780,7 +3790,7 @@ def display_backtest_results(
         metrics["Benchmark Excess Return"] = metrics["Total Return"] - result["ftse_bt_metrics"]["Total Return"]
         comparison = pd.concat([comparison, pd.DataFrame([metrics], index=[name])])
     if result.get("ml_runs"):
-        st.caption("ML and Monte Carlo estimators are refit at historical decisions. The FTSE MIB price index excludes dividends. "
+        st.caption("ML and Monte Carlo estimators are refit at historical decisions. "
                    "Current universe membership can introduce survivorship bias.")
 
     selected_names = result.get("selected_strategies")
@@ -3792,6 +3802,15 @@ def display_backtest_results(
     if overlays:
         overlay_rows = pd.DataFrame({run["label"]: run["metrics"] for run in overlays.values()}).T
         comparison = pd.concat([comparison, overlay_rows])
+
+    if show_index:
+        comparison = comparison.rename(index={LEGACY_BENCHMARK: index_label})
+    else:
+        comparison = comparison.drop(index=LEGACY_BENCHMARK, errors="ignore")
+    if etf_runs:
+        comparison = pd.concat([comparison, pd.DataFrame({
+            benchmark_run_label(name, run): run["metrics"] for name, run in etf_runs.items()
+        }).T])
 
     percentage_columns = [
         column
@@ -3824,7 +3843,7 @@ def display_backtest_results(
 
         if column == "Final Value":
             comparison_format[column] = (
-                "€{:,.2f}"
+                value_symbol + "{:,.2f}"
             )
 
     render_terminal_table(comparison, comparison_format, index_label="Strategy",
@@ -3834,12 +3853,8 @@ def display_backtest_results(
         from src.backtest_overlay_ui import render_overlay_details
         render_overlay_details(overlays, result_key, render_terminal_table)
 
-    st.caption(
-        "The selected benchmark is shown as a passive buy-and-hold "
-        "benchmark starting from the same date and "
-        "capital as the portfolio strategies."
-    )
-
+    render_benchmark_details(result, result.get("risk_free_rate", risk_free_rate), selected_names,
+                             observed_only=observed_only)
 
     # =====================================================
     # PORTFOLIO GROWTH
@@ -3976,9 +3991,20 @@ def display_backtest_results(
         portfolio_fig.add_scatter(x=curve.index, y=curve["Portfolio Value"], mode="lines",
                          name=run["label"], line=dict(dash="dash", color=color), legendgroup=run["base"])
 
+    if show_index:
+        for trace in portfolio_fig.data:
+            if trace.name == LEGACY_BENCHMARK:
+                trace.name = index_label
+    else:
+        portfolio_fig.data = tuple(trace for trace in portfolio_fig.data if trace.name != LEGACY_BENCHMARK)
+    for name, run in etf_runs.items():
+        curve = run["curve"]
+        portfolio_fig.add_scatter(x=curve.index, y=curve["Portfolio Value"], name=benchmark_run_label(name, run), mode="lines",
+                         line=dict(dash="dot"))
+
     portfolio_fig.update_layout(
         xaxis_title="Date",
-        yaxis_title="Portfolio Value (€)",
+        yaxis_title=f"Portfolio Value ({value_currency})",
         hovermode="x unified",
         legend_title="Strategy",
     )
@@ -3992,8 +4018,8 @@ def display_backtest_results(
     )
 
     portfolio_fig.update_yaxes(
-        title_text="Portfolio Value (€)",
-        tickprefix="€",
+        title_text=f"Portfolio Value ({value_currency})",
+        tickprefix=value_symbol,
         tickformat=",.0f",
         showline=True,
         linecolor="rgba(255, 255, 255, 0.45)",
@@ -4006,7 +4032,7 @@ def display_backtest_results(
         line_dash="dash",
         line_width=1,
         line_color="rgba(255, 255, 255, 0.45)",
-        annotation_text=f"Initial Capital · €{result['capital']:,.0f}",
+        annotation_text=f"Initial Capital · {value_symbol}{result['capital']:,.0f}",
         annotation_position="top left",
     )
 
@@ -4170,6 +4196,17 @@ def display_backtest_results(
         color = base_trace.line.color if base_trace else None
         drawdown_fig.add_scatter(x=curve.index, y=calculate_drawdown(curve), mode="lines",
                          name=run["label"], line=dict(dash="dash", color=color), legendgroup=run["base"])
+
+    if show_index:
+        for trace in drawdown_fig.data:
+            if trace.name == LEGACY_BENCHMARK:
+                trace.name = index_label
+    else:
+        drawdown_fig.data = tuple(trace for trace in drawdown_fig.data if trace.name != LEGACY_BENCHMARK)
+    for name, run in etf_runs.items():
+        curve = run["curve"]
+        drawdown_fig.add_scatter(x=curve.index, y=calculate_drawdown(curve), name=benchmark_run_label(name, run), mode="lines",
+                         line=dict(dash="dot"))
 
     drawdown_fig.update_layout(
         hovermode="x unified",
@@ -6309,7 +6346,7 @@ def render_fama_french_model(model, tickers, market, capital, max_weight,
     st.subheader(f"Fama–French {'Three' if model == 'FF3' else 'Five'}-Factor Model")
     st.caption(
         f"Region-specific daily {factor_names} from the Kenneth French Data Library. "
-        "European factors are converted to EUR using EURUSD and €STR."
+        "European factors use EUR/USD and the selected EUR overnight series."
     )
     with st.container(key=f"kangemi_controls_{code}"):
         window, covariance_control, action = st.columns([2, 2, 1], vertical_alignment="bottom")
@@ -6319,6 +6356,7 @@ def render_fama_french_model(model, tickers, market, capital, max_weight,
             "Covariance", ["Historical", "Factor Cov"], default="Historical",
             required=True, key=f"{code}_covariance",
         )
+    eur_rf_mode = select_eur_rf_methodology(market, f"{code}_eur_rf_methodology")
     use_factor_cov = covariance_choice == "Factor Cov"
     result_key = f"{code}_factor_results" if use_factor_cov else f"{code}_results"
 
@@ -6330,11 +6368,11 @@ def render_fama_french_model(model, tickers, market, capital, max_weight,
                 factors = loaders[0 if market == "USA" else 1]()
                 fx = None if market == "USA" else get_prices(["EURUSD=X"], period=period)
                 expected, stats = estimate_factor_returns(prices, factors, fx, market=market,
-                                                         model=code, return_stats=True)
+                                                         model=code, return_stats=True, eur_rf_mode=eur_rf_mode)
                 if use_factor_cov:
                     from src.factor_covariance import estimate_factor_covariance
                     covariance = estimate_factor_covariance(
-                        prices, factors, model=code, eurusd_prices=fx, market=market
+                        prices, factors, model=code, eurusd_prices=fx, market=market, eur_rf_mode=eur_rf_mode
                     )
                 else:
                     covariance = covariance_matrix(calculate_returns(prices))
@@ -6346,6 +6384,7 @@ def render_fama_french_model(model, tickers, market, capital, max_weight,
                 table = prepare_portfolio_table(weights, prices, capital, use_fractional_shares)
                 st.session_state[result_key] = {
                     "period": period, "stats": stats, "expected_returns_eur": expected,
+                    "eur_rf_mode": eur_rf_mode if market == "Borsa Italiana" else None,
                     "prices": prices,
                     "selection_configuration": capture_portfolio_configuration(tickers, market),
                     "optimized_at": pd.Timestamp.now(tz="UTC").isoformat(), "max_weight": max_weight,
@@ -6373,6 +6412,8 @@ def render_fama_french_result(model, result, capital, use_factor_cov):
     title = f"{model} Factor Cov" if use_factor_cov else f"{model} Historical Cov"
     st.markdown(f"#### {title} — Maximum Sharpe Portfolio")
     st.caption(factor_estimation_caption(model, result))
+    if result.get("eur_rf_mode"):
+        st.caption(f"EUR risk-free methodology · {result['eur_rf_mode']}")
     for column, (label, value, color) in zip(st.columns(3), (
         ("Expected Return", f"{result['return']:.2%}", "green"),
         ("Volatility", f"{result['volatility']:.2%}", "red"),
@@ -6980,19 +7021,44 @@ with robustness_tab:
         )
         rb_cost_preset = st.selectbox("Cost scenario", ["None", *PRESETS],
                                      index=["None", *PRESETS].index("Base"), key="rb_cost_preset")
+        from src.benchmark_ui import benchmark_details, select_benchmarks
+        from src.benchmarks import benchmark_label
+
+        rb_eur_rf_mode = select_eur_rf_methodology(market, "rb_eur_rf_methodology")
+        rb_benchmarks = select_benchmarks(market, "rb_benchmarks")
         rb_assumption = PRESETS.get(rb_cost_preset)
         st.caption(
             "Historical screening uses Momentum and Risk. FF3 and FF5 use the same "
-            "two-calendar-month publication buffer as the main backtests. EUR factor windows require €STR coverage."
+            "two-calendar-month publication buffer as the main backtests."
         )
         _, rb_action, _ = st.columns([1, 2, 1])
         run_robustness = rb_action.button("Run Rolling Robustness", type="primary", key="rb_run", width="stretch")
 
+    from src.benchmark_ui import render_coverage, render_run_provenance
+    from src.run_provenance import configuration_snapshot, new_attempt
+
+    rb_snapshot = configuration_snapshot(dict(
+        market=market, benchmark_ticker=FTSE_MIB_TICKER, start_year=rb_start, end_year=rb_end,
+        estimation_years=rb_est, horizon_months=rb_horizon, step_months=rb_step, top_n=rb_top,
+        selection_policy=rb_policy, rebalance_days=rb_rebalance, capital=capital,
+        risk_free_rate=risk_free_rate, max_weight=max_weight, models=rb_models_selected, eur_rf_mode=rb_eur_rf_mode,
+        transaction_costs=rb_cost_preset, benchmarks=rb_benchmarks,
+        tickers=market_instruments["ticker"].dropna().astype(str).tolist(),
+    ))
     if run_robustness:
+        rb_attempt = new_attempt("Robustness Analysis", rb_snapshot)
+        rb_attempt.update(provider_start=f"{rb_start}-01-01", provider_end=f"{rb_end}-12-31")
+        st.session_state["rb_benchmark_attempt"] = rb_attempt
         if rb_start > rb_end:
-            st.error("First OOS year must not exceed the last OOS year.")
+            rb_error = "First OOS year must not exceed the last OOS year."
+        elif not rb_benchmarks:
+            rb_error = "Select at least one benchmark."
         elif not rb_models_selected:
-            st.error("Select at least one portfolio model.")
+            rb_error = "Select at least one portfolio model."
+        else:
+            rb_error = None
+        if rb_error:
+            rb_attempt.update(error=rb_error, status="FAILED")
         else:
             try:
                 rb_tickers = market_instruments["ticker"].dropna().astype(str).tolist()
@@ -7009,26 +7075,60 @@ with robustness_tab:
                         capital=capital, risk_free_rate=risk_free_rate,
                         max_weight=max_weight, market=market, models=rb_models_selected,
                         progress=lambda value: rb_progress.progress(value),
-                        transaction_costs=rb_assumption,
+                        transaction_costs=rb_assumption, benchmarks=rb_benchmarks, eur_rf_mode=rb_eur_rf_mode,
                     )
                 rb_progress.empty()
+                if rb_results.empty:
+                    rb_attempt.update(error="No windows completed. See Diagnostics.", status="FAILED")
+                rb_info["run_provenance"] = {**rb_attempt, **{
+                    name: rb_info.get(name) for name in ("oos_start", "oos_end", "provider_start", "provider_end")
+                }}
                 st.session_state["robustness_run"] = (rb_results, rb_skipped, rb_info)
             except Exception as exc:
-                st.error(f"Robustness run failed: {exc}")
+                rb_attempt.update(error=str(exc), status="FAILED")
 
-    if "robustness_run" in st.session_state:
-        rb_results, rb_skipped, rb_info = st.session_state["robustness_run"]
+    saved_robustness = st.session_state.get("robustness_run")
+    render_run_provenance(saved_robustness[2].get("run_provenance") if saved_robustness else None,
+                          rb_snapshot, st.session_state.get("rb_benchmark_attempt"))
+    if saved_robustness:
+        rb_results, rb_skipped, rb_info = saved_robustness
+        if not rb_info.get("run_provenance"):
+            st.warning("Previous Robustness result has no run metadata. Run again for traceable diagnostics.")
+        render_coverage(rb_info.get("coverage_reports", []), rb_info.get("benchmark_diagnostics", []),
+                        rb_info.get("benchmark_endpoints", []), "robustness", rb_info.get("run_provenance"))
         st.caption(
             f"Downloaded history: {rb_info['first_price']} to {rb_info['last_price']} · "
             f"Universe: {rb_info['asset_columns']} tickers with some data · "
             f"Candidate windows: {rb_info['candidate_windows']} · "
             f"Benchmark: {rb_info.get('benchmark', 'FTSE MIB')}"
         )
+        if rb_info.get("eur_rf_mode"):
+            sources = " · ".join(rb_info.get("eur_rf_sources", []))
+            st.caption(" · ".join(filter(None, ("EUR risk-free methodology", rb_info["eur_rf_mode"], sources))))
+        st.caption("This run uses the local instrument catalog and available Yahoo history. "
+                   "Historical membership and delisting return coverage are unverified.")
+        rf_windows = rb_info.get("window_status")
+        if rf_windows:
+            with st.expander("Requested OOS windows and data availability"):
+                st.dataframe(pd.DataFrame(rf_windows), hide_index=True, width="stretch")
         if not rb_results.empty:
             rb_results = rb_results.replace({"Model": {"FTSE MIB": "Benchmark"}}).rename(columns={
                 "Transaction Costs EUR": "Transaction Costs", "Traded Notional EUR": "Traded Notional",
             })
-        rb_models = [*rb_info.get("models", ["CAPM", "FF3", "FF5", "Equal Weight"]), "Benchmark"]
+        rb_portfolios = rb_info.get("models", ["CAPM", "FF3", "FF5", "Equal Weight"])
+        rb_benchmark_names = rb_info.get("selected_benchmarks", ["Benchmark"])
+        rb_market = rb_info.get("market", market)
+        coverage_rows = []
+        for name in rb_benchmark_names:
+            coverage = rb_info.get("benchmark_coverage", {}).get(name, (None, None))
+            count = (rb_results.loc[rb_results["Model"].eq(name), "OOS Start"].nunique()
+                     if not rb_results.empty else 0)
+            coverage_rows.append({
+                "Benchmark": benchmark_label(name, rb_market), "Instrument": benchmark_details(name),
+                "Return Currency": rb_info.get("currency", "EUR"),
+                "Available From": coverage[0], "Available Through": coverage[1], "Available Windows": count,
+            })
+        st.dataframe(pd.DataFrame(coverage_rows), hide_index=True, width="stretch")
         style_backtest_analysis_tabs()
         with st.container(key="backtest_analysis_tabs_robustness"):
             overview_tab, cost_tab, windows_tab, diagnostics_tab = st.tabs(
@@ -7038,61 +7138,84 @@ with robustness_tab:
         if overview_tab.open:
             with overview_tab:
                 if not rb_results.empty:
-                    rb_available = rb_results[rb_results["Model"].isin(rb_models)].copy()
+                    from src.robustness_comparison import absolute_rows, matched_sample, performance_summary, relative_summary
+
                     basis = st.segmented_control("Return basis", ["Net", "Gross"], default="Net",
                                                  required=True, key="rb_return_basis")
-                    if basis == "Net":
-                        for metric in ("Total Return", "Sharpe Ratio", "Max Drawdown"):
-                            rb_available[metric] = rb_available[f"Net {metric}"]
-                        rb_available["Excess OOS Return"] = rb_available["Total Return"] - rb_available["Benchmark Return"]
-                    else:
-                        rb_available["Excess OOS Return"] = rb_available["Excess Return"]
-                    rb_available = rb_available.dropna(subset=["Total Return", "Sharpe Ratio", "Max Drawdown"])
-                    rb_complete_dates = (
-                        rb_available.groupby("OOS Start")["Model"]
-                        .agg(lambda x: set(rb_models).issubset(set(x)))
+                    formats = {field: "{:.2%}" for field in (
+                        "Mean Return", "Median Return", "Positive Rate", "Mean Drawdown", "Worst Drawdown",
+                    )}
+                    formats.update({"Mean Sharpe": "{:.2f}", "Median Sharpe": "{:.2f}"})
+                    st.subheader("Absolute OOS Performance")
+                    completed = absolute_rows(rb_results, rb_portfolios, basis)
+                    st.caption("Each model uses all its completed OOS windows and its original portfolio NAV.")
+                    st.dataframe(performance_summary(completed).style.format(formats, na_rep="—"), width="stretch")
+
+                    st.subheader("Benchmark-Matched Comparison")
+                    mode = st.radio("Comparison sample", ["Pairwise", "Common Sample"], horizontal=True,
+                                    key="rb_sample_mode")
+                    reference = st.selectbox(
+                        "Comparison benchmark" if mode == "Pairwise" else "Benchmark for charts",
+                        rb_benchmark_names, format_func=lambda name: benchmark_label(name, rb_market),
+                        key="rb_comparison_benchmark",
                     )
-                    rb_complete_dates = rb_complete_dates[rb_complete_dates].index
-                    rb_common = rb_available[rb_available["OOS Start"].isin(rb_complete_dates)].copy()
-                    for column, (label, value, color) in zip(st.columns(3), (
+                    references = [reference] if mode == "Pairwise" else rb_benchmark_names
+                    observed_only = st.checkbox("Observed benchmark prices only", key="rb_observed_benchmark")
+                    rb_models = [*rb_portfolios, *references]
+                    rb_common, relative, excluded, sessions = (pd.DataFrame() for _ in range(4))
+                    if "portfolio_nav" in rb_info:
+                        rb_common, relative, excluded, sessions = matched_sample(
+                            rb_results, rb_info, rb_portfolios, references, basis, observed_only=observed_only,
+                        )
+                    else:
+                        st.info("Run Robustness again to capture the dated NAV needed for this comparison.")
+                    all_models_count = (completed.groupby("OOS Start")["Model"].nunique() == len(rb_portfolios)).sum()
+                    common_count = 0 if sessions.empty else sessions["OOS Start"].nunique()
+                    for column, (label, value, color) in zip(st.columns(4), (
                         ("Candidate Windows", rb_info["candidate_windows"], "blue"),
-                        ("Common Windows", len(rb_complete_dates), "green"),
-                        ("Portfolios Selected", len(rb_models) - 1, "purple"),
+                        ("Model-Complete Windows", all_models_count, "purple"),
+                        ("Common Windows", common_count, "green"),
+                        ("Matched Session Marks", len(sessions), "blue"),
                     )):
                         with column:
                             colored_metric(label, str(value), color)
-                    st.subheader("Like-for-like comparison (same OOS windows)")
+                    names = {name: benchmark_label(name, rb_market) for name in references}
                     st.caption(
-                        f"{len(rb_complete_dates)} common windows across the selected portfolios and benchmark; "
-                        "missing-model windows are excluded only from this comparison, not from the raw results."
+                        "Benchmarks: " + ", ".join(names.values()) + ". All legs use the same NAV marks within each "
+                        "window. Matched Sharpe uses the existing 252-period convention, including returns that "
+                        "span a skipped session. Tracking error and information ratio use consecutive portfolio sessions."
                     )
+                    if not excluded.empty:
+                        with st.expander(f"Excluded windows ({len(excluded)})"):
+                            st.dataframe(excluded, hide_index=True, width="stretch")
                     if not rb_common.empty:
-                        rb_common["Positive Window"] = rb_common["Total Return"] > 0
-                        summary = rb_common.groupby("Model").agg(
-                            Windows=("Total Return", "count"),
-                            Median_Return=("Total Return", "median"),
-                            Mean_Return=("Total Return", "mean"),
-                            Positive_Rate=("Positive Window", "mean"),
-                            Median_Sharpe=("Sharpe Ratio", "median"),
-                            Worst_Drawdown=("Max Drawdown", "min"),
-                        )
-                        benchmark_returns = rb_common.loc[
-                            rb_common["Model"] == "Benchmark", ["OOS Start", "Total Return"]
-                        ].set_index("OOS Start")["Total Return"]
-                        rb_common["Benchmark OOS Return"] = rb_common["OOS Start"].map(benchmark_returns)
-                        rb_common["Outperformance"] = rb_common["Total Return"] > rb_common["Benchmark OOS Return"]
-                        rb_common["Excess OOS Return"] = rb_common["Total Return"] - rb_common["Benchmark OOS Return"]
-                        extra = rb_common.groupby("Model").agg(
-                            Benchmark_Win_Rate=("Outperformance", "mean"),
-                            Mean_Excess_Return=("Excess OOS Return", "mean"),
-                        )
-                        summary = summary.join(extra).reindex(rb_models)
-                        render_terminal_table(summary, {
-                            "Median_Return": "{:.2%}", "Mean_Return": "{:.2%}",
-                            "Positive_Rate": "{:.1%}", "Benchmark_Win_Rate": "{:.1%}",
-                            "Mean_Excess_Return": "{:+.2%}",
-                            "Median_Sharpe": "{:.2f}", "Worst_Drawdown": "{:.2%}",
-                        }, index_label="Model", signed=("Median_Return", "Mean_Return", "Worst_Drawdown"))
+                        st.dataframe(performance_summary(rb_common).rename(index=names).style.format(formats, na_rep="—"),
+                                     width="stretch")
+                        imputed = sessions["Interpolated Benchmarks"].ne("")
+                        if imputed.any():
+                            st.caption(f"{int(imputed.sum())} matched session marks include interpolated ETF quotes.")
+                        with st.expander("Matched sessions by window"):
+                            session_summary = sessions.groupby("OOS Start").agg(
+                                First=("Session", "min"), Last=("Session", "max"), Sessions=("Session", "count"),
+                            )
+                            st.dataframe(session_summary, width="stretch")
+                            st.download_button("Download exact matched sessions (CSV)", sessions.to_csv(index=False),
+                                               "robustness_matched_sessions.csv", mime="text/csv")
+                        relative["Benchmark"] = relative["Benchmark"].replace(names)
+                        st.dataframe(relative_summary(relative).style.format({
+                            "Benchmark Win Rate": "{:.2%}", "Mean Excess Return": "{:+.2%}",
+                            "Mean Matched minus Original": "{:+.2%}",
+                        }), width="stretch")
+                        with st.expander("Per-window original and matched returns"):
+                            st.dataframe(relative.style.format({
+                                **dict.fromkeys(["Original Return", "Matched Return", "Matched minus Original",
+                                                 "Benchmark Return", "Excess Return", "Tracking Error"], "{:.2%}"),
+                                "Information Ratio": "{:.2f}",
+                            }, na_rep="—"), hide_index=True, width="stretch")
+                            st.download_button("Download per-window comparisons (CSV)", relative.to_csv(index=False),
+                                               "robustness_matched_returns.csv", mime="text/csv")
+                        focal_returns = rb_common.loc[rb_common["Model"].eq(reference)].set_index("OOS Start")["Total Return"]
+                        rb_common["Excess OOS Return"] = rb_common["Total Return"] - rb_common["OOS Start"].map(focal_returns)
                         # Risk diagnostics are descriptive and use the same completed OOS
                         # windows for the selected portfolios. No financial engine changes.
                         st.subheader("Risk-adjusted performance — common windows")
@@ -7189,7 +7312,7 @@ with robustness_tab:
                             "These are selected mechanically, not predefined crisis labels. "
                             "With overlapping windows, observations are not independent."
                         )
-                        rb_stress_dates = rb_return_wide["Benchmark"].nsmallest(3).index
+                        rb_stress_dates = rb_return_wide[reference].nsmallest(3).index
                         rb_stress = rb_common[rb_common["OOS Start"].isin(rb_stress_dates)].copy()
                         rb_stress["OOS Start"] = rb_stress["OOS Start"].astype(str)
                         rb_stress = rb_stress[["OOS Start", "Model", "Total Return", "Sharpe Ratio", "Max Drawdown"]]
@@ -7213,9 +7336,9 @@ with robustness_tab:
                         ).reindex(columns=rb_models)
                         st.line_chart(chart_data * 100, y_label="Total Return (%)")
                         st.subheader("Excess return vs benchmark — common windows")
-                        excess_chart = rb_common[rb_common["Model"] != "Benchmark"].pivot_table(
+                        excess_chart = rb_common[rb_common["Model"].isin(rb_portfolios)].pivot_table(
                             index="OOS Start", columns="Model", values="Excess OOS Return"
-                        ).reindex(columns=rb_models[:-1])
+                        ).reindex(columns=rb_portfolios)
                         st.bar_chart(excess_chart * 100, y_label="Excess Return (percentage points)")
                     else:
                         st.warning("No windows contain all selected portfolios and the benchmark. Review skipped-window diagnostics.")
@@ -7223,13 +7346,13 @@ with robustness_tab:
                     st.info("No completed windows are available. See Diagnostics.")
         if cost_tab.open:
             with cost_tab:
-                if not rb_results.empty and rb_results["Model"].ne("Benchmark").any():
+                if not rb_results.empty and rb_results["Model"].isin(rb_portfolios).any():
                     st.caption(
                         "Cost-adjusted results are computed from actual changes in target holdings at each "
                         "rebalance. The benchmark has no simulated trading costs. "
                         "All figures are historical scenario estimates, not executable trade confirmations."
                     )
-                    rb_cost_rows = rb_results[rb_results["Model"] != "Benchmark"].copy()
+                    rb_cost_rows = rb_results[rb_results["Model"].isin(rb_portfolios)].copy()
                     rb_cost_rows["Return drag (pp)"] = (
                         rb_cost_rows["Total Return"] - rb_cost_rows["Net Total Return"]
                     ) * 100
@@ -7242,7 +7365,7 @@ with robustness_tab:
                         Return_Drag_pp=("Return drag (pp)", "mean"),
                         Net_Sharpe=("Net Sharpe Ratio", "mean"),
                         Net_Drawdown=("Net Max Drawdown", "mean"),
-                    ).reindex([model for model in rb_models if model != "Benchmark" and model in rb_cost_rows["Model"].values])
+                    ).reindex([model for model in rb_portfolios if model in rb_cost_rows["Model"].values])
                     currency = "$" if rb_info.get("market") == "USA" else "€"
                     render_terminal_table(rb_cost_summary.rename(columns={"Mean_Cost": "Mean Cost"}), {
                         "Gross_Return": "{:+.2%}", "Net_Return": "{:+.2%}",
@@ -7584,6 +7707,10 @@ with backtest_tab:
                 f"slippage: {bt_cost_assumptions.slippage_bps:g} bps. "
                 "Italian transaction tax and capital gains taxes excluded."
             )
+    from src.benchmark_ui import prepare_result_benchmarks, select_benchmarks
+
+    bt_eur_rf_mode = select_eur_rf_methodology(market, "bt_eur_rf_methodology")
+    bt_benchmarks = select_benchmarks(market, "bt_benchmarks", default="iShares MSCI ACWI ETF")
     from src.backtest_overlay import build_overlay_variants
     from src.backtest_overlay_ui import overlay_controls
 
@@ -7595,18 +7722,38 @@ with backtest_tab:
     # RUN SELECTED BACKTESTS
     # =====================================================
 
+    from src.benchmark_ui import render_run_provenance
+    from src.run_provenance import configuration_snapshot, new_attempt
+
+    bt_snapshot = configuration_snapshot(dict(
+        market=market, tickers=tickers, capital=capital, risk_free_rate=risk_free_rate,
+        max_weight=max_weight, selection_mode=selection_mode,
+        quant_factors=quant_factors if selection_mode == "Quant Selection" else None,
+        run_standard=run_standard, run_fixed=run_fixed, standard_period=standard_period,
+        standard_lookback=standard_lookback_days, standard_oos=standard_oos_days,
+        standard_rebalance=standard_rebalance_days, policies=standard_selection_policy_labels,
+        fixed_lookback=fixed_lookback_days, fixed_horizon=fixed_backtest_days,
+        costs=bt_cost_choice, benchmarks=bt_benchmarks, ml=ml_configs, eur_rf_mode=bt_eur_rf_mode,
+        selected=selected_strategies, overlay_selected=overlay_selected,
+        overlay_models=overlay_models, overlay_settings=overlay_settings,
+    ))
     if run_backtests:
-
-        if not run_standard and not run_fixed:
-
-            st.warning(
-                "Select at least one backtest methodology."
-            )
-
-        elif validate_portfolio(
-            tickers,
-            max_weight,
-        ):
+        sections = [section for enabled, section in ((run_standard, "Standard Walk-Forward"),
+                    (run_fixed, "Fixed Horizon")) if enabled] or ["Backtesting"]
+        attempts = {section: new_attempt(section, bt_snapshot) for section in sections}
+        st.session_state["bt_benchmark_attempts"] = attempts
+        if not bt_benchmarks:
+            bt_error = "Select at least one benchmark."
+        elif not run_standard and not run_fixed:
+            bt_error = "Select at least one backtest methodology."
+        elif not validate_portfolio(tickers, max_weight):
+            bt_error = "Portfolio validation failed."
+        else:
+            bt_error = None
+        if bt_error:
+            for attempt in attempts.values():
+                attempt.update(error=bt_error, status="FAILED")
+        else:
 
             shared_ff3_factors = None
             shared_ff5_factors = None
@@ -7736,19 +7883,23 @@ with backtest_tab:
                                 if any(f in quant_factors for f in ("Value", "Quality")) else None
                             )
                         standard_results = {}
-                        standard_market_prices = get_prices(
-                            [FTSE_MIB_TICKER], period=standard_period
+                        from src.backtest_inputs import prepare_market_inputs
+
+                        standard_inputs, factor_errors = prepare_market_inputs(
+                            standard_prices, lambda: get_prices([FTSE_MIB_TICKER], period=standard_period),
+                            market=market, families=("FF3", "FF5"),
+                            ff3=shared_ff3_factors, ff5=shared_ff5_factors, fx=shared_eurusd,
+                            fetch_fx=lambda: get_prices(["EURUSD=X"], period="10y"),
+                            fundamentals=historical_fundamentals if selection_mode == "Quant Selection" else None,
                         )
-                        # FF3: scarica fattori e FX una sola volta per entrambe le policy.
-                        if shared_ff3_factors is None:
-                            shared_ff3_factors = (load_us_ff3() if market == "USA" else load_europe_ff3())
-                        if market != "USA" and shared_eurusd is None:
-                            shared_eurusd = get_prices(["EURUSD=X"], period="10y")
-                        if shared_ff5_factors is None:
-                            shared_ff5_factors = (load_us_ff5() if market == "USA" else load_europe_ff5())
-                        standard_ff5_factors = shared_ff5_factors
-                        standard_ff3_factors = shared_ff3_factors
-                        standard_eurusd = shared_eurusd
+                        if factor_errors:
+                            raise ValueError("; ".join(f"{family}: {error}" for family, error in factor_errors.items()))
+                        shared_ff3_factors, shared_ff5_factors, shared_eurusd = (
+                            standard_inputs.ff3, standard_inputs.ff5, standard_inputs.fx,
+                        )
+                        standard_ff3_factors, standard_ff5_factors, standard_eurusd = (
+                            shared_ff3_factors, shared_ff5_factors, shared_eurusd,
+                        )
                         # Un'unica cache per entrambe le politiche e le sette strategie.
                         standard_shared_cache = {}
 
@@ -7763,7 +7914,7 @@ with backtest_tab:
                                 tickers=tickers,
                                 transaction_costs=bt_cost_assumptions,
                                 ml_configs=ml_configs,
-                                prices=standard_prices,
+                                prices=standard_inputs.prices,
                                 lookback_days=effective_standard_lookback_days,
                                 rebalance_days=standard_rebalance_days,
                                 risk_free_rate=risk_free_rate,
@@ -7773,15 +7924,15 @@ with backtest_tab:
                                 benchmark_period=standard_period,
                                 selection_top_n=backtest_selection_top_n,
                                 selection_policy=policy,
-                                market_prices=standard_market_prices,
+                                market_prices=standard_inputs.benchmark,
                                 shared_window_cache=standard_shared_cache,
-                                historical_fundamentals=historical_fundamentals if selection_mode == "Quant Selection" else None,
+                                historical_fundamentals=standard_inputs.fundamentals,
                                 selection_audit=selection_audit if selection_mode == "Quant Selection" else None,
                                 active_factors=quant_factors if selection_mode == "Quant Selection" else ("Momentum", "Risk"),
                                 ff3_factors=standard_ff3_factors,
                                 ff5_factors=standard_ff5_factors,
                                 eurusd_prices=standard_eurusd,
-                                market=market,
+                                market=market, eur_rf_mode=bt_eur_rf_mode,
                             )
 
                             if selection_mode == "Quant Selection":
@@ -7820,16 +7971,15 @@ with backtest_tab:
                                     standard_result, overlay_selected, overlay_models, risk_free_rate,
                                     prices=standard_overlay_prices, **overlay_settings,
                                 )
+                            standard_result["run_provenance"] = dict(attempts["Standard Walk-Forward"])
+                            prepare_result_benchmarks(standard_result, bt_benchmarks, market, risk_free_rate)
                             standard_results[policy] = standard_result
 
                         st.session_state["standard_backtest_results"] = standard_results
 
                 except Exception as e:
 
-                    st.error(
-                        "Standard Walk-Forward "
-                        f"backtest failed: {e}"
-                    )
+                    attempts["Standard Walk-Forward"].update(error=str(e), status="FAILED")
 
 
             # =================================================
@@ -7918,7 +8068,7 @@ with backtest_tab:
                                 ff3_factors=fixed_ff3_factors,
                                 ff5_factors=fixed_ff5_factors,
                                 eurusd_prices=fixed_eurusd,
-                                market=market,
+                                market=market, eur_rf_mode=bt_eur_rf_mode,
                                 risk_free_rate=
                                     risk_free_rate,
                                 max_weight=
@@ -7967,16 +8117,15 @@ with backtest_tab:
                             fixed_result["overlay_runs"], fixed_result["overlay_errors"] = build_overlay_variants(
                                 fixed_result, overlay_selected, overlay_models, risk_free_rate, **overlay_settings,
                             )
+                        fixed_result["run_provenance"] = dict(attempts["Fixed Horizon"])
+                        prepare_result_benchmarks(fixed_result, bt_benchmarks, market, risk_free_rate)
                         st.session_state[
                             "fixed_backtest_results"
                         ] = fixed_result
 
                 except Exception as e:
 
-                    st.error(
-                        "Fixed-Horizon "
-                        f"backtest failed: {e}"
-                    )
+                    attempts["Fixed Horizon"].update(error=str(e), status="FAILED")
 
 
     # =====================================================
@@ -7995,6 +8144,17 @@ with backtest_tab:
         ]
     )
 
+
+    current_attempts = st.session_state.get("bt_benchmark_attempts", {})
+    if "Backtesting" in current_attempts:
+        render_run_provenance(None, bt_snapshot, current_attempts["Backtesting"])
+    standard_sample = (standard_result if standard_result and "max_sharpe_bt" in standard_result else
+                       next(iter(standard_result.values()), {}) if standard_result else {})
+    for section, stored in (("Standard Walk-Forward", standard_sample), ("Fixed Horizon", fixed_result)):
+        run = stored.get("run_provenance") if stored else None
+        if stored and run is None:
+            st.warning(f"Previous {section} result has no run metadata. Run again for traceable diagnostics.")
+        render_run_provenance(run, bt_snapshot, current_attempts.get(section))
 
     if standard_result is None:
         standard_results_to_display = {}

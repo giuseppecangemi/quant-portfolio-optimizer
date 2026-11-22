@@ -84,3 +84,43 @@ def get_prices(tickers: list[str], period: str = "5y", *, preserve_missing: bool
     if len(result) < 2:
         raise ValueError("Dati storici insufficienti dopo l'allineamento dei ticker")
     return result
+
+
+def download_adjusted_close_range(tickers: list[str], start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
+    """Download adjusted prices by absolute dates, preserving partial ticker histories."""
+    tickers = list(dict.fromkeys(str(t).strip() for t in tickers if str(t).strip()))
+    if not tickers:
+        return pd.DataFrame()
+    pieces = []
+    # Small batches are more tolerant of failures in large market universes.
+    for offset in range(0, len(tickers), 25):
+        batch = tickers[offset:offset + 25]
+        try:
+            raw = yf.download(
+                tickers=batch, start=start.strftime("%Y-%m-%d"),
+                end=end.strftime("%Y-%m-%d"), auto_adjust=True,
+                progress=False, threads=False, group_by="column", timeout=15,
+            )
+            if raw is None or raw.empty:
+                continue
+            if isinstance(raw.columns, pd.MultiIndex):
+                if "Close" not in raw.columns.get_level_values(0):
+                    continue
+                close = raw["Close"]
+            else:
+                if "Close" not in raw:
+                    continue
+                close = raw[["Close"]].rename(columns={"Close": batch[0]})
+            if isinstance(close, pd.Series):
+                close = close.to_frame(name=batch[0])
+            close.columns = [str(c) for c in close.columns]
+            pieces.append(close)
+        except Exception:
+            continue
+    if not pieces:
+        return pd.DataFrame()
+    frame = pd.concat(pieces, axis=1).sort_index()
+    frame = frame.loc[~frame.index.duplicated(keep="last")]
+    frame = frame.loc[:, ~frame.columns.duplicated()]
+    frame.index = pd.to_datetime(frame.index).tz_localize(None)
+    return frame.apply(pd.to_numeric, errors="coerce").dropna(axis=1, how="all")

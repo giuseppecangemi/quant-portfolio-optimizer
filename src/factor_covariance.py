@@ -4,6 +4,7 @@ EUR equity excess returns and converted EUR factor returns are used for both exp
 """
 import numpy as np
 import pandas as pd
+from src.eur_risk_free import ESTR_ONLY
 from src.factor_currency import factor_sample
 
 FACTOR_NAMES = {"ff3": ("MKT-RF", "SMB", "HML"),
@@ -13,13 +14,14 @@ FACTOR_NAMES = {"ff3": ("MKT-RF", "SMB", "HML"),
 def estimate_factor_covariance(prices: pd.DataFrame, factors: pd.DataFrame,
                                *, model: str, annualization: int = 252,
                                min_observations: int = 80,
-                               eurusd_prices=None, market="USA", return_components=False):
+                               eurusd_prices=None, market="USA", return_components=False,
+                               eur_rf_mode=ESTR_ONLY):
     if model not in FACTOR_NAMES:
         raise ValueError(f"Unknown factor model {model}")
     if annualization <= 0:
         raise ValueError("Annualization must be positive")
     cols = list(FACTOR_NAMES[model])
-    returns, available = factor_sample(prices, factors, eurusd_prices, market=market)
+    returns, available = factor_sample(prices, factors, eurusd_prices, market=market, eur_rf_mode=eur_rf_mode)
     aligned = returns.join(available[[*cols, "RF"]], how="inner").dropna()
     if len(aligned) < max(min_observations, len(cols) + 3):
         raise ValueError("Insufficient aligned observations for factor covariance")

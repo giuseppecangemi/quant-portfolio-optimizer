@@ -2,6 +2,7 @@ from hashlib import sha256
 
 import numpy as np
 import pandas as pd
+from src.eur_risk_free import ESTR_ONLY, validate_mode
 from src.factors import capm_expected_returns
 from src.fama_french import estimate_ff3_eur_returns
 from src.fama_french_5 import estimate_ff5_eur_returns
@@ -40,6 +41,7 @@ def backtest_portfolio(
     market="Borsa Italiana",
     capture_initial_ex_ante=False,
     input_estimator=None,
+    eur_rf_mode=ESTR_ONLY,
 ):
     """
     Esegue un backtest walk-forward realistico.
@@ -55,6 +57,7 @@ def backtest_portfolio(
     weights_history : pd.DataFrame
         Pesi target calcolati a ogni data di ribilanciamento.
     """
+    validate_mode(eur_rf_mode)
     valid_strategies = [
         "ff3_factor_cov_max_sharpe",
         "ff5_factor_cov_max_sharpe",
@@ -237,15 +240,15 @@ def backtest_portfolio(
         def load_factor_components(model, use_factor_cov):
             from src.factor_covariance import estimate_factor_covariance
 
-            key = ("factor_risk", model, factor_fingerprints, market, rebalance_start,
+            key = ("factor_risk", eur_rf_mode, model, factor_fingerprints, market, rebalance_start,
                    factor_prices.index[0], factor_prices.index[-1], tuple(factor_prices.columns))
             if not capture_initial_ex_ante:
                 return (estimate_factor_covariance(factor_prices, signal_factors, model=model,
-                        eurusd_prices=eurusd_prices, market=market) if use_factor_cov else None), None
+                        eurusd_prices=eurusd_prices, market=market, eur_rf_mode=eur_rf_mode) if use_factor_cov else None), None
             if key not in shared_window_cache:
                 shared_window_cache[key] = estimate_factor_covariance(
                     factor_prices, signal_factors, model=model, eurusd_prices=eurusd_prices,
-                    market=market, return_components=True,
+                    market=market, return_components=True, eur_rf_mode=eur_rf_mode,
                 )
             return shared_window_cache[key]
 
@@ -306,12 +309,12 @@ def backtest_portfolio(
             if ff3_factors is None or (market != "USA" and eurusd_prices is None):
                 raise ValueError("FF3 factors and EUR/USD prices are required.")
             signal_factors = factors_for_backtest_signal(ff3_factors, factor_prices.index[-1])
-            ff3_key = ("ff3_expected_returns", factor_fingerprints, lookback_days, rebalance_start,
+            ff3_key = ("ff3_expected_returns", eur_rf_mode, factor_fingerprints, lookback_days, rebalance_start,
                        tuple(historical_prices.columns), len(historical_prices))
             if ff3_key not in shared_window_cache:
                 shared_window_cache[ff3_key] = estimate_factor_returns(
                     factor_prices, signal_factors, eurusd_prices,
-                    market=market, model="ff3", return_stats=True
+                    market=market, model="ff3", return_stats=True, eur_rf_mode=eur_rf_mode
                 )
             ff3_expected, ff3_stats = shared_window_cache[ff3_key]
             ff3_mu = ff3_expected.reindex(covariance.index)
@@ -335,12 +338,12 @@ def backtest_portfolio(
             if ff5_factors is None or (market != "USA" and eurusd_prices is None):
                 raise ValueError("FF5 factors and EUR/USD prices are required.")
             signal_factors = factors_for_backtest_signal(ff5_factors, factor_prices.index[-1])
-            ff5_key = ("ff5_expected_returns", factor_fingerprints, lookback_days, rebalance_start,
+            ff5_key = ("ff5_expected_returns", eur_rf_mode, factor_fingerprints, lookback_days, rebalance_start,
                        tuple(historical_prices.columns), len(historical_prices))
             if ff5_key not in shared_window_cache:
                 shared_window_cache[ff5_key] = estimate_factor_returns(
                     factor_prices, signal_factors, eurusd_prices,
-                    market=market, model="ff5", return_stats=True
+                    market=market, model="ff5", return_stats=True, eur_rf_mode=eur_rf_mode
                 )
             ff5_expected, ff5_stats = shared_window_cache[ff5_key]
             ff5_mu = ff5_expected.reindex(covariance.index)

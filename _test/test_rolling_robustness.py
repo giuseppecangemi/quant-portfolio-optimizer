@@ -68,3 +68,39 @@ def test_rolling_robustness():
 if __name__ == "__main__":
     test_rolling_robustness()
     print("PASS: ten models, benchmark, EUR/USD routing, initial KPIs and engine costs")
+
+
+def test_oos_boundary_uses_last_scheduled_session():
+    import exchange_calendars
+
+    dates = exchange_calendars.get_calendar("XMIL", start="2023-12-01", end="2026-01-07").sessions
+    rng = np.random.default_rng(52)
+    prices = pd.DataFrame(100 * np.cumprod(1 + rng.normal(.0003, .008, (len(dates), 2)), axis=0),
+                          index=dates, columns=["A", "B"])
+    last = pd.Timestamp("2025-12-30")
+    capture = []
+    def simulate(*args, **kwargs):
+        result = backtest_portfolio(*args, **kwargs)
+        capture.append(result)
+        return result
+    def evaluate(panel):
+        def download(tickers, start, end):
+            return panel[["A"]].rename(columns={"A": "INDEX"}) if tickers == ["INDEX"] else panel
+        with (patch.object(robustness, "_download_close", side_effect=download),
+              patch.object(robustness, "backtest_portfolio", side_effect=simulate)):
+            return robustness.run_rolling_robustness(
+                ["A", "B"], "INDEX", 2025, 2025, 1, top_n=None, market="Borsa Italiana",
+                models=["Equal Weight"], max_weight=.65, transaction_costs=PRESETS["Base"],
+            )
+    full, full_skips, _ = evaluate(prices)
+    terminal, terminal_skips, _ = evaluate(prices.loc[:last])
+    pd.testing.assert_frame_equal(full, terminal)
+    assert full_skips.empty and terminal_skips.empty
+    (a, wa), (b, wb) = capture
+    assert a.index[-1] == b.index[-1] == last
+    np.testing.assert_array_equal(a.to_numpy(), b.to_numpy())
+    pd.testing.assert_frame_equal(wa, wb)
+    pd.testing.assert_frame_equal(a.attrs["transaction_log"], b.attrs["transaction_log"])
+    incomplete, reasons, _ = evaluate(prices.drop(last))
+    assert incomplete.empty
+    assert reasons.iloc[0]["Reason"] == "Missing asset prices on final scheduled OOS session 2025-12-30"

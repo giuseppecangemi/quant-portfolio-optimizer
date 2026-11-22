@@ -7,10 +7,13 @@ from __future__ import annotations
 
 import pandas as pd
 import numpy as np
-import yfinance as yf
+from src.eur_risk_free import EONIA_ESTR, EONIA_KEY, ESTR_KEY, ESTR_ONLY, validate_mode
+from src.data import download_adjusted_close_range as _download_close
 
 from src.backtest import backtest_portfolio, calculate_backtest_metrics
+from src.backtest_inputs import MarketInputs, benchmark_curve, prepare_market_inputs, prepare_walk_forward_window
 from src.transaction_costs import CostAssumptions
+from src.benchmarks import ETFS, LEGACY_BENCHMARK, daily_relative_metrics, endpoint_comparison, etf_coverage, index_coverage, load_etf_data, matched_portfolio_metrics
 from src.fama_french import load_europe_ff3, load_us_ff3
 from src.fama_french_5 import load_europe_ff5, load_us_ff5
 
@@ -28,46 +31,6 @@ STRATEGIES = {
 }
 
 
-def _download_close(tickers: list[str], start: pd.Timestamp, end: pd.Timestamp) -> pd.DataFrame:
-    """Download adjusted prices by absolute dates, preserving partial ticker histories."""
-    tickers = list(dict.fromkeys(str(t).strip() for t in tickers if str(t).strip()))
-    if not tickers:
-        return pd.DataFrame()
-    pieces = []
-    # Small batches are more tolerant of failures in large market universes.
-    for offset in range(0, len(tickers), 25):
-        batch = tickers[offset:offset + 25]
-        try:
-            raw = yf.download(
-                tickers=batch, start=start.strftime("%Y-%m-%d"),
-                end=end.strftime("%Y-%m-%d"), auto_adjust=True,
-                progress=False, threads=False, group_by="column",
-            )
-            if raw is None or raw.empty:
-                continue
-            if isinstance(raw.columns, pd.MultiIndex):
-                if "Close" not in raw.columns.get_level_values(0):
-                    continue
-                close = raw["Close"]
-            else:
-                if "Close" not in raw:
-                    continue
-                close = raw[["Close"]].rename(columns={"Close": batch[0]})
-            if isinstance(close, pd.Series):
-                close = close.to_frame(name=batch[0])
-            close.columns = [str(c) for c in close.columns]
-            pieces.append(close)
-        except Exception:
-            continue
-    if not pieces:
-        return pd.DataFrame()
-    frame = pd.concat(pieces, axis=1).sort_index()
-    frame = frame.loc[~frame.index.duplicated(keep="last")]
-    frame = frame.loc[:, ~frame.columns.duplicated()]
-    frame.index = pd.to_datetime(frame.index).tz_localize(None)
-    return frame.apply(pd.to_numeric, errors="coerce").dropna(axis=1, how="all")
-
-
 def run_rolling_robustness(
     tickers: list[str], benchmark_ticker: str, start_year: int = 2010,
     end_year: int = 2025, estimation_years: int = 5,
@@ -77,6 +40,8 @@ def run_rolling_robustness(
     risk_free_rate: float = 0.02, max_weight: float = 0.20,
     progress=None, transaction_costs: CostAssumptions | None = None,
     *, market: str = "Borsa Italiana", models: list[str] | None = None,
+    market_inputs: MarketInputs | None = None, active_factors=("Momentum", "Risk"),
+    benchmarks=None, etf_inputs=None, eur_rf_mode=ESTR_ONLY,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
     """Return (metrics, skipped_windows, download_info).
 
@@ -84,6 +49,7 @@ def run_rolling_robustness(
     Estimation is the preceding calendar years; OOS ends at the horizon boundary.
     Every model is re-estimated from historical data by the existing backtest engine.
     """
+    validate_mode(eur_rf_mode)
     if not 2010 <= start_year <= end_year:
         raise ValueError("Invalid historical range (start year must be >= 2010).")
     if estimation_years < 1 or horizon_months < 1 or step_months < 1:
@@ -102,38 +68,50 @@ def run_rolling_robustness(
     first_anchor = pd.Timestamp(year=start_year, month=1, day=1)
     last_boundary = pd.Timestamp(year=end_year + 1, month=1, day=1)
     download_start = first_anchor - pd.DateOffset(years=estimation_years, days=12)
-    download_end = last_boundary + pd.Timedelta(days=7)
-    prices = _download_close(tickers, download_start, download_end)
-    benchmark = _download_close([benchmark_ticker], download_start, download_end)
     factor_models = [model for model in models if model.startswith(("FF3", "FF5"))]
-    fx = (_download_close(["EURUSD=X"], download_start, download_end)
-          if factor_models and market != "USA" else None)
-    if prices.empty:
-        raise ValueError("No historical asset prices were downloaded.")
-    if benchmark.empty:
-        raise ValueError("Benchmark historical prices are unavailable.")
+    families = tuple(dict.fromkeys(model[:3] for model in factor_models))
+    if market_inputs is not None and market_inputs.market != market:
+        raise ValueError("Prepared inputs must use the requested market.")
+    if market_inputs is None:
+        market_inputs, errors = prepare_market_inputs(
+            lambda: _download_close(tickers, download_start, last_boundary),
+            lambda: _download_close([benchmark_ticker], download_start, last_boundary),
+            market=market, families=families, require_benchmark=False,
+            fetch_fx=lambda: _download_close(["EURUSD=X"], download_start, last_boundary),
+            factor_loaders={
+                "FF3": load_us_ff3 if market == "USA" else load_europe_ff3,
+                "FF5": load_us_ff5 if market == "USA" else load_europe_ff5,
+            },
+        )
+    else:
+        market_inputs, errors = prepare_market_inputs(
+            market_inputs.prices, market_inputs.benchmark, market=market, families=families,
+            ff3=market_inputs.ff3, ff5=market_inputs.ff5, fx=market_inputs.fx,
+            fundamentals=market_inputs.fundamentals,
+            allow_download=False, require_benchmark=False,
+        )
+    prices, benchmark = market_inputs.prices, market_inputs.benchmark
+    factor_errors = {model: errors[model[:3]] for model in factor_models if model[:3] in errors}
 
-    ff3, ff5 = None, None
-    factor_errors = {}
-    for model, loader in (
-        ("FF3", load_us_ff3 if market == "USA" else load_europe_ff3),
-        ("FF5", load_us_ff5 if market == "USA" else load_europe_ff5),
-    ):
-        variants = [label for label in factor_models if label.startswith(model)]
-        if not variants:
-            continue
-        try:
-            if market != "USA" and (fx is None or fx.empty):
-                raise ValueError("EUR/USD historical prices are unavailable.")
-            data = loader()
-            if model == "FF3":
-                ff3 = data
-            else:
-                ff5 = data
-        except Exception as exc:
-            factor_errors.update(dict.fromkeys(variants, str(exc)))
+    selected_benchmarks = tuple(dict.fromkeys((LEGACY_BENCHMARK,) if benchmarks is None else benchmarks))
+    if not selected_benchmarks or any(name not in {LEGACY_BENCHMARK, *ETFS} for name in selected_benchmarks):
+        raise ValueError("Select at least one supported benchmark.")
+    currency = "USD" if market == "USA" else "EUR"
+    if etf_inputs is None:
+        etf_inputs = load_etf_data(selected_benchmarks, first_anchor, last_boundary - pd.Timedelta(days=1), currency)
+    etf_quotes, etf_fx, etf_errors = etf_inputs
+    matched_metrics = {}
+    portfolio_nav, benchmark_nav = {}, {}
+    coverage_reports, etf_diagnostics, endpoints, evaluated_bounds = [], [], [], []
+    benchmark_coverage = {name: (series.index[0].date().isoformat(), series.index[-1].date().isoformat())
+                for name, series in etf_quotes.items() if not series.empty}
+    if LEGACY_BENCHMARK in selected_benchmarks and not benchmark.empty:
+        close = benchmark.iloc[:, 0].dropna()
+        if not close.empty:
+            benchmark_coverage[LEGACY_BENCHMARK] = (close.index[0].date().isoformat(), close.index[-1].date().isoformat())
 
-    records, skipped = [], []
+    records, skipped, sample_coverage = [], [], {}
+    failed = set()
     anchors = []
     anchor = first_anchor
     while anchor + pd.DateOffset(months=horizon_months) <= last_boundary:
@@ -142,6 +120,12 @@ def run_rolling_robustness(
     if not anchors:
         raise ValueError("No complete OOS windows fit in the chosen period.")
 
+    import exchange_calendars
+
+    calendar = exchange_calendars.get_calendar(
+        {"Borsa Italiana": "XMIL", "USA": "XNYS"}[market],
+        start=first_anchor - pd.Timedelta(days=7), end=last_boundary + pd.Timedelta(days=7),
+    )
     for window_i, anchor in enumerate(anchors):
         if progress is not None:
             progress(window_i / len(anchors))
@@ -161,28 +145,71 @@ def run_rolling_robustness(
             continue
         # The engine expects lookback observations immediately preceding the first OOS day.
         lookback = len(before)
-        # Confirm the requested horizon has elapsed without using later prices in the engine.
-        next_trading = prices.index[prices.index >= horizon_end]
-        if len(next_trading) == 0:
-            skipped.append({"OOS Start": anchor.date().isoformat(), "Reason": "Missing post-horizon boundary"})
+        sessions = calendar.sessions_in_range(anchor, horizon_end - pd.Timedelta(days=1))
+        if sessions.empty:
+            skipped.append({"OOS Start": anchor.date().isoformat(), "Reason": "No scheduled OOS sessions"})
+            continue
+        valid_prices = (np.isfinite(window) & window.gt(0)).any(axis=1)
+        observed = valid_prices.index[valid_prices]
+        missing_sessions = sessions.difference(observed)
+        if len(missing_sessions):
+            if sessions[-1] in missing_sessions:
+                reason = f"Missing asset prices on final scheduled OOS session {sessions[-1]:%Y-%m-%d}"
+            else:
+                reason = f"Missing asset prices on {len(missing_sessions)} scheduled OOS sessions, first {missing_sessions[0]:%Y-%m-%d}"
+            skipped.append({"OOS Start": anchor.date().isoformat(), "Reason": reason})
             continue
         if window.shape[1] < 2:
             skipped.append({"OOS Start": anchor.date().isoformat(), "Reason": "Fewer than two assets"})
             continue
-        # Independent buy-and-hold benchmark for this OOS window.
-        # Uses the first and last dates available in the asset trading calendar.
-        benchmark_window = benchmark.iloc[:, 0].reindex(after).ffill().dropna()
-        if len(benchmark_window) == len(after) and benchmark_window.iloc[0] > 0:
-            benchmark_curve = pd.DataFrame({
-                "Portfolio Value": capital * benchmark_window / benchmark_window.iloc[0],
-            })
-            benchmark_curve["Daily Return"] = benchmark_curve["Portfolio Value"].pct_change().fillna(0.0)
-            benchmark_metrics = calculate_backtest_metrics(benchmark_curve, risk_free_rate)
+        prepared = prepare_walk_forward_window(
+            window, lookback, selection_policy=selection_policy, models=models,
+            rebalance_days=rebalance_days, transaction_costs=transaction_costs,
+            risk_free_rate=risk_free_rate, max_weight=max_weight, top_n=top_n, capital=capital,
+        )
+        evaluated_bounds.append((str(prepared.oos_start.date()), str(prepared.oos_end.date())))
+        benchmark_return = np.nan
+        etf_runs, window_coverage = {}, {}
+        for benchmark_name in selected_benchmarks:
+            if benchmark_name == LEGACY_BENCHMARK:
+                report = index_coverage(benchmark, prepared.oos_dates, market, ticker=benchmark_ticker,
+                                        requested=(str(download_start.date()), str((last_boundary - pd.Timedelta(days=1)).date())))
+                report.update(Window=str(anchor.date()), Benchmark=benchmark_name)
+                window_coverage[benchmark_name] = report
+                coverage_reports.append(report)
+            try:
+                if benchmark_name == LEGACY_BENCHMARK:
+                    reference_curve = benchmark_curve(
+                        benchmark, prepared.oos_start, prepared.oos_end, capital,
+                        required_dates=prepared.oos_dates,
+                    )
+                    benchmark_metrics = calculate_backtest_metrics(reference_curve, risk_free_rate)
+                    benchmark_return = benchmark_metrics["Total Return"]
+                else:
+                    run, report, detail = etf_coverage(
+                        ETFS[benchmark_name], etf_quotes.get(benchmark_name), prepared.oos_dates,
+                        capital, risk_free_rate, currency, etf_fx,
+                        requested=(str(first_anchor.date()), str((last_boundary - pd.Timedelta(days=1)).date())),
+                        error=etf_errors.get(benchmark_name),
+                    )
+                    window_coverage[benchmark_name] = report
+                    coverage_reports.append({"Window": str(anchor.date()), "Benchmark": benchmark_name, **report})
+                    etf_diagnostics.extend(detail)
+                    if run is None:
+                        raise ValueError(report["Reason"])
+                    etf_runs[benchmark_name] = run
+                    reference_curve, benchmark_metrics = run["curve"], run["metrics"]
+            except ValueError as exc:
+                if benchmark_name == LEGACY_BENCHMARK:
+                    report["Reason"] = str(exc)
+                skipped.append({"OOS Start": anchor.date().isoformat(), "Model": benchmark_name, "Reason": str(exc)})
+                continue
+            benchmark_nav.setdefault(str(anchor.date()), {})[benchmark_name] = reference_curve["Portfolio Value"].copy()
             benchmark_total_return = float(benchmark_metrics["Total Return"])
             records.append({
                 "OOS Start": anchor.date().isoformat(),
                 "OOS End": (horizon_end - pd.Timedelta(days=1)).date().isoformat(),
-                "Model": "Benchmark",
+                "Model": benchmark_name,
                 "Total Return": benchmark_total_return,
                 "Sharpe Ratio": float(benchmark_metrics["Sharpe Ratio"]),
                 "Max Drawdown": float(benchmark_metrics["Max Drawdown"]),
@@ -203,8 +230,14 @@ def run_rolling_robustness(
                 "Orders": 0,
                 "Rebalances": 0,
             })
-        else:
-            skipped.append({"OOS Start": anchor.date().isoformat(), "Model": "Benchmark", "Reason": "Insufficient benchmark OOS history"})
+            if benchmark_name in ETFS:
+                records[-1].update({
+                    "Coverage Status": run["status"],
+                    "Execution Start": reference_curve.index[0].date().isoformat(),
+                    "Execution End": reference_curve.index[-1].date().isoformat(),
+                    "CAGR": benchmark_metrics["CAGR"],
+                    "Volatility": benchmark_metrics["Volatility"],
+                })
 
         window_cache = {}
         for label in models:
@@ -213,14 +246,18 @@ def run_rolling_robustness(
                 skipped.append({"OOS Start": anchor.date().isoformat(), "Model": label, "Reason": factor_errors[label]})
                 continue
             try:
+                if strategy == "capm_max_sharpe" and benchmark.empty:
+                    raise ValueError("CAPM market-index observations are unavailable")
                 curve, weights = backtest_portfolio(
-                    window, strategy=strategy, initial_capital=capital,
-                    lookback_days=lookback, rebalance_days=rebalance_days,
-                    risk_free_rate=risk_free_rate, max_weight=max_weight,
-                    market_prices=benchmark, selection_top_n=top_n,
-                    selection_policy=selection_policy, shared_window_cache=window_cache,
-                    market=market, transaction_costs=transaction_costs, capture_initial_ex_ante=True,
-                    ff3_factors=ff3, ff5_factors=ff5, eurusd_prices=fx,
+                    prepared.prices, strategy=strategy, initial_capital=prepared.capital,
+                    lookback_days=len(prepared.training_dates), rebalance_days=prepared.rebalance_days,
+                    risk_free_rate=prepared.risk_free_rate, max_weight=prepared.max_weight,
+                    market_prices=benchmark, selection_top_n=prepared.top_n,
+                    selection_policy=prepared.selection_policy, shared_window_cache=window_cache,
+                    market=market, transaction_costs=prepared.transaction_costs, capture_initial_ex_ante=True,
+                    ff3_factors=market_inputs.ff3, ff5_factors=market_inputs.ff5, eurusd_prices=market_inputs.fx,
+                    historical_fundamentals=market_inputs.fundamentals, active_factors=active_factors,
+                    eur_rf_mode=eur_rf_mode,
                 )
                 net_metrics = calculate_backtest_metrics(curve, risk_free_rate)
                 gross_nav = curve.get("Gross Portfolio Value", curve["Portfolio Value"])
@@ -228,10 +265,12 @@ def run_rolling_robustness(
                 gross_curve["Daily Return"] = gross_nav.pct_change().fillna(0.0)
                 gross_curve.attrs["initial_capital"] = capital
                 metrics = calculate_backtest_metrics(gross_curve, risk_free_rate)
-                aligned_benchmark = benchmark.iloc[:, 0].reindex(curve.index).ffill()
-                benchmark_return = (float(aligned_benchmark.iloc[-1] / aligned_benchmark.iloc[0] - 1)
-                                    if aligned_benchmark.notna().all() and aligned_benchmark.iloc[0] > 0
-                                    else np.nan)
+                if not curve.index.equals(prepared.oos_dates):
+                    raise ValueError("Strategy did not complete the requested OOS calendar")
+                nav = pd.DataFrame({"Portfolio Value": curve["Portfolio Value"],
+                                    "Gross Portfolio Value": gross_nav})
+                nav.attrs["initial_capital"] = capital
+                portfolio_nav.setdefault(str(anchor.date()), {})[label] = nav
                 trade_log = curve.attrs.get("transaction_log", pd.DataFrame())
                 ex_ante = curve.attrs["initial_ex_ante_kpis"]
 
@@ -254,6 +293,15 @@ def run_rolling_robustness(
                 # Informative flag, not an exclusion criterion: preserve every
                 # existing backtest result and financial calculation.
                 coverage_warning = coverage < 0.80
+                risk_history = curve.attrs.get("factor_risk_history", {})
+                samples = [sample for sample in risk_history.values() if "observations" in sample]
+                if samples:
+                    sample_coverage.setdefault(str(anchor.date()), {})[label] = {
+                        "initial_observations": samples[0]["observations"],
+                        "min_observations": min(sample["observations"] for sample in samples),
+                        "from": min(sample["sample_start"][:10] for sample in samples),
+                        "through": max(sample["sample_end"][:10] for sample in samples),
+                    }
                 records.append({
                     "OOS Start": anchor.date().isoformat(),
                     "OOS End": (horizon_end - pd.Timedelta(days=1)).date().isoformat(),
@@ -284,10 +332,45 @@ def run_rolling_robustness(
                     "Orders": int(trade_log["Orders"].sum()) if not trade_log.empty else 0,
                     "Rebalances": max(0, len(weights) - 1),
                 })
+                for name, report in window_coverage.items():
+                    for basis in ("Net", "Gross"):
+                        value = endpoint_comparison(curve, report, gross=basis == "Gross")
+                        if value is not None:
+                            endpoints.append({"Window": str(anchor.date()), "Benchmark": name, "Model": label,
+                                              "Basis": basis, "From": report["From"], "Through": report["Through"],
+                                              "Scope": report["Endpoint Scope"], "Portfolio Return": value,
+                                              "Benchmark Return": report["Benchmark Return"],
+                                              "Excess Return": value - report["Benchmark Return"]})
+                for name, run in etf_runs.items():
+                    dates = run["curve"].index
+                    try:
+                        comparison = {
+                            basis: {**matched_portfolio_metrics(curve, dates, risk_free_rate, gross=basis == "Gross"),
+                                    **daily_relative_metrics(curve, run["curve"], dates, gross=basis == "Gross")}
+                            for basis in ("Net", "Gross")
+                        }
+                    except ValueError as exc:
+                        skipped.append({"OOS Start": anchor.date().isoformat(), "Model": name,
+                                        "Reason": f"{label} matched metrics: {exc}"})
+                    else:
+                        matched_metrics.setdefault(name, {}).setdefault(anchor.date().isoformat(), {})[label] = comparison
             except Exception as exc:
+                if not isinstance(exc, (ValueError, OSError)):
+                    failed.add(str(anchor.date()))
                 skipped.append({"OOS Start": anchor.date().isoformat(), "Model": label, "Reason": str(exc)[:260]})
     if progress is not None:
         progress(1.0)
+    reported = {(row["Window"], row["Benchmark"]) for row in coverage_reports}
+    window_errors = {row["OOS Start"]: row["Reason"] for row in skipped if "Model" not in row}
+    for anchor in anchors:
+        window_id = str(anchor.date())
+        for name in selected_benchmarks:
+            if (window_id, name) not in reported:
+                coverage_reports.append({"Window": window_id, "Benchmark": name, "Status": "UNAVAILABLE",
+                                         "OOS Start": window_id,
+                                         "OOS End": str((anchor + pd.DateOffset(months=horizon_months, days=-1)).date()),
+                                         "Benchmark Return": None,
+                                         "Reason": window_errors.get(window_id, "Window not evaluated")})
     info = {
         "requested_start": download_start.date().isoformat(),
         "first_price": prices.index.min().date().isoformat(),
@@ -298,8 +381,40 @@ def run_rolling_robustness(
         "models": models,
         "market": market,
         "benchmark": benchmark_ticker,
-        "currency": "USD" if market == "USA" else "EUR",
+        "currency": currency,
+        "selected_benchmarks": list(selected_benchmarks),
+        "benchmark_coverage": benchmark_coverage,
+        "benchmark_comparisons": matched_metrics,
+        "portfolio_nav": portfolio_nav, "benchmark_nav": benchmark_nav, "risk_free_rate": risk_free_rate,
+        "provider_start": str(first_anchor.date()),
+        "provider_end": str((last_boundary - pd.Timedelta(days=1)).date()),
+        "oos_start": min((start for start, _ in evaluated_bounds), default=None),
+        "oos_end": max((end for _, end in evaluated_bounds), default=None),
+        "coverage_reports": coverage_reports, "benchmark_diagnostics": etf_diagnostics,
+        "benchmark_endpoints": endpoints,
     }
+    completed = {(row["OOS Start"], row["Model"]) for row in records}
+    window_status = []
+    for anchor in anchors:
+        window_id = str(anchor.date())
+        successful = [model for model in models if (window_id, model) in completed]
+        reasons = [f"{row['Model']}: {row['Reason']}" if row.get("Model") else row["Reason"]
+                   for row in skipped if row["OOS Start"] == window_id]
+        sample = sample_coverage.get(window_id, {})
+        window_status.append({
+            "OOS Start": window_id, "Status": ("FAILED" if window_id in failed else
+                       "PASS" if len(successful) == len(models) else "SKIPPED"),
+            "Completed": ", ".join(successful),
+            "Initial factor observations": "; ".join(
+                f"{label}: {coverage['initial_observations']}" for label, coverage in sample.items()
+            ),
+            "Reason": " | ".join(reasons),
+        })
+    info["window_status"] = window_status
+    info["factor_sample_coverage"] = sample_coverage
+    info["eur_rf_mode"] = eur_rf_mode if market == "Borsa Italiana" else None
+    if info["eur_rf_mode"] and factor_models:
+        info["eur_rf_sources"] = [EONIA_KEY, ESTR_KEY] if eur_rf_mode == EONIA_ESTR else [ESTR_KEY]
     results = pd.DataFrame(records)
     if not results.empty:
         results["Currency"] = info["currency"]
