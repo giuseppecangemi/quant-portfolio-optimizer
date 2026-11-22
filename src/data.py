@@ -7,7 +7,7 @@ import yfinance as yf
 _INDEX_ALIASES = {"FTSEMIB.MI": ("FTSEMIB.MI", "^FTSEMIB", "^FTMIB")}
 
 
-def _close_series(frame, ticker):
+def _close_series(frame, ticker, *, preserve_invalid=False):
     if frame is None or frame.empty:
         return None
     close = frame.get("Close")
@@ -18,14 +18,15 @@ def _close_series(frame, ticker):
             return None
         close = close.iloc[:, 0]
     close = pd.to_numeric(close, errors="coerce").dropna()
-    close = close[close > 0]
+    if not preserve_invalid:
+        close = close[close > 0]
     if len(close) < 2:
         return None
     close.name = ticker
     return close
 
 
-def _fetch_one(symbol, period):
+def _fetch_one(symbol, period, *, preserve_invalid=False):
     errors = []
     for attempt in range(2):
         try:
@@ -33,7 +34,7 @@ def _fetch_one(symbol, period):
                 symbol, period=period, auto_adjust=True,
                 progress=False, threads=False, timeout=15,
             )
-            close = _close_series(frame, symbol)
+            close = _close_series(frame, symbol, preserve_invalid=preserve_invalid)
             if close is not None:
                 return close, errors
             errors.append(f"download({symbol}): empty/insufficient")
@@ -41,7 +42,7 @@ def _fetch_one(symbol, period):
             errors.append(f"download({symbol}): {type(exc).__name__}: {exc}")
         try:
             frame = yf.Ticker(symbol).history(period=period, auto_adjust=True, timeout=15)
-            close = _close_series(frame, symbol)
+            close = _close_series(frame, symbol, preserve_invalid=preserve_invalid)
             if close is not None:
                 return close, errors
             errors.append(f"history({symbol}): empty/insufficient")

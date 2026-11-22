@@ -62,10 +62,16 @@ def _predict_variance(returns, horizon, model, window, decay):
     with warnings.catch_warnings():
         warnings.simplefilter("ignore")
         fit = arch_model(r.to_numpy()*100, **kwargs).fit(disp="off", show_warning=False)
+        if fit.convergence_flag:
+            raise ValueError(f"{model} fit did not converge.")
         if model == "EGARCH" and horizon > 1:
             # Il calcolo analitico della varianza su più periodi non è supportato
             # dal modello EGARCH: utilizziamo simulazioni riproducibili.
-            f = fit.forecast(horizon=horizon, method="simulation", simulations=1000, random_state=np.random.RandomState(42), reindex=False)
+            rng = np.random.default_rng(42)
+            nu = float(fit.params["nu"])
+            f = fit.forecast(horizon=horizon, method="simulation", simulations=1000,
+                             rng=lambda size: rng.standard_t(nu, size) * np.sqrt((nu - 2) / nu),
+                             reindex=False)
         else:
             f = fit.forecast(horizon=horizon, method="analytic", reindex=False)
     predicted = np.asarray(f.variance.iloc[-1], dtype=float) / 10000

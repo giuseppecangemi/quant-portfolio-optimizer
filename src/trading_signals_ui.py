@@ -541,8 +541,14 @@ def dashboard(store, identifier, meta, metric):
                 st.plotly_chart(go.Figure(go.Scatter(x=equity.index, y=states, mode="markers",
                                                    name="Reconstructed portfolio state")))
         else:
-            asset = st.selectbox("Series", list(history))
-            d = analysis[asset]
+            asset = st.selectbox("Series", list(series), index=0,
+                                 key=f"monitor_trend_series_{identifier}")
+            if asset == "Portfolio":
+                d = indicators(indicator_index, window).loc[start:]
+                st.caption("Portfolio index based on executed holdings and cash. Indicators use the "
+                           "conditional opening-basket history before activation for warm-up.")
+            else:
+                d = analysis[asset]
             lines = st.multiselect("Overlays",["SMA20","SMA50","SMA100","SMA200","EMA20","Upper","Lower"],["SMA50","SMA200","Upper","Lower"])
             series_label = "Portfolio index" if asset == "Portfolio" else f"{asset} adjusted price"
             trend = go.Figure([

@@ -18,12 +18,41 @@ from src.volatility_forecasting import _predict_variance, ARCH_AVAILABLE
 MODELS = ("EWMA", "GARCH(1,1)", "GJR-GARCH", "EGARCH")
 
 
+def pretest_portfolio_returns(prices, weights_history, test_start, required):
+    """Constant-mix proxy computed with initial targets and pre-test prices."""
+    if prices is None or weights_history is None or weights_history.empty:
+        raise ValueError("Historical prices and initial target weights are required.")
+    weights = weights_history.iloc[0]
+    weights = weights[weights > 0]
+    if weights.empty or not weights.index.isin(prices.columns).all():
+        raise ValueError("Initial holdings are missing historical prices.")
+    history = prices.loc[prices.index < test_start, weights.index]
+    history = history.where(np.isfinite(history) & history.gt(0)).dropna()
+    returns = history.pct_change(fill_method=None).dropna().dot(weights)
+    if len(returns) < required:
+        raise ValueError(f"Only {len(returns)} complete pre-test returns; need {required}.")
+    return returns.tail(required)
+
+
+def exposure_signal(past, model, exposure, target_vol, horizon, window, decay,
+                    trade_band_pp, review_band_pp, reentry_band_pp):
+    variance = _predict_variance(past, horizon, model, window, decay)
+    if not np.isfinite(variance) or variance < 0:
+        raise ValueError("Invalid forecast variance.")
+    forecast = float(np.sqrt(variance * 252) * 100)
+    target = min(1., target_vol / forecast) if forecast else 1.
+    gap = abs(target - exposure) * 100
+    threshold = reentry_band_pp if target > exposure else trade_band_pp
+    action = "REBALANCE" if gap >= threshold else ("REVIEW" if gap >= review_band_pp else "HOLD")
+    return forecast, target, action
+
+
 def run_exposure_overlay(curve, models=MODELS, train=252, horizon=21, pretest_returns=None,
                          target_vol=15.0, trade_band_pp=10.0, review_band_pp=5.0,
                          window=63, decay=0.94, update_every=5, capital=10000.,
                          commission_rate=0.0005, min_commission=3.0,
                          half_spread_bps=5.0, slippage_bps=5.0,
-                         estimated_holdings=20, cash_annual_yield=0.0, reentry_band_pp=None):
+                         estimated_holdings=20, cash_annual_yield=0.0, reentry_band_pp=None, holdings_history=None):
     """Genera decisioni di gestione del rischio basate esclusivamente su dati
         passati, utilizzando i rendimenti netti della strategia.
 
@@ -78,13 +107,22 @@ def run_exposure_overlay(curve, models=MODELS, train=252, horizon=21, pretest_re
     # per la fase iniziale di calibrazione della volatilità.
     logret = pd.concat([np.log1p(pretest_returns.tail(train)), np.log1p(daily.iloc[1:])])
     test_index = values.index
-    base = values / values.iloc[0] * capital
+    source_capital = curve.attrs.get("initial_capital", values.iloc[0])
+    base = values / source_capital * capital
+
+    def holdings_at(date):
+        if holdings_history is None:
+            return max(1, int(estimated_holdings))
+        known = holdings_history.loc[:date]
+        row = holdings_history.iloc[0] if known.empty else known.iloc[-1]
+        return max(1, int(row.gt(1e-10).sum()))
+
     cash_daily = (1 + cash_annual_yield) ** (1/252) - 1
     curves = pd.DataFrame({"Standard": base}, index=test_index)
     logs = []
     summary = []
     for model in models:
-        nav = float(capital)
+        nav = float(base.iloc[0])
         exposure = 1.0
         nav_history = []
         exposure_history = []
@@ -98,16 +136,17 @@ def run_exposure_overlay(curve, models=MODELS, train=252, horizon=21, pretest_re
         # le osservazioni disponibili prima dell'inizio del periodo di test.
         initial_past = np.log1p(pretest_returns.tail(train))
         try:
-            initial_var = _predict_variance(initial_past, horizon, model, window, decay)
-            initial_forecast = float(np.sqrt(initial_var * 252) * 100)
-            initial_target = min(1.0, target_vol / initial_forecast)
+            initial_forecast, initial_target, initial_action = exposure_signal(
+                initial_past, model, exposure, target_vol, horizon, window, decay,
+                trade_band_pp, review_band_pp, reentry_band_pp,
+            )
             initial_gap = abs(initial_target - exposure) * 100
             if initial_gap >= trade_band_pp:
                 exposure = initial_target
                 # Costo approssimativo della transazione per l'esposizione iniziale del portafoglio.
                 delta = abs(initial_target - 1.0)
                 notional = delta * nav
-                cost = min(nav * 0.99, max(commission_rate * notional, max(1, int(estimated_holdings)) * min_commission)
+                cost = min(nav * 0.99, max(commission_rate * notional, holdings_at(test_index[0]) * min_commission)
                            + notional * (half_spread_bps + slippage_bps) / 10000)
                 nav -= cost
                 costs_total += cost
@@ -137,21 +176,21 @@ def run_exposure_overlay(curve, models=MODELS, train=252, horizon=21, pretest_re
             if j % update_every == 0 and j < len(test_index) - 1:
                 past = logret.loc[logret.index <= date]
                 try:
-                    var = _predict_variance(past, horizon, model, window, decay)
-                    latest_forecast = float(np.sqrt(var * 252) * 100)
-                    latest_target = min(1.0, target_vol / latest_forecast)
+                    latest_forecast, latest_target, action = exposure_signal(
+                        past, model, exposure, target_vol, horizon, window, decay,
+                        trade_band_pp, review_band_pp, reentry_band_pp,
+                    )
                     gap_pp = abs(latest_target - exposure) * 100
                     # Isteresi asimmetrica: è sufficiente una differenza più contenuta
                     # per ripristinare l'esposizione del portafoglio.
                     threshold = reentry_band_pp if latest_target > exposure else trade_band_pp
-                    action = "REBALANCE" if gap_pp >= threshold else ("REVIEW" if gap_pp >= review_band_pp else "HOLD")
                     cost = 0.0
                     if action == "REBALANCE":
                         delta = abs(latest_target - exposure)
                         notional = delta * nav
                         # Stima approssimativa delle commissioni per ciascuna posizione
                         # del portafoglio, in caso di variazione proporzionale dell'esposizione.
-                        n_orders = max(1, int(estimated_holdings))
+                        n_orders = holdings_at(date)
                         commission = max(commission_rate * notional, n_orders * min_commission)
                         variable = notional * (half_spread_bps + slippage_bps) / 10000
                         cost = min(nav * 0.99, commission + variable)

@@ -1,6 +1,5 @@
 from src.trading_signals_ui import render as render_trading_signals
 import re
-from src.ml_ui import render_ml_forecasting, render_factor_ml_comparison
 from src.kangemi_ai import render_optimization_k
 from src.kangemi_factors_ai import render_factors_k
 
@@ -17,6 +16,9 @@ YFINANCE_CACHE = (
 YFINANCE_CACHE.mkdir(parents=True, exist_ok=True)
 yf.set_tz_cache_location(str(YFINANCE_CACHE))
 import streamlit as st
+from src.backtest_registry import (
+    allocation_csv, backtest_strategies, ml_backtest_configs, transaction_cost_row,
+)
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
@@ -69,7 +71,6 @@ from src.backtest import (
 )
 from src.robustness import STRATEGIES as ROBUSTNESS_STRATEGIES, run_rolling_robustness
 from src.transaction_costs import PRESETS, CostAssumptions
-from src.volatility_forecasting import (analyze_volatility, backtest_volatility, load_volatility_prices, ARCH_AVAILABLE, portfolio_log_returns, filtered_garch_volatility, forecast_volatility_path, compare_volatility_models, portfolio_risk_contributions)
 
 
 @st.cache_data(ttl=86400, show_spinner=False)
@@ -174,7 +175,7 @@ def _json_safe(value):
         return {
             "__type__": "series",
             "attrs": _json_safe({key: value.attrs[key] for key in
-                                 ("initial_capital", "transaction_log", "estimation_end")
+                                 ("initial_capital", "transaction_log", "estimation_end", "risk_position_marks", "factor_risk_history", "exposure_log")
                                  if key in value.attrs}),
             "name": _json_safe(value.name),
             "index": [_json_safe(x) for x in value.index.tolist()],
@@ -185,7 +186,7 @@ def _json_safe(value):
         return {
             "__type__": "dataframe",
             "attrs": _json_safe({key: value.attrs[key] for key in
-                                 ("initial_capital", "transaction_log", "estimation_end")
+                                 ("initial_capital", "transaction_log", "estimation_end", "risk_position_marks", "factor_risk_history", "exposure_log")
                                  if key in value.attrs}),
             "index": [_json_safe(x) for x in value.index.tolist()],
             "columns": [_json_safe(x) for x in value.columns.tolist()],
@@ -1276,7 +1277,7 @@ def prepare_portfolio_table(
         ascending=False,
     )
 
-    return df.reset_index(drop=True)
+    return df
 
 
 def style_portfolio_table(
@@ -1462,10 +1463,47 @@ def download_portfolio_weights(weights, portfolio_key, result=None, prefix=""):
     )
 
 
+    if result is not None and st.checkbox(
+        "Show asset correlation matrix", key=f"portfolio_correlation_{portfolio_key}"
+    ):
+        import plotly.express as px
+
+        held = weights[weights > 1e-10].sort_values(ascending=False).index
+        prices = result.get("prices")
+        if len(held) < 2:
+            st.info("At least two assets with positive weights are needed.")
+        elif not isinstance(prices, pd.DataFrame) or not held.isin(prices.columns).all():
+            st.info("Run the analysis again to obtain the historical prices for this portfolio.")
+        else:
+            returns = prices.loc[:, held].sort_index().pct_change(fill_method=None)
+            returns = returns.where(returns.abs() < float("inf"))
+            correlation = returns.corr(method="pearson", min_periods=2)
+            if not correlation.notna().any().any():
+                st.info("Insufficient valid returns to estimate correlations.")
+            else:
+                st.caption("Pearson correlations of historical daily returns for assets with positive portfolio weights.")
+                figure = px.imshow(
+                    correlation, zmin=-1, zmax=1, aspect="auto",
+                    color_continuous_scale=["#d97706", "#161b26", "#2563eb"],
+                    labels={"color": "Pearson r", "x": "", "y": ""},
+                )
+                figure.update_layout(template="plotly_dark")
+                st.plotly_chart(figure, key=f"portfolio_correlation_chart_{portfolio_key}")
+
+
 def display_portfolio_table(
     df,
     use_fractional_shares,
+    covariance=None,
 ):
+    if covariance is not None:
+        from src.component_var import allocation_var
+        try:
+            df, total_var = allocation_var(df, covariance)
+            st.caption(f"Executed allocation VaR · 1D 99% · €{total_var:,.2f}")
+        except ValueError as exc:
+            st.caption(f"Component VaR unavailable: {exc}")
+            df = df.assign(**{"Marginal VaR (%)": float("nan"), "Component VaR (€)": float("nan")})
 
     styled_table = style_portfolio_table(
         df,
@@ -1498,6 +1536,10 @@ def display_portfolio_table(
                 "Quantity",
                 width="small",
             ),
+            "Marginal VaR (%)": st.column_config.NumberColumn(
+                format="%.4f%%", help="Change in one-day 99% VaR per additional euro of exposure, shown in percent."),
+            "Component VaR (€)": st.column_config.NumberColumn(
+                format="€%.2f", help="Signed contribution to VaR based on the executed amount."),
             "Invested": st.column_config.Column(
                 "Invested",
                 width="small",
@@ -1617,6 +1659,14 @@ def render_backtest_return_chart(scenarios, key_prefix):
         if values:
             fig.add_bar(name=name, x=labels, y=values, marker_color=color,
                         text=[f"{value:+.2f}%" for value in values], textposition="outside")
+    ml_series = {}
+    for scenario, result in scenarios:
+        for name, strategy in backtest_strategies(result).items():
+            if "configuration" in strategy:
+                nav = strategy["curve"]["Portfolio Value"].iloc[-1]
+                ml_series.setdefault(name, {})[scenario] = 100 * (nav / result["capital"] - 1)
+    for name, values in ml_series.items():
+        fig.add_bar(name=name, x=list(values), y=list(values.values()))
     if not fig.data:
         st.info("No portfolio curves are available.")
         return
@@ -1701,6 +1751,10 @@ def render_backtesting_comparison(standard_results, fixed_result, key_prefix="li
                     equity = _comparison_equity(result, f"{model}_bt")
                     if equity is not None:
                         curves[f"{scenario} · {label}"] = (equity, color, scenario)
+                for label, strategy in backtest_strategies(result).items():
+                    if "configuration" in strategy:
+                        equity = strategy["curve"]["Portfolio Value"]
+                        curves[f"{scenario} · {label}"] = (equity, None, scenario)
             if len(curves) >= 2:
                 common_dates = None
                 for equity, _, _ in curves.values():
@@ -2028,6 +2082,7 @@ def run_fixed_horizon_engine(
     selection_audit=None,
     active_factors=("Momentum", "Risk"),
     market="Borsa Italiana",
+    ml_configs=None,
 ):
     """
     Fixed-Horizon Backtest.
@@ -2093,19 +2148,8 @@ def run_fixed_horizon_engine(
         if selection_audit is not None:
             selection_audit[str(test_prices.index[0].date())] = ranking.copy()
 
-        first_test_prices = test_prices.iloc[0]
-        selected_tickers = [
-            ticker for ticker in selected_tickers
-            if ticker in first_test_prices.index
-            and pd.notna(first_test_prices[ticker])
-            and first_test_prices[ticker] > 0
-        ]
-
         if len(selected_tickers) < 2:
-            raise ValueError(
-                "Point-in-time screening produced fewer than two "
-                "tradable assets at the Fixed-Horizon start."
-            )
+            raise ValueError("Point-in-time screening produced fewer than two assets.")
 
         estimation_prices = estimation_prices[selected_tickers]
         test_prices = test_prices[selected_tickers].ffill()
@@ -2187,9 +2231,15 @@ def run_fixed_horizon_engine(
     )
 
     # Factor-implied covariance: same FF3/FF5 expected returns, different risk model.
-    from src.factor_covariance import estimate_factor_covariance
-    ff3_factor_cov = estimate_factor_covariance(estimation_prices, signal_ff3, model="ff3", eurusd_prices=eurusd_prices, market=market)
-    ff5_factor_cov = estimate_factor_covariance(estimation_prices, signal_ff5, model="ff5", eurusd_prices=eurusd_prices, market=market)
+    from src.factor_covariance import estimate_factor_covariance, factor_risk_record
+    ff3_factor_cov, ff3_risk = estimate_factor_covariance(
+        estimation_prices, signal_ff3, model="ff3", eurusd_prices=eurusd_prices, market=market,
+        return_components=True,
+    )
+    ff5_factor_cov, ff5_risk = estimate_factor_covariance(
+        estimation_prices, signal_ff5, model="ff5", eurusd_prices=eurusd_prices, market=market,
+        return_components=True,
+    )
     ff3_factor_weights = optimize_maximum_sharpe(
         ff3_mu, ff3_factor_cov.reindex(index=covariance.index, columns=covariance.columns),
         risk_free_rate=risk_free_rate, max_weight=max_weight,
@@ -2245,14 +2295,17 @@ def run_fixed_horizon_engine(
         weights = weights / weights.sum()
 
         start_prices = test_prices.iloc[0]
+        active = weights.gt(0)
+        if not np.isfinite(start_prices[active]).all() or start_prices[active].le(0).any():
+            raise ValueError("Missing or invalid initial execution price for a selected holding.")
 
         # Nel motore di backtest usiamo quantità frazionarie
         # per replicare esattamente i pesi teorici.
         quantities = (
             capital
             * weights
-            / start_prices
-        )
+            / start_prices.where(active)
+        ).fillna(0.)
 
         gross_value = (test_prices * quantities).sum(axis=1)
         portfolio_value = gross_value
@@ -2263,7 +2316,7 @@ def run_fixed_horizon_engine(
                 float(capital), weights, pd.Series(0.0, index=weights.index),
                 start_prices, transaction_costs,
             )
-            quantities = budget * weights / start_prices
+            quantities = (budget * weights / start_prices.where(active)).fillna(0.)
             portfolio_value = (test_prices * quantities).sum(axis=1)
             cost_log = pd.DataFrame([{
                 "Rebalance Date": test_prices.index[0], **detail,
@@ -2289,6 +2342,7 @@ def run_fixed_horizon_engine(
             backtest["Daily Return"] = backtest["Portfolio Value"].pct_change().fillna(0.0)
             backtest.loc[backtest.index[0], "Daily Return"] = budget / capital - 1
         backtest.attrs["initial_capital"] = float(capital)
+        backtest.attrs["risk_position_marks"] = test_prices.mul(quantities)
         return backtest
 
     max_sharpe_bt = build_buy_and_hold(
@@ -2303,6 +2357,19 @@ def run_fixed_horizon_engine(
     ff5_bt = build_buy_and_hold(ff5_weights)
     ff3_factor_bt = build_buy_and_hold(ff3_factor_weights)
     ff5_factor_bt = build_buy_and_hold(ff5_factor_weights)
+    for curve, weights, risk_model, optimizer_cov, uses_factor_cov in (
+        (ff3_bt, ff3_weights, ff3_risk, covariance, False),
+        (ff5_bt, ff5_weights, ff5_risk, covariance, False),
+        (ff3_factor_bt, ff3_factor_weights, ff3_risk, ff3_factor_cov, True),
+        (ff5_factor_bt, ff5_factor_weights, ff5_risk, ff5_factor_cov, True),
+    ):
+        try:
+            record = factor_risk_record(weights, risk_model, optimizer_cov,
+                                        estimation_prices.index[-1], uses_factor_cov)
+        except (ValueError, np.linalg.LinAlgError) as exc:
+            record = {"error": str(exc)}
+        curve.attrs["factor_risk_history"] = {curve.index[0].date().isoformat(): record}
+
 
 
     min_vol_bt = build_buy_and_hold(
@@ -2545,7 +2612,35 @@ def run_fixed_horizon_engine(
             "sharpe": (expected - risk_free_rate) / volatility if volatility > 0 else 0.0,
         }
 
+    ml_runs, ml_errors, ml_cache = {}, {}, {}
+    if ml_configs:
+        from src.ml_estimators import fit_portfolio, summarize_backtest
+    for name, config in (ml_configs or {}).items():
+        try:
+            estimator = fit_portfolio
+            if config.get("family") == "MC Construction":
+                from src.mc_construction import fit_construction
+                estimator = fit_construction
+            weights, mu, cov = estimator(estimation_prices[tickers], config, risk_free_rate, max_weight, ml_cache)
+            curve = build_buy_and_hold(weights)
+            history = weights.to_frame().T.set_axis(curve.index[:1])
+            volatility = float(np.sqrt(weights @ cov @ weights))
+            expected_return = float(weights @ mu)
+            curve.attrs["initial_ex_ante_kpis"] = {
+                "estimation_end": estimation_prices.index[-1], "expected_return": expected_return,
+                "volatility": volatility, "sharpe": (expected_return - risk_free_rate) / volatility,
+            }
+            ml_runs[name] = {"curve": curve, "weights": history, "configuration": {**config, "training_sessions": estimation_days},
+                             "status": "Completed",
+                             "metrics": summarize_backtest(curve, history, risk_free_rate)}
+            cost_row = transaction_cost_row(curve, capital)
+            if cost_row is not None:
+                transaction_cost_summary[name] = cost_row
+        except (ValueError, ImportError, RuntimeError, np.linalg.LinAlgError) as exc:
+            ml_errors[name] = f"Historical fit or execution · {effective_start:%Y-%m-%d} · {exc}"
     return {
+        "ml_runs": ml_runs, "ml_errors": ml_errors,
+        "risk_prices": prices,
         "initial_ex_ante_kpis": initial_ex_ante_kpis,
         "transaction_cost_summary": transaction_cost_summary,
         "transaction_cost_preset": transaction_costs,
@@ -2709,6 +2804,7 @@ def run_backtest_engine(
     selection_audit=None,
     active_factors=("Momentum", "Risk"),
     market="Italia",
+    ml_configs=None,
 ):
 
     # Il benchmark viene condiviso tra le politiche e le strategie.
@@ -3101,7 +3197,43 @@ def run_backtest_engine(
                 "Net Return (%)": (float(curve["Portfolio Value"].iloc[-1]) / capital - 1) * 100,
             }
 
+    ml_runs, ml_errors, ml_cache = {}, {}, {}
+    if ml_configs:
+        from src.ml_estimators import fit_portfolio, summarize_backtest
+    for name, config in (ml_configs or {}).items():
+        try:
+            estimator = fit_portfolio
+            if config.get("family") == "MC Construction":
+                from src.mc_construction import fit_construction
+                estimator = fit_construction
+            curve, history = backtest_portfolio(
+                prices, initial_capital=capital, lookback_days=lookback_days,
+                rebalance_days=rebalance_days, risk_free_rate=risk_free_rate, max_weight=max_weight,
+                selection_top_n=selection_top_n, selection_policy=selection_policy,
+                shared_window_cache=shared_window_cache, historical_fundamentals=historical_fundamentals,
+                active_factors=active_factors, transaction_costs=transaction_costs, market=market,
+                capture_initial_ex_ante=True,
+                input_estimator=lambda training: estimator(training, config, risk_free_rate, max_weight, ml_cache),
+            )
+            failure = curve.attrs.get("estimator_failure")
+            curve = curve.loc[effective_start:effective_end].copy()
+            if failure:
+                ml_errors[name] = failure
+                ml_runs[name] = {"curve": curve, "weights": history, "configuration": {**config, "training_sessions": lookback_days},
+                                 "status": "Incomplete"}
+                continue
+            history = history.loc[:effective_end]
+            ml_runs[name] = {"curve": curve, "weights": history, "configuration": {**config, "training_sessions": lookback_days},
+                             "status": "Completed",
+                             "metrics": summarize_backtest(curve, history, risk_free_rate)}
+            cost_row = transaction_cost_row(curve, capital)
+            if cost_row is not None:
+                transaction_cost_summary[name] = cost_row
+        except (ValueError, ImportError, RuntimeError, np.linalg.LinAlgError) as exc:
+            ml_errors[name] = f"Historical fit or execution · {exc}"
     return {
+        "ml_runs": ml_runs, "ml_errors": ml_errors,
+        "risk_prices": prices,
         "transaction_cost_summary": transaction_cost_summary,
         "transaction_cost_preset": transaction_costs,
         "tickers":
@@ -3319,22 +3451,22 @@ st.markdown("""<style>
 }
 </style>""", unsafe_allow_html=True)
 
+def select_backtest_allocation(result, result_key):
+    allocations = {
+        label: strategy for label, strategy in backtest_strategies(result).items()
+        if strategy.get("weights") is not None and not strategy["weights"].empty
+    }
+    strategy = st.selectbox("Strategy", list(allocations), key=f"rebalance_strategy_{result_key}")
+    return strategy, allocations[strategy]
+
+
 def render_final_portfolio_values(result, key_suffix):
-    strategies = (
-        ("Maximum Sharpe", "max_sharpe_bt"), ("CAPM Maximum Sharpe", "capm_bt"),
-        ("Minimum Volatility", "min_vol_bt"), ("Risk Parity", "risk_parity_bt"),
-        ("FF3 Maximum Sharpe", "ff3_bt"), ("FF5 Maximum Sharpe", "ff5_bt"),
-        ("FF3 Factor Cov", "ff3_factor_bt"), ("FF5 Factor Cov", "ff5_factor_bt"),
-        ("HRP", "hrp_bt"), ("Equal Weight", "equal_weight_bt"), ("Benchmark", "ftse_mib_bt"),
-    )
     capital = result["capital"]
     cards = []
-    for label, key in strategies:
-        curve = result.get(key)
-        if curve is not None and not curve.empty:
-            values = curve["Portfolio Value"]
-            nav = float(values.iloc[-1])
-            cards.append((label, nav, nav / capital - 1, values))
+    for label, strategy in backtest_strategies(result).items():
+        values = strategy["curve"]["Portfolio Value"]
+        nav = float(values.iloc[-1])
+        cards.append((label, nav, nav / capital - 1, values))
     cards.sort(key=lambda card: card[2], reverse=True)
 
     st.subheader("Final Portfolio Value")
@@ -3627,6 +3759,40 @@ def display_backtest_results(
         }
     ).T
 
+    for name, message in result.get("ml_errors", {}).items():
+        run = result.get("ml_runs", {}).get(name, {})
+        status = run.get("status", "Unavailable")
+        st.warning(f"{name} · {status}")
+        with st.expander(f"{name} · failure diagnostics"):
+            st.text(message)
+            if status == "Incomplete":
+                st.dataframe(run["weights"])
+    for name, run in result.get("ml_runs", {}).items():
+        if run.get("status") == "Incomplete":
+            continue
+        metrics = dict(run["metrics"])
+        if run.get("configuration", {}).get("family") == "MC Construction":
+            from src.mc_construction import tail
+            losses = -run["curve"]["Daily Return"].to_numpy()
+            metrics["Realized Daily VaR 95 (%)"], metrics["Realized Daily ES 95 (%)"] = (
+                100 * value for value in tail(losses, .95)
+            )
+        metrics["Benchmark Excess Return"] = metrics["Total Return"] - result["ftse_bt_metrics"]["Total Return"]
+        comparison = pd.concat([comparison, pd.DataFrame([metrics], index=[name])])
+    if result.get("ml_runs"):
+        st.caption("ML and Monte Carlo estimators are refit at historical decisions. The FTSE MIB price index excludes dividends. "
+                   "Current universe membership can introduce survivorship bias.")
+
+    selected_names = result.get("selected_strategies")
+    if selected_names is not None:
+        comparison = comparison.loc[comparison.index.isin([*selected_names, "Benchmark"])]
+    overlays = result.get("overlay_runs", {})
+    for label, reason in result.get("overlay_errors", {}).items():
+        st.warning(f"{label} · Overlay unavailable · {reason}")
+    if overlays:
+        overlay_rows = pd.DataFrame({run["label"]: run["metrics"] for run in overlays.values()}).T
+        comparison = pd.concat([comparison, overlay_rows])
+
     percentage_columns = [
         column
         for column
@@ -3635,7 +3801,8 @@ def display_backtest_results(
             "Return" in column
             or "Volatility" in column
             or "Drawdown" in column
-            or column == "CAGR"
+            or column in ("CAGR", "Daily VaR 95", "Daily ES 95", "Executed Turnover", "Time Below Full Exposure")
+            or "Exposure" in column
         )
     ]
 
@@ -3662,6 +3829,10 @@ def display_backtest_results(
 
     render_terminal_table(comparison, comparison_format, index_label="Strategy",
                           signed=("Total Return", "CAGR", "Max Drawdown"))
+
+    if overlays:
+        from src.backtest_overlay_ui import render_overlay_details
+        render_overlay_details(overlays, result_key, render_terminal_table)
 
     st.caption(
         "The selected benchmark is shown as a passive buy-and-hold "
@@ -3788,6 +3959,22 @@ def display_backtest_results(
             name="Benchmark",
         )
     )
+
+    for name, run in result.get("ml_runs", {}).items():
+        if run.get("status") == "Incomplete":
+            name = f"{name} (incomplete)"
+        curve = run["curve"]
+        portfolio_fig.add_scatter(x=curve.index, y=curve["Portfolio Value"], mode="lines", name=name)
+
+    if selected_names is not None:
+        portfolio_fig.data = tuple(trace for trace in portfolio_fig.data
+                               if trace.name.removesuffix(" (incomplete)") in [*selected_names, "Benchmark"])
+    for run in overlays.values():
+        curve = run["curve"]
+        base_trace = next((trace for trace in portfolio_fig.data if trace.name == run["base"]), None)
+        color = base_trace.line.color if base_trace else None
+        portfolio_fig.add_scatter(x=curve.index, y=curve["Portfolio Value"], mode="lines",
+                         name=run["label"], line=dict(dash="dash", color=color), legendgroup=run["base"])
 
     portfolio_fig.update_layout(
         xaxis_title="Date",
@@ -3968,6 +4155,22 @@ def display_backtest_results(
         )
     )
 
+    for name, run in result.get("ml_runs", {}).items():
+        if run.get("status") == "Incomplete":
+            name = f"{name} (incomplete)"
+        curve = run["curve"]
+        drawdown_fig.add_scatter(x=curve.index, y=calculate_drawdown(curve), mode="lines", name=name)
+
+    if selected_names is not None:
+        drawdown_fig.data = tuple(trace for trace in drawdown_fig.data
+                               if trace.name.removesuffix(" (incomplete)") in [*selected_names, "Benchmark"])
+    for run in overlays.values():
+        curve = run["curve"]
+        base_trace = next((trace for trace in drawdown_fig.data if trace.name == run["base"]), None)
+        color = base_trace.line.color if base_trace else None
+        drawdown_fig.add_scatter(x=curve.index, y=calculate_drawdown(curve), mode="lines",
+                         name=run["label"], line=dict(dash="dash", color=color), legendgroup=run["base"])
+
     drawdown_fig.update_layout(
         hovermode="x unified",
         legend_title="Strategy",
@@ -4006,10 +4209,15 @@ def display_backtest_results(
     history_title = "Initial Optimal Allocation" if fixed_horizon else "Rebalancing History"
     style_backtest_analysis_tabs()
     with st.container(key=f"backtest_analysis_tabs_{result_key}"):
-        history_tab, cost_tab, attribution_tab = st.tabs(
-            [history_title, "Transaction Costs", "Factor Attribution"],
+        history_tab, risk_tab, cost_tab, attribution_tab, factor_risk_tab = st.tabs(
+            [history_title, "Dynamic Component VaR", "Transaction Costs", "Factor Attribution", "Factor Risk Decomposition"],
             key=f"backtest_analysis_view_{result_key}", on_change="rerun",
         )
+
+    if risk_tab.open:
+        with risk_tab:
+            from src.component_var_ui import render_dynamic_component_var
+            render_dynamic_component_var(result, result_key, get_company_name)
 
     if history_tab.open:
         with history_tab:
@@ -4018,96 +4226,10 @@ def display_backtest_results(
             else:
                 st.caption("Target weights at each rebalance. The table turnover measures changes in target weights.")
 
-            rebalance_strategy = st.selectbox(
-                "Strategy",
-                [
-                    "Maximum Sharpe",
-                    "CAPM Maximum Sharpe",
-                    "FF3 Maximum Sharpe",
-                    "FF5 Maximum Sharpe",
-                    "FF3 Factor Cov Maximum Sharpe",
-                    "FF5 Factor Cov Maximum Sharpe",
-                    "Minimum Volatility",
-                    "Risk Parity",
-                    "HRP",
-                    "Equal Weight",
-                ],
-                key=f"rebalance_strategy_{result_key}",
-            )
-
-            if (
-                rebalance_strategy
-                == "Maximum Sharpe"
-            ):
-
-                selected_weights_history = (
-                    result[
-                        "max_sharpe_weights_history"
-                    ]
-                )
-
-            elif (
-                rebalance_strategy
-                == "CAPM Maximum Sharpe"
-            ):
-
-                selected_weights_history = (
-                    result["capm_weights_history"]
-                )
-
-            elif rebalance_strategy == "FF3 Maximum Sharpe":
-                selected_weights_history = result["ff3_weights_history"]
-
-            elif rebalance_strategy == "FF5 Maximum Sharpe":
-                selected_weights_history = result.get("ff5_weights_history", pd.DataFrame())
-
-            elif rebalance_strategy == "FF3 Factor Cov Maximum Sharpe":
-                selected_weights_history = result.get("ff3_factor_weights_history", pd.DataFrame())
-
-            elif rebalance_strategy == "FF5 Factor Cov Maximum Sharpe":
-                selected_weights_history = result.get("ff5_factor_weights_history", pd.DataFrame())
-
-            elif (
-                rebalance_strategy
-                == "Minimum Volatility"
-            ):
-
-                selected_weights_history = (
-                    result[
-                        "min_vol_weights_history"
-                    ]
-                )
-
-            elif (
-                rebalance_strategy
-                == "Risk Parity"
-            ):
-
-                selected_weights_history = (
-                    result[
-                        "risk_parity_weights_history"
-                    ]
-                )
-
-            elif (
-                rebalance_strategy
-                == "HRP"
-            ):
-
-                selected_weights_history = (
-                    result[
-                        "hrp_weights_history"
-                    ]
-                )
-
-            else:
-
-                selected_weights_history = (
-                    result[
-                        "equal_weight_weights_history"
-                    ]
-                )
-
+            rebalance_strategy, selected = select_backtest_allocation(result, result_key)
+            selected_weights_history = selected["weights"]
+            if not fixed_horizon:
+                st.caption(f"Initial allocation · {selected_weights_history.index[0]:%d/%m/%Y}")
             rebalance_table = (
                 prepare_rebalancing_history(
                     selected_weights_history
@@ -4121,19 +4243,8 @@ def display_backtest_results(
             }
 
             rebalance_table.index = rebalance_table.index.strftime("%Y-%m-%d")
-            curve_key = {
-                "Maximum Sharpe": "max_sharpe_bt", "CAPM Maximum Sharpe": "capm_bt",
-                "FF3 Maximum Sharpe": "ff3_bt", "FF5 Maximum Sharpe": "ff5_bt",
-                "FF3 Factor Cov Maximum Sharpe": "ff3_factor_bt",
-                "FF5 Factor Cov Maximum Sharpe": "ff5_factor_bt",
-                "Minimum Volatility": "min_vol_bt", "Risk Parity": "risk_parity_bt",
-                "HRP": "hrp_bt", "Equal Weight": "equal_weight_bt",
-            }[rebalance_strategy]
-            curve = result.get(curve_key)
-            if fixed_horizon:
-                ex_ante = result.get("initial_ex_ante_kpis", {}).get(curve_key)
-            else:
-                ex_ante = curve.attrs.get("initial_ex_ante_kpis") if curve is not None else None
+            curve = selected["curve"]
+            ex_ante = selected.get("ex_ante") or curve.attrs.get("initial_ex_ante_kpis")
             if ex_ante is not None:
                 estimation_date = pd.Timestamp(
                     ex_ante.get("estimation_end", result.get("estimation_end"))
@@ -4149,7 +4260,7 @@ def display_backtest_results(
             else:
                 st.info("Run this backtest again to generate historical ex-ante KPIs.")
 
-            trade_log = result.get(curve_key, pd.DataFrame()).attrs.get("transaction_log")
+            trade_log = curve.attrs.get("transaction_log")
             if trade_log is not None and "Executed Turnover" in trade_log:
                 turnover_series = trade_log.set_index("Rebalance Date")["Executed Turnover"]
                 turnover_series = turnover_series.reindex(selected_weights_history.index)
@@ -4198,7 +4309,7 @@ def display_backtest_results(
             strategy_slug = re.sub(r"[^a-z0-9]+", "_", rebalance_strategy.lower()).strip("_")
             st.download_button(
                 f"Download {history_title} (CSV)",
-                data=rebalance_table.to_csv(index_label="Rebalance Date").encode("utf-8-sig"),
+                data=allocation_csv(rebalance_table),
                 file_name=f"{export_name}_{result_key}_{strategy_slug}.csv",
                 mime="text/csv", key=f"backtest_history_export_{result_key}", on_click="ignore",
             )
@@ -4232,8 +4343,15 @@ def display_backtest_results(
                 )
 
 
+    if factor_risk_tab.open:
+        with factor_risk_tab:
+            from src.factor_risk_ui import render_factor_risk
+            render_factor_risk(result, result_key, colored_metric)
+
     if attribution_tab.open:
         with attribution_tab:
+            if any(run.get("status", "Completed") == "Completed" for run in result.get("ml_runs", {}).values()):
+                st.caption("Factor attribution is available for the supported Fama–French strategies. ML attribution is unavailable.")
             complete_factor_attributions(result)
             if not any(f"{model}_{suffix}" in result
                        for model in ("ff3", "ff5", "ff3_factor", "ff5_factor")
@@ -4897,18 +5015,20 @@ with st.sidebar.expander(
 # =========================================================
 
 with st.container(key="kangemi_main_navigation"):
-    asset_selection_tab, optimization_tab, factor_models_tab, backtest_tab, robustness_tab, trading_signals_tab, monte_carlo_tab, volatility_tab, ml_tab, saved_experiments_tab = st.tabs(
+    asset_selection_tab, optimization_tab, factor_models_tab, backtest_tab, robustness_tab, vix_tab, trading_signals_tab, monte_carlo_tab, mc_construction_tab, volatility_tab, saved_experiments_tab, ml_tab = st.tabs(
         [
             "Asset Selection",
             "Portfolio Optimization",
             "Factor Models",
             "Backtesting",
             "Robustness Analysis",
+            "VIX",
             "Trading Signals",
             "Monte Carlo Simulation",
+            "Monte Carlo Portfolio Construction",
             "Volatility Analytics",
-            "ML Return Forecasting",
             "Saved Experiments",
+            "ML Return Forecasting",
         ], key="main_navigation", on_change="rerun"
     )
 
@@ -5775,7 +5895,7 @@ with optimization_tab:
 
                 display_portfolio_table(
                     r["min_table"],
-                    r["use_fractional_shares"],
+                    r["use_fractional_shares"], r["covariance"],
                 )
                 download_portfolio_weights(r["min_weights"], "min", r, "min_")
 
@@ -5845,7 +5965,7 @@ with optimization_tab:
 
                 display_portfolio_table(
                     r["max_table"],
-                    r["use_fractional_shares"],
+                    r["use_fractional_shares"], r["covariance"],
                 )
                 download_portfolio_weights(r["max_weights"], "max", r, "max_")
 
@@ -5924,7 +6044,7 @@ with optimization_tab:
 
                 display_portfolio_table(
                     r["risk_parity_table"],
-                    r["use_fractional_shares"],
+                    r["use_fractional_shares"], r["covariance"],
                 )
                 download_portfolio_weights(r["risk_parity_weights"], "risk_parity", r, "risk_parity_")
 
@@ -6035,7 +6155,7 @@ with optimization_tab:
 
                 display_portfolio_table(
                     r["hrp_table"],
-                    r["use_fractional_shares"],
+                    r["use_fractional_shares"], r["covariance"],
                 )
                 download_portfolio_weights(r["hrp_weights"], "hrp", r, "hrp_")
 
@@ -6226,6 +6346,7 @@ def render_fama_french_model(model, tickers, market, capital, max_weight,
                 table = prepare_portfolio_table(weights, prices, capital, use_fractional_shares)
                 st.session_state[result_key] = {
                     "period": period, "stats": stats, "expected_returns_eur": expected,
+                    "prices": prices,
                     "selection_configuration": capture_portfolio_configuration(tickers, market),
                     "optimized_at": pd.Timestamp.now(tz="UTC").isoformat(), "max_weight": max_weight,
                     "risk_free_rate": risk_free_rate,
@@ -6261,7 +6382,7 @@ def render_fama_french_result(model, result, capital, use_factor_cov):
             colored_metric(label, value, color)
     render_diversification_var_kpis(result["weights"], result["covariance"], capital)
     portfolio_allocation_title()
-    display_portfolio_table(result["table"], result["use_fractional_shares"])
+    display_portfolio_table(result["table"], result["use_fractional_shares"], result["covariance"])
     covariance_key = "factor_cov" if use_factor_cov else "historical_cov"
     download_portfolio_weights(result["weights"], f"{model.lower()}_{covariance_key}", result)
     for column, (label, value, color) in zip(st.columns(2), (
@@ -6453,7 +6574,7 @@ with factor_models_tab:
 
                 render_diversification_var_kpis(cr["weights"], cr["covariance"], capital)
                 portfolio_allocation_title()
-                display_portfolio_table(cr["table"], cr["use_fractional_shares"])
+                display_portfolio_table(cr["table"], cr["use_fractional_shares"], cr["covariance"])
                 download_portfolio_weights(cr["weights"], "capm", cr)
 
                 s1, s2 = st.columns(2)
@@ -7157,31 +7278,7 @@ with robustness_tab:
                                            file_name="rolling_robustness_diagnostics.csv", mime="text/csv", key="rb_errors")
 
 
-def _drbt_pretest_returns(prices, weights_history, test_start, required):
-    """Construct pre-OOS constant-mix return proxy using first investable weights.
-
-    This is NOT the historical optimized strategy: weights are those chosen at t0.
-    Historical prices are only used for a conditional volatility estimate at t0.
-    """
-    if not isinstance(prices, pd.DataFrame) or prices.empty:
-        raise ValueError("Missing historical price matrix; rerun Standard Walk-Forward.")
-    if not isinstance(weights_history, pd.DataFrame) or weights_history.empty:
-        raise ValueError("Missing initial strategy weights; rerun Standard Walk-Forward.")
-    w = pd.to_numeric(weights_history.iloc[0], errors="coerce").fillna(0.0)
-    w = w[w > 1e-10]
-    w = w[w.index.isin(prices.columns)]
-    if w.empty:
-        raise ValueError("Initial strategy holdings have no matching historical price columns.")
-    history = prices.loc[prices.index < test_start, w.index].apply(pd.to_numeric, errors="coerce")
-    # Do not forward-fill stale data across missing sessions; use complete dates.
-    history = history.dropna(how="any")
-    history = history.loc[(history > 0).all(axis=1)]
-    if len(history) < required + 1:
-        raise ValueError(f"Only {max(0, len(history)-1)} complete pre-test price returns for initial holdings; "
-                         f"need {required}. Check instrument listing dates or extend history.")
-    rets = history.pct_change().dropna()
-    w = w / w.sum()
-    return rets.mul(w, axis=1).sum(axis=1).tail(required)
+from src.dynamic_risk_backtest import pretest_portfolio_returns as _drbt_pretest_returns
 
 
 # =========================================================
@@ -7459,6 +7556,25 @@ with backtest_tab:
             help="Costs charged on every actual purchase, sale and rebalance. "
                  "Commission per order plus half-spread and slippage on traded notional.",
         )
+        ml_registered = ml_backtest_configs(market, st.session_state.get("ml_backtest_registry", {}))
+        prior = st.session_state.get("bt_ml_configurations")
+        if prior is not None:
+            st.session_state["bt_ml_configurations"] = [name for name in prior if name in ml_registered]
+        ml_requested = st.multiselect("ML configurations for backtesting", list(ml_registered),
+                                      key="bt_ml_configurations",
+                                      help="Each selected model is refit on the backtest estimation window at every decision.")
+        ml_configs = {name: ml_registered[name] for name in ml_requested}
+        construction_configs = {
+            f"Monte Carlo — {strategy}": config
+            for (saved_market, strategy), config in st.session_state.get("mc_construction_registry", {}).items()
+            if saved_market == market
+        }
+        if construction_configs:
+            selected_construction = st.multiselect(
+                "Monte Carlo scenario strategies", list(construction_configs),
+                key=f"bt_mc_construction_{market}",
+            )
+            ml_configs.update({name: construction_configs[name] for name in selected_construction})
         bt_cost_assumptions = TRANSACTION_COST_PRESETS.get(bt_cost_choice)
         if bt_cost_assumptions is not None:
             st.caption(
@@ -7468,8 +7584,12 @@ with backtest_tab:
                 f"slippage: {bt_cost_assumptions.slippage_bps:g} bps. "
                 "Italian transaction tax and capital gains taxes excluded."
             )
-        _, action_column, _ = st.columns([1, 2, 1])
-        run_backtests = action_column.button("Run Backtests", type="primary", width="stretch")
+    from src.backtest_overlay import build_overlay_variants
+    from src.backtest_overlay_ui import overlay_controls
+
+    selected_strategies, overlay_selected, overlay_models, overlay_settings = overlay_controls(ml_configs)
+    _, action_column, _ = st.columns([1, 2, 1])
+    run_backtests = action_column.button("Run Backtests", type="primary", width="stretch")
 
     # =====================================================
     # RUN SELECTED BACKTESTS
@@ -7576,6 +7696,7 @@ with backtest_tab:
                                 preserve_missing=True,
                             )
 
+                        standard_overlay_prices = standard_prices
                         if standard_oos_days is not None and not sync_quant_dates:
                             required_rows = standard_lookback_days + standard_oos_days + 1
                             if len(standard_prices) < required_rows:
@@ -7641,6 +7762,7 @@ with backtest_tab:
                             standard_result = run_backtest_engine(
                                 tickers=tickers,
                                 transaction_costs=bt_cost_assumptions,
+                                ml_configs=ml_configs,
                                 prices=standard_prices,
                                 lookback_days=effective_standard_lookback_days,
                                 rebalance_days=standard_rebalance_days,
@@ -7692,6 +7814,12 @@ with backtest_tab:
                             standard_result["selection_policy"] = policy
                             standard_result["selection_policy_label"] = policy_label
 
+                            standard_result["selected_strategies"] = selected_strategies
+                            if overlay_selected and overlay_models:
+                                standard_result["overlay_runs"], standard_result["overlay_errors"] = build_overlay_variants(
+                                    standard_result, overlay_selected, overlay_models, risk_free_rate,
+                                    prices=standard_overlay_prices, **overlay_settings,
+                                )
                             standard_results[policy] = standard_result
 
                         st.session_state["standard_backtest_results"] = standard_results
@@ -7781,6 +7909,7 @@ with backtest_tab:
                             run_fixed_horizon_engine(
                                 tickers=tickers,
                                 transaction_costs=bt_cost_assumptions,
+                                ml_configs=ml_configs,
                                 prices=fixed_prices,
                                 estimation_days=
                                     fixed_lookback_days,
@@ -7832,6 +7961,12 @@ with backtest_tab:
                             "rebalance_label"
                         ] = "None (Buy & Hold)"
 
+                        fixed_result["drbt_price_history"] = fixed_prices
+                        fixed_result["selected_strategies"] = selected_strategies
+                        if overlay_selected and overlay_models:
+                            fixed_result["overlay_runs"], fixed_result["overlay_errors"] = build_overlay_variants(
+                                fixed_result, overlay_selected, overlay_models, risk_free_rate, **overlay_settings,
+                            )
                         st.session_state[
                             "fixed_backtest_results"
                         ] = fixed_result
@@ -8072,8 +8207,6 @@ with backtest_tab:
                         strategy_key = drbt_available[strategy_name]
                         weight_key = strategy_key.replace("_bt", "_weights_history")
                         history = drbt_base.get(weight_key)
-                        holdings = (int((history.iloc[-1] > 1e-10).sum())
-                                    if isinstance(history, pd.DataFrame) and not history.empty else 20)
                         try:
                             with st.spinner(f"Evaluating {strategy_name}..."):
                                 pretest = _drbt_pretest_returns(
@@ -8089,7 +8222,7 @@ with backtest_tab:
                                     min_commission=drbt_cost.min_commission,
                                     half_spread_bps=drbt_cost.half_spread_bps,
                                     slippage_bps=drbt_cost.slippage_bps,
-                                    estimated_holdings=holdings, cash_annual_yield=float(drbt_cash)/100,
+                                    holdings_history=history, cash_annual_yield=float(drbt_cash)/100,
                                     reentry_band_pp=float(drbt_reentry),
                                 )
                             met = met.reset_index().rename(columns={"Strategy": "Risk Model"})
@@ -8249,6 +8382,12 @@ with backtest_tab:
 # =========================================================
 # MONTE CARLO SIMULATION (INDEPENDENT TAB)
 # =========================================================
+if mc_construction_tab.open:
+    with mc_construction_tab:
+        from src.mc_construction_ui import render_mc_construction
+        render_mc_construction(tickers, market, risk_free_rate, max_weight, style_backtest_analysis_tabs, ACTIVE_BENCHMARK)
+
+
 with monte_carlo_tab, st.container(key="kangemi_monte_carlo"):
     st.markdown("""
     <style>
@@ -8275,414 +8414,430 @@ with monte_carlo_tab, st.container(key="kangemi_monte_carlo"):
         figure.update_yaxes(gridcolor="#242c37")
 
     st.header("Monte Carlo Simulation")
-    st.caption(
-        "Simulazioni statistiche condizionate ai rendimenti fuori campione del backtest. "
-        "Non sono previsioni certe, né simulazioni degli ordini sui singoli titoli."
-    )
-    mc_keys = {
-        "Maximum Sharpe": "max_sharpe_bt",
-        "CAPM Maximum Sharpe": "capm_bt",
-        "FF3 Maximum Sharpe": "ff3_bt",
-        "FF3 Factor Cov": "ff3_factor_bt",
-        "FF5 Factor Cov": "ff5_factor_bt",
-        "FF5 Maximum Sharpe": "ff5_bt",
-        "Minimum Volatility": "min_vol_bt",
-        "Risk Parity": "risk_parity_bt",
-        "HRP": "hrp_bt",
-        "Equal Weight": "equal_weight_bt",
-    }
-    mc_sources = {}
-    mc_standard = st.session_state.get("standard_backtest_results")
-    mc_fixed = st.session_state.get("fixed_backtest_results")
-    if isinstance(mc_standard, dict):
-        if "max_sharpe_bt" in mc_standard:
-            mc_sources["Standard · Fixed"] = mc_standard
-        else:
-            for mc_policy, mc_result in mc_standard.items():
-                if isinstance(mc_result, dict) and "max_sharpe_bt" in mc_result:
-                    mc_sources[f"Standard · {str(mc_policy).title()}"] = mc_result
-    if isinstance(mc_fixed, dict) and "max_sharpe_bt" in mc_fixed:
-        mc_sources["Fixed Horizon"] = mc_fixed
-
-    if not mc_sources:
-        st.info("Esegui prima un backtest nella scheda Backtesting. Monte Carlo utilizza le sue curve storiche nette.")
-    else:
-        mc_source_name = st.selectbox(
-            "Fonte dei rendimenti", list(mc_sources), key="mc_source",
-            help="Seleziona il backtest da cui estrarre i rendimenti giornalieri storici. "
-                 "Le simulazioni partono da questi rendimenti, non dai rendimenti attesi dei modelli fattoriali."
+    style_backtest_analysis_tabs()
+    with st.container(key="backtest_analysis_tabs_monte_carlo"):
+        mc_robustness, mc_forward, mc_stress = st.tabs(
+            ["Backtest Robustness", "Forward-Looking Simulation", "Stress Testing"],
+            key="monte_carlo_views", on_change="rerun",
         )
-        mc_source = mc_sources[mc_source_name]
-        mc_available = {
-            name: eq for name, key in mc_keys.items()
-            if (eq := mc_extract_equity(mc_source, key)) is not None
-        }
-        if not mc_available:
-            st.warning("Nessuna curva valida trovata nel backtest selezionato.")
-        else:
-            with st.container(key="kangemi_controls_mc_simulation"):
-                mc_selected = st.multiselect(
-                    "Strategie di portafoglio", list(mc_available),
-                    default=list(mc_available), key="mc_strategies",
-                    help="Seleziona uno o più portafogli da simulare. Le strategie vengono confrontate "
-                         "usando gli stessi shock casuali, preservando la dipendenza storica tra di esse."
-                )
-                c1, c2, c3, c4 = st.columns(4)
-                with c1:
-                    mc_years = st.selectbox("Orizzonte (anni)", [1, 3, 5], key="mc_years",
-                        help="Numero di anni futuri simulati: 252 sedute per anno.")
-                with c2:
-                    mc_paths = st.selectbox("Numero simulazioni", [500, 1000, 2000, 3000], index=1, key="mc_paths",
-                        help="Numero di traiettorie casuali. Un numero maggiore rende più stabili le stime, "
-                             "ma aumenta i tempi di calcolo.")
-                with c3:
-                    mc_capital = st.number_input("Capitale iniziale (€)", min_value=100.0,
-                        value=10000.0, step=1000.0, key="mc_capital",
-                        help="Capitale ipotetico da cui partono tutte le simulazioni. "
-                             "Le curve storiche vengono convertite in rendimenti prima della simulazione.")
-                with c4:
-                    mc_method = st.selectbox("Metodo di simulazione",
-                        ["Block bootstrap", "IID bootstrap", "Multivariate Gaussian"], key="mc_method",
-                        help="Block bootstrap: estrae blocchi consecutivi di sedute storiche e conserva parte "
-                             "della dipendenza temporale. IID: estrae singole sedute indipendenti. "
-                             "Gaussian: simula rendimenti normali multivariati con media e covarianza storiche.")
-                c5, c6, c7 = st.columns(3)
-                with c5:
-                    mc_block = st.selectbox("Lunghezza blocco (sedute)", [3, 5, 10, 21], index=1,
-                        disabled=mc_method != "Block bootstrap", key="mc_block",
-                        help="Nel block bootstrap, numero di sedute consecutive estratte insieme. "
-                             "Blocchi più lunghi preservano più struttura temporale, ma riducono la varietà dei campioni.")
-                with c6:
-                    mc_drift = st.number_input("Aggiustamento rendimento annuo (pp)",
-                        min_value=-30.0, max_value=30.0, value=0.0, step=1.0, key="mc_drift",
-                        help="Stress test sulla media dei rendimenti: -5 sottrae circa 5 punti percentuali "
-                             "all'anno al rendimento medio giornaliero utilizzato nelle simulazioni. "
-                             "Non modifica la volatilità o le correlazioni stimate.")
-                with c7:
-                    mc_seed = st.number_input("Seed casuale", min_value=0, max_value=1000000,
-                        value=42, step=1, key="mc_seed",
-                        help="Permette di riprodurre gli stessi scenari casuali con gli stessi parametri.")
-
-            if mc_selected:
-                try:
-                    mc_returns_preview = mc_aligned_returns({name: mc_available[name] for name in mc_selected})
-                    st.caption(
-                        f"Campione storico comune: {mc_returns_preview.index.min():%d/%m/%Y} – "
-                        f"{mc_returns_preview.index.max():%d/%m/%Y} · "
-                        f"{len(mc_returns_preview)} rendimenti giornalieri · {len(mc_selected)} strategie."
-                    )
-                    st.caption("Si usano solo intervalli tra valorizzazioni consecutive nel calendario osservato "
-                               "con entrambi i NAV presenti per tutte le strategie.")
-                    missing_entry = set(mc_selected) - mc_returns_preview.attrs["entry_multipliers"].keys()
-                    if missing_entry:
-                        st.warning("Capitale iniziale storico non disponibile per: " + ", ".join(sorted(missing_entry))
-                                   + ". Per queste curve si simula un portafoglio già investito.")
-                    if len(mc_returns_preview) < 252:
-                        st.warning("Campione inferiore a un anno: le code della distribuzione e i risultati "
-                                   "su 3–5 anni possono essere molto instabili.")
-                    elif mc_years * 252 > len(mc_returns_preview) * 3:
-                        st.warning("L'orizzonte simulato è molto più lungo dello storico osservato: "
-                                   "gli scenari ripetono necessariamente caratteristiche del campione disponibile.")
-                except ValueError as mc_error:
-                    st.warning(str(mc_error))
-
-            with st.expander("Research & Validation — Export Audit Data"):
-                if st.button("Prepare Monte Carlo Audit Data", disabled=not mc_selected):
-                    try:
-                        from src.monte_carlo_export import build_audit_archive
-
-                        calibration = mc_aligned_returns({name: mc_available[name] for name in mc_selected})
-                        archive = build_audit_archive(
-                            mc_source, {name: mc_keys[name] for name in mc_selected}, calibration,
-                            dict(method=mc_method, years=mc_years, n_paths=mc_paths,
-                                 initial_capital=mc_capital, block_size=mc_block, seed=mc_seed,
-                                 annual_drift_adjustment=mc_drift/100, sessions_per_year=252),
-                            dict(source=mc_source_name, market=mc_source.get("market"),
-                                 experiment_id=None, robustness_seed=st.session_state.get("mc_rb_seed", 42),
-                                 robustness_paths=st.session_state.get("mc_rb_paths", 500),
-                                 robustness_min_obs=st.session_state.get("mc_rb_min", 100)),
-                        )
-                        st.download_button("Export Monte Carlo Audit Data", archive,
-                                           "monte_carlo_audit.zip", "application/zip")
-                    except (ValueError, TypeError) as exc:
-                        st.error(str(exc))
-
-            if st.button("Run Monte Carlo Simulation", type="primary", key="mc_run", disabled=not mc_selected):
-                st.session_state.pop("mc_results", None)
-                try:
-                    mc_returns = mc_aligned_returns({name: mc_available[name] for name in mc_selected})
-                    with st.spinner("Simulazione degli scenari in corso..."):
-                        mc_metrics, mc_percentiles, mc_finals, mc_trajectories = mc_simulate(
-                            mc_returns, years=int(mc_years), n_paths=int(mc_paths),
-                            initial_capital=float(mc_capital), method=mc_method,
-                            block_size=int(mc_block), seed=int(mc_seed),
-                            annual_drift_adjustment=float(mc_drift) / 100,
-                            return_paths=True,
-                        )
-                    st.session_state["mc_results"] = {
-                        "metrics": mc_metrics, "percentiles": mc_percentiles,
-                        "finals": mc_finals, "trajectories": mc_trajectories, "source": mc_source_name,
-                        "strategies": tuple(mc_selected), "years": mc_years,
-                        "paths": mc_paths, "method": mc_method, "capital": mc_capital,
-                        "seed": mc_seed, "drift": mc_drift, "block": mc_block,
-                        "sample": len(mc_returns),
-                    }
-                except Exception as mc_error:
-                    st.error(f"Monte Carlo Simulation failed: {mc_error}")
-
-            mc_saved = st.session_state.get("mc_results")
-            if mc_saved:
-                st.divider()
-                st.subheader("Monte Carlo — Results")
-                st.caption(
-                    f"Fonte: {mc_saved['source']} · {mc_saved['years']} anni · "
-                    f"{mc_saved['paths']:,} simulazioni · {mc_saved['method']} · "
-                    f"{mc_saved['sample']} rendimenti storici. "
-                    "Risultati riferiti alla configurazione dell'ultima esecuzione."
-                )
-                if mc_saved['source'] != mc_source_name or tuple(mc_selected) != mc_saved['strategies']:
-                    st.warning("La selezione è cambiata: premi Run Monte Carlo Simulation per aggiornare i risultati.")
-                # Dark, understated per-column gradients consistent with the other
-                # Quant Portfolio Optimizer tables (no bright matplotlib palettes).
-                mc_green_cols = ["Median final (€)", "Mean final (€)",
-                                 "P5 final (€)", "P95 final (€)"]
-                mc_red_cols = ["Probability of loss (%)", "VaR 95% (€)",
-                               "ES 95% (€)", "Daily VaR 95% (€)", "Daily ES 95% (€)", "Probability MDD ≤ -20% (%)"]
-
-                def _mc_dark_gradient(column, low_rgb, high_rgb):
-                    numeric = pd.to_numeric(column, errors="coerce")
-                    finite = numeric.replace([np.inf, -np.inf], np.nan).dropna()
-                    if finite.empty:
-                        return ["" for _ in column]
-                    lo, hi = float(finite.min()), float(finite.max())
-                    styles = []
-                    for val in numeric:
-                        if pd.isna(val) or not np.isfinite(val):
-                            styles.append("")
-                            continue
-                        # Keep a visible, dark base and scale the saturation per metric.
-                        t = (float(val) - lo) / (hi - lo) if hi > lo else 0.5
-                        t = 0.12 + 0.88 * t
-                        rgb = tuple(round(a + (b - a) * t)
-                                    for a, b in zip(low_rgb, high_rgb))
-                        styles.append(
-                            f"background-color: rgb({rgb[0]}, {rgb[1]}, {rgb[2]}); "
-                            "color: #f2f4f7; font-weight: 500;"
-                        )
-                    return styles
-
-                mc_display = mc_saved["metrics"].drop(columns=["Daily VaR 95% (%)", "Daily ES 95% (%)"], errors="ignore")
-                mc_styled = mc_display.style.format({
-                    "Median final (€)": "€{:,.2f}", "Mean final (€)": "€{:,.2f}",
-                    "P5 final (€)": "€{:,.2f}", "P95 final (€)": "€{:,.2f}",
-                    "Probability of loss (%)": "{:.1f}%", "VaR 95% (€)": "€{:,.2f}",
-                    "ES 95% (€)": "€{:,.2f}", "Probability MDD ≤ -20% (%)": "{:.1f}%",
-                })
-                for mc_col in mc_green_cols:
-                    mc_styled = mc_styled.apply(
-                        _mc_dark_gradient, subset=[mc_col], axis=0,
-                        low_rgb=(18, 28, 25), high_rgb=(29, 111, 68),
-                    )
-                for mc_col in mc_red_cols:
-                    if mc_col not in mc_display:
-                        continue
-                    mc_styled = mc_styled.apply(
-                        _mc_dark_gradient, subset=[mc_col], axis=0,
-                        low_rgb=(28, 22, 26), high_rgb=(124, 38, 49),
-                    )
-                st.dataframe(mc_styled, use_container_width=True)
-                st.caption("Il costo d’ingresso storico, se noto, è applicato una sola volta in proporzione al capitale. "
-                           "I costi successivi restano incorporati nei rendimenti netti del NAV. "
-                           "VaR 95%: perdita rispetto al capitale iniziale al 5° percentile. "
-                           "ES 95%: perdita media sulla massa esatta del 5%, con peso frazionario al confine. "
-                           "Le perdite sono riportate come zero se il corrispondente risultato è positivo. "
-                           "MDD: massimo drawdown all'interno di ciascuna traiettoria.")
-                st.caption("Daily VaR ed ES usano tutti gli shock giornalieri simulati su capitale fisso, "
-                           "senza il costo iniziale. Sono misure incondizionate. La VaR di orizzonte "
-                           "può essere zero anche con VaR giornaliera positiva, se il P5 terminale supera il capitale iniziale.")
-                mc_view = st.selectbox("Strategia da visualizzare", list(mc_saved["percentiles"]),
-                                       key="mc_view_strategy")
-                mc_p = mc_saved["percentiles"][mc_view]
-                mc_show_paths = st.checkbox("Mostra tutte le traiettorie simulate", value=False,
-                    key="mc_show_all_paths",
-                    help="Mostra ogni percorso Monte Carlo come linea sottile e trasparente dietro il ventaglio. "
-                         "Per mantenere il grafico fluido, la visualizzazione campiona le sedute, "
-                         "ma i calcoli utilizzano tutte le osservazioni.")
-                mc_fig = go.Figure()
-                if mc_show_paths:
-                    mc_paths_array = mc_saved.get("trajectories", {}).get(mc_view)
-                    if mc_paths_array is None:
-                        st.info("Riesegui la simulazione per visualizzare le singole traiettorie.")
-                    else:
-                        # One WebGL trace with NaN separators avoids thousands of traces.
-                        import numpy as _mc_np
-                        mc_stride = max(1, int(_mc_np.ceil((mc_paths_array.shape[1] - 1) / 300)))
-                        mc_idx = _mc_np.unique(_mc_np.r_[_mc_np.arange(0, mc_paths_array.shape[1], mc_stride),
-                                                        mc_paths_array.shape[1] - 1])
-                        mc_sample = mc_paths_array[:, mc_idx]
-                        mc_x = _mc_np.broadcast_to(mc_idx, mc_sample.shape)
-                        mc_fig.add_trace(go.Scattergl(
-                            x=_mc_np.column_stack([mc_x, _mc_np.full((len(mc_x), 1), _mc_np.nan)]).ravel(),
-                            y=_mc_np.column_stack([mc_sample, _mc_np.full((len(mc_sample), 1), _mc_np.nan)]).ravel(),
-                            mode="lines", line=dict(color="rgba(125,190,235,0.10)", width=0.6),
-                            name=f"{len(mc_sample):,} simulazioni", hoverinfo="skip"))
-                
-                mc_fig.add_trace(go.Scatter(x=mc_p.index, y=mc_p["P95"],
-                    line=dict(width=0), name="95° percentile", hovertemplate="Seduta %{x}: €%{y:,.0f}<extra></extra>"))
-                mc_fig.add_trace(go.Scatter(x=mc_p.index, y=mc_p["P5"],
-                    fill="tonexty", fillcolor="rgba(56,189,248,0.07)" if mc_show_paths else "rgba(56,189,248,0.12)",
-                    line=dict(width=0), name="5°–95° percentile"))
-                mc_fig.add_trace(go.Scatter(x=mc_p.index, y=mc_p["P75"],
-                    line=dict(width=0), name="75° percentile"))
-                mc_fig.add_trace(go.Scatter(x=mc_p.index, y=mc_p["P25"],
-                    fill="tonexty", fillcolor="rgba(56,189,248,0.13)" if mc_show_paths else "rgba(56,189,248,0.22)",
-                    line=dict(width=0), name="25°–75° percentile"))
-                mc_fig.add_trace(go.Scatter(x=mc_p.index, y=mc_p["Median"],
-                    line=dict(color="#ffbf69", width=3), name="Mediana"))
-                mc_fig.add_hline(y=float(mc_saved["capital"]), line_dash="dash",
-                    line_color="rgba(255,255,255,0.55)", annotation_text="Capitale iniziale")
-                mc_fig.update_layout(title=f"{mc_view} — ventaglio delle traiettorie simulate",
-                    xaxis_title="Sedute future", yaxis_title="Valore portafoglio (€)",
-                    template="plotly_dark", hovermode="x unified")
-                mc_chart_theme(mc_fig)
-                st.plotly_chart(mc_fig, use_container_width=True, key="mc_fan_chart")
-                mc_hist = go.Figure()
-                for mc_name in mc_saved["finals"].columns:
-                    mc_hist.add_trace(go.Histogram(x=mc_saved["finals"][mc_name],
-                        name=mc_name, opacity=0.55, nbinsx=55))
-                mc_hist.add_vline(x=float(mc_saved["capital"]), line_dash="dash",
-                    line_color="white")
-                mc_hist.update_layout(title="Distribuzione dei valori finali",
-                    xaxis_title="Valore finale (€)", yaxis_title="Numero di scenari",
-                    barmode="overlay", template="plotly_dark")
-                mc_chart_theme(mc_hist)
-                st.plotly_chart(mc_hist, use_container_width=True, key="mc_distribution")
-                st.download_button("Download Monte Carlo Metrics (CSV)",
-                    mc_saved["metrics"].to_csv().encode("utf-8"),
-                    file_name="monte_carlo_metrics.csv", mime="text/csv", key="mc_download_metrics")
-                st.download_button("Download Terminal Values (CSV)",
-                    mc_saved["finals"].to_csv(index=False).encode("utf-8"),
-                    file_name="monte_carlo_terminal_values.csv", mime="text/csv", key="mc_download_finals")
-                st.info("Le simulazioni ripetono o parametrizzano la distribuzione osservata nel campione: "
-                        "non modellano automaticamente cambiamenti strutturali, fiscalità, ordini futuri "
-                        "o la riottimizzazione futura dei portafogli.")
-
-
-            st.divider()
-            st.subheader("Monte Carlo — Robustness & Method Comparison")
+    if mc_stress.open:
+        with mc_stress:
+            from src.stress_testing_ui import render_stress_testing
+            render_stress_testing(st.session_state, market, ACTIVE_BENCHMARK, risk_free_rate, mc_chart_theme)
+    if mc_forward.open:
+        with mc_forward:
+            from src.forward_mc_ui import render_forward_mc
+            render_forward_mc(tickers, market, ACTIVE_BENCHMARK, risk_free_rate, max_weight, mc_chart_theme)
+    if mc_robustness.open:
+        with mc_robustness:
             st.caption(
-                "Confronta gli stessi portafogli su campioni storici differenti e con tre metodi: "
-                "Block bootstrap, IID bootstrap e normale multivariata. "
-                "Questa analisi non cambia le simulazioni principali."
+                "Simulazioni statistiche condizionate ai rendimenti fuori campione del backtest. "
+                "Non sono previsioni certe, né simulazioni degli ordini sui singoli titoli."
             )
-            with st.container(key="kangemi_controls_mc_robustness"):
-                rb1, rb2, rb3 = st.columns(3)
-                with rb1:
-                    mc_rb_paths = st.selectbox("Simulazioni per combinazione", [300, 500, 1000], index=1,
-                        key="mc_rb_paths", help="Numero di scenari per ogni coppia campione/metodo. "
-                        "Più scenari riducono il rumore Monte Carlo, ma aumentano i tempi di calcolo.")
-                with rb2:
-                    mc_rb_min = st.selectbox("Minimo sedute per sottocampione", [60, 100, 126, 252], index=1,
-                        key="mc_rb_min", help="I sottocampioni troppo corti sono esclusi. "
-                        "Con un anno di storico, le stime delle code restano comunque fragili.")
-                with rb3:
-                    mc_rb_seed = st.number_input("Seed del confronto", min_value=0, max_value=1000000,
-                        value=42, step=1, key="mc_rb_seed", help="Rende replicabile il confronto statistico.")
-                st.caption("Campioni: intero periodo, prima metà, seconda metà e ultimo 75% "
-                           "(quando contengono abbastanza osservazioni). Sono parzialmente sovrapposti: "
-                           "non costituiscono test indipendenti né una validazione walk-forward.")
-            if st.button("Run Robustness Comparison", type="primary", key="mc_rb_run",
-                         disabled=not mc_selected):
-                st.session_state.pop("mc_rb_results", None)
-                try:
-                    mc_rb_returns = mc_aligned_returns({name: mc_available[name] for name in mc_selected})
-                    n_rb = len(mc_rb_returns)
-                    candidate_samples = {
-                        "Intero periodo": mc_rb_returns,
-                        "Prima metà": mc_rb_returns.iloc[:n_rb // 2],
-                        "Seconda metà": mc_rb_returns.iloc[n_rb // 2:],
-                        "Ultimo 75%": mc_rb_returns.iloc[n_rb // 4:],
-                    }
-                    samples = {k: v for k, v in candidate_samples.items()
-                               if len(v) >= max(40, int(mc_rb_min))}
-                    methods = ["Block bootstrap", "IID bootstrap", "Multivariate Gaussian"]
-                    rows = []
-                    with st.spinner(f"Confronto di {len(samples) * len(methods)} configurazioni in corso..."):
-                        for sample_name, sample_returns in samples.items():
-                            for method_idx, method_name in enumerate(methods):
-                                m, _, _ = mc_simulate(
-                                    sample_returns, years=int(mc_years), n_paths=int(mc_rb_paths),
-                                    initial_capital=float(mc_capital), method=method_name,
-                                    block_size=int(mc_block),
-                                    seed=int(mc_rb_seed) + method_idx,
-                                    annual_drift_adjustment=float(mc_drift) / 100,
-                                    return_paths=False,
-                                )
-                                for strategy_name, vals in m.iterrows():
-                                    rows.append({
-                                        "Strategy": strategy_name, "Sample": sample_name,
-                                        "Method": method_name, "Observations": len(sample_returns),
-                                        "Start": sample_returns.index[0].strftime("%Y-%m-%d"),
-                                        "End": sample_returns.index[-1].strftime("%Y-%m-%d"),
-                                        **vals.to_dict(),
-                                    })
-                    st.session_state["mc_rb_results"] = {
-                        "table": pd.DataFrame(rows), "source": mc_source_name,
-                        "strategies": tuple(mc_selected), "years": int(mc_years),
-                        "capital": float(mc_capital), "drift": float(mc_drift),
-                        "block": int(mc_block), "paths": int(mc_rb_paths),
-                        "min_obs": int(mc_rb_min), "seed": int(mc_rb_seed),
-                    }
-                except Exception as rb_error:
-                    st.error(f"Monte Carlo robustness comparison failed: {rb_error}")
+            mc_keys = {
+                "Maximum Sharpe": "max_sharpe_bt",
+                "CAPM Maximum Sharpe": "capm_bt",
+                "FF3 Maximum Sharpe": "ff3_bt",
+                "FF3 Factor Cov": "ff3_factor_bt",
+                "FF5 Factor Cov": "ff5_factor_bt",
+                "FF5 Maximum Sharpe": "ff5_bt",
+                "Minimum Volatility": "min_vol_bt",
+                "Risk Parity": "risk_parity_bt",
+                "HRP": "hrp_bt",
+                "Equal Weight": "equal_weight_bt",
+            }
+            mc_sources = {}
+            mc_standard = st.session_state.get("standard_backtest_results")
+            mc_fixed = st.session_state.get("fixed_backtest_results")
+            if isinstance(mc_standard, dict):
+                if "max_sharpe_bt" in mc_standard:
+                    mc_sources["Standard · Fixed"] = mc_standard
+                else:
+                    for mc_policy, mc_result in mc_standard.items():
+                        if isinstance(mc_result, dict) and "max_sharpe_bt" in mc_result:
+                            mc_sources[f"Standard · {str(mc_policy).title()}"] = mc_result
+            if isinstance(mc_fixed, dict) and "max_sharpe_bt" in mc_fixed:
+                mc_sources["Fixed Horizon"] = mc_fixed
 
-            mc_rb_saved = st.session_state.get("mc_rb_results")
-            if mc_rb_saved:
-                rb_table = mc_rb_saved["table"]
-                if (mc_rb_saved["source"] != mc_source_name or
-                        mc_rb_saved["strategies"] != tuple(mc_selected) or
-                        mc_rb_saved["years"] != int(mc_years) or
-                        mc_rb_saved["capital"] != float(mc_capital) or
-                        mc_rb_saved["drift"] != float(mc_drift) or
-                        mc_rb_saved["block"] != int(mc_block) or
-                        mc_rb_saved["paths"] != int(mc_rb_paths) or
-                        mc_rb_saved["min_obs"] != int(mc_rb_min) or
-                        mc_rb_saved["seed"] != int(mc_rb_seed)):
-                    st.warning("I parametri sono cambiati: riesegui Run Robustness Comparison per aggiornare la tabella.")
-                st.caption(f"{len(rb_table)} risultati · "
-                           f"{rb_table['Sample'].nunique()} campioni · "
-                           f"{rb_table['Method'].nunique()} metodi · "
-                           f"{mc_rb_saved['paths']} scenari per combinazione.")
-                rb_strategy = st.selectbox("Strategia per il confronto", rb_table["Strategy"].unique(),
-                    key="mc_rb_view_strategy")
-                rb_metric_options = ["Median final (€)", "Probability of loss (%)",
-                                     "VaR 95% (€)", "ES 95% (€)", "Daily VaR 95% (€)", "Daily ES 95% (€)",
-                                     "Probability MDD ≤ -20% (%)"]
-                rb_metric_options = [metric for metric in rb_metric_options if metric in rb_table]
-                rb_metric = st.selectbox("Metrica da confrontare", rb_metric_options,
-                    key="mc_rb_metric")
-                rb_view = rb_table.loc[rb_table["Strategy"] == rb_strategy]
-                rb_pivot = rb_view.pivot(index="Sample", columns="Method", values=rb_metric)
-                rb_order = [x for x in ["Intero periodo", "Prima metà", "Seconda metà", "Ultimo 75%"]
-                            if x in rb_pivot.index]
-                rb_pivot = rb_pivot.reindex(rb_order)
-                rb_fig = go.Figure()
-                for rb_method in rb_pivot.columns:
-                    rb_fig.add_trace(go.Bar(name=rb_method, x=rb_pivot.index,
-                                            y=rb_pivot[rb_method]))
-                rb_fig.update_layout(title=f"{rb_strategy} — {rb_metric}",
-                    xaxis_title="Campione storico", yaxis_title=rb_metric,
-                    barmode="group", template="plotly_dark")
-                mc_chart_theme(rb_fig)
-                st.plotly_chart(rb_fig, use_container_width=True, key="mc_rb_chart")
-                st.dataframe(rb_pivot.style.format("{:,.2f}"), use_container_width=True)
-                st.caption("La differenza tra campioni misura la sensibilità al periodo storico; "
-                           "la differenza tra metodi misura la sensibilità alle ipotesi distributive. "
-                           "Con pochi rendimenti, VaR, ES e probabilità di drawdown possono cambiare molto.")
-                st.download_button("Download Monte Carlo Robustness (CSV)",
-                    rb_table.to_csv(index=False).encode("utf-8"),
-                    file_name="monte_carlo_robustness_comparison.csv",
-                    mime="text/csv", key="mc_rb_download")
+            if not mc_sources:
+                st.info("Esegui prima un backtest nella scheda Backtesting. Monte Carlo utilizza le sue curve storiche nette.")
+            else:
+                mc_source_name = st.selectbox(
+                    "Fonte dei rendimenti", list(mc_sources), key="mc_source",
+                    help="Seleziona il backtest da cui estrarre i rendimenti giornalieri storici. "
+                         "Le simulazioni partono da questi rendimenti, non dai rendimenti attesi dei modelli fattoriali."
+                )
+                mc_source = mc_sources[mc_source_name]
+                mc_available = {
+                    name: eq for name, key in mc_keys.items()
+                    if (eq := mc_extract_equity(mc_source, key)) is not None
+                }
+                if not mc_available:
+                    st.warning("Nessuna curva valida trovata nel backtest selezionato.")
+                else:
+                    with st.container(key="kangemi_controls_mc_simulation"):
+                        mc_selected = st.multiselect(
+                            "Strategie di portafoglio", list(mc_available),
+                            default=list(mc_available), key="mc_strategies",
+                            help="Seleziona uno o più portafogli da simulare. Le strategie vengono confrontate "
+                                 "usando gli stessi shock casuali, preservando la dipendenza storica tra di esse."
+                        )
+                        c1, c2, c3, c4 = st.columns(4)
+                        with c1:
+                            mc_years = st.selectbox("Orizzonte (anni)", [1, 3, 5], key="mc_years",
+                                help="Numero di anni futuri simulati: 252 sedute per anno.")
+                        with c2:
+                            mc_paths = st.selectbox("Numero simulazioni", [500, 1000, 2000, 3000], index=1, key="mc_paths",
+                                help="Numero di traiettorie casuali. Un numero maggiore rende più stabili le stime, "
+                                     "ma aumenta i tempi di calcolo.")
+                        with c3:
+                            mc_capital = st.number_input("Capitale iniziale (€)", min_value=100.0,
+                                value=10000.0, step=1000.0, key="mc_capital",
+                                help="Capitale ipotetico da cui partono tutte le simulazioni. "
+                                     "Le curve storiche vengono convertite in rendimenti prima della simulazione.")
+                        with c4:
+                            mc_method = st.selectbox("Metodo di simulazione",
+                                ["Block bootstrap", "IID bootstrap", "Multivariate Gaussian"], key="mc_method",
+                                help="Block bootstrap: estrae blocchi consecutivi di sedute storiche e conserva parte "
+                                     "della dipendenza temporale. IID: estrae singole sedute indipendenti. "
+                                     "Gaussian: simula rendimenti normali multivariati con media e covarianza storiche.")
+                        c5, c6, c7 = st.columns(3)
+                        with c5:
+                            mc_block = st.selectbox("Lunghezza blocco (sedute)", [3, 5, 10, 21], index=1,
+                                disabled=mc_method != "Block bootstrap", key="mc_block",
+                                help="Nel block bootstrap, numero di sedute consecutive estratte insieme. "
+                                     "Blocchi più lunghi preservano più struttura temporale, ma riducono la varietà dei campioni.")
+                        with c6:
+                            mc_drift = st.number_input("Aggiustamento rendimento annuo (pp)",
+                                min_value=-30.0, max_value=30.0, value=0.0, step=1.0, key="mc_drift",
+                                help="Stress test sulla media dei rendimenti: -5 sottrae circa 5 punti percentuali "
+                                     "all'anno al rendimento medio giornaliero utilizzato nelle simulazioni. "
+                                     "Non modifica la volatilità o le correlazioni stimate.")
+                        with c7:
+                            mc_seed = st.number_input("Seed casuale", min_value=0, max_value=1000000,
+                                value=42, step=1, key="mc_seed",
+                                help="Permette di riprodurre gli stessi scenari casuali con gli stessi parametri.")
+
+                    if mc_selected:
+                        try:
+                            mc_returns_preview = mc_aligned_returns({name: mc_available[name] for name in mc_selected})
+                            st.caption(
+                                f"Campione storico comune: {mc_returns_preview.index.min():%d/%m/%Y} – "
+                                f"{mc_returns_preview.index.max():%d/%m/%Y} · "
+                                f"{len(mc_returns_preview)} rendimenti giornalieri · {len(mc_selected)} strategie."
+                            )
+                            st.caption("Si usano solo intervalli tra valorizzazioni consecutive nel calendario osservato "
+                                       "con entrambi i NAV presenti per tutte le strategie.")
+                            missing_entry = set(mc_selected) - mc_returns_preview.attrs["entry_multipliers"].keys()
+                            if missing_entry:
+                                st.warning("Capitale iniziale storico non disponibile per: " + ", ".join(sorted(missing_entry))
+                                           + ". Per queste curve si simula un portafoglio già investito.")
+                            if len(mc_returns_preview) < 252:
+                                st.warning("Campione inferiore a un anno: le code della distribuzione e i risultati "
+                                           "su 3–5 anni possono essere molto instabili.")
+                            elif mc_years * 252 > len(mc_returns_preview) * 3:
+                                st.warning("L'orizzonte simulato è molto più lungo dello storico osservato: "
+                                           "gli scenari ripetono necessariamente caratteristiche del campione disponibile.")
+                        except ValueError as mc_error:
+                            st.warning(str(mc_error))
+
+                    with st.expander("Research & Validation — Export Audit Data"):
+                        if st.button("Prepare Monte Carlo Audit Data", disabled=not mc_selected):
+                            try:
+                                from src.monte_carlo_export import build_audit_archive
+
+                                calibration = mc_aligned_returns({name: mc_available[name] for name in mc_selected})
+                                archive = build_audit_archive(
+                                    mc_source, {name: mc_keys[name] for name in mc_selected}, calibration,
+                                    dict(method=mc_method, years=mc_years, n_paths=mc_paths,
+                                         initial_capital=mc_capital, block_size=mc_block, seed=mc_seed,
+                                         annual_drift_adjustment=mc_drift/100, sessions_per_year=252),
+                                    dict(source=mc_source_name, market=mc_source.get("market"),
+                                         experiment_id=None, robustness_seed=st.session_state.get("mc_rb_seed", 42),
+                                         robustness_paths=st.session_state.get("mc_rb_paths", 500),
+                                         robustness_min_obs=st.session_state.get("mc_rb_min", 100)),
+                                )
+                                st.download_button("Export Monte Carlo Audit Data", archive,
+                                                   "monte_carlo_audit.zip", "application/zip")
+                            except (ValueError, TypeError) as exc:
+                                st.error(str(exc))
+
+                    if st.button("Run Monte Carlo Simulation", type="primary", key="mc_run", disabled=not mc_selected):
+                        st.session_state.pop("mc_results", None)
+                        try:
+                            mc_returns = mc_aligned_returns({name: mc_available[name] for name in mc_selected})
+                            with st.spinner("Simulazione degli scenari in corso..."):
+                                mc_metrics, mc_percentiles, mc_finals, mc_trajectories = mc_simulate(
+                                    mc_returns, years=int(mc_years), n_paths=int(mc_paths),
+                                    initial_capital=float(mc_capital), method=mc_method,
+                                    block_size=int(mc_block), seed=int(mc_seed),
+                                    annual_drift_adjustment=float(mc_drift) / 100,
+                                    return_paths=True,
+                                )
+                            st.session_state["mc_results"] = {
+                                "metrics": mc_metrics, "percentiles": mc_percentiles,
+                                "finals": mc_finals, "trajectories": mc_trajectories, "source": mc_source_name,
+                                "strategies": tuple(mc_selected), "years": mc_years,
+                                "paths": mc_paths, "method": mc_method, "capital": mc_capital,
+                                "seed": mc_seed, "drift": mc_drift, "block": mc_block,
+                                "sample": len(mc_returns),
+                            }
+                        except Exception as mc_error:
+                            st.error(f"Monte Carlo Simulation failed: {mc_error}")
+
+                    mc_saved = st.session_state.get("mc_results")
+                    if mc_saved:
+                        st.divider()
+                        st.subheader("Monte Carlo — Results")
+                        st.caption(
+                            f"Fonte: {mc_saved['source']} · {mc_saved['years']} anni · "
+                            f"{mc_saved['paths']:,} simulazioni · {mc_saved['method']} · "
+                            f"{mc_saved['sample']} rendimenti storici. "
+                            "Risultati riferiti alla configurazione dell'ultima esecuzione."
+                        )
+                        if mc_saved['source'] != mc_source_name or tuple(mc_selected) != mc_saved['strategies']:
+                            st.warning("La selezione è cambiata: premi Run Monte Carlo Simulation per aggiornare i risultati.")
+                        # Dark, understated per-column gradients consistent with the other
+                        # Quant Portfolio Optimizer tables (no bright matplotlib palettes).
+                        mc_green_cols = ["Median final (€)", "Mean final (€)",
+                                         "P5 final (€)", "P95 final (€)"]
+                        mc_red_cols = ["Probability of loss (%)", "VaR 95% (€)",
+                                       "ES 95% (€)", "Daily VaR 95% (€)", "Daily ES 95% (€)", "Probability MDD ≤ -20% (%)"]
+
+                        def _mc_dark_gradient(column, low_rgb, high_rgb):
+                            numeric = pd.to_numeric(column, errors="coerce")
+                            finite = numeric.replace([np.inf, -np.inf], np.nan).dropna()
+                            if finite.empty:
+                                return ["" for _ in column]
+                            lo, hi = float(finite.min()), float(finite.max())
+                            styles = []
+                            for val in numeric:
+                                if pd.isna(val) or not np.isfinite(val):
+                                    styles.append("")
+                                    continue
+                                # Keep a visible, dark base and scale the saturation per metric.
+                                t = (float(val) - lo) / (hi - lo) if hi > lo else 0.5
+                                t = 0.12 + 0.88 * t
+                                rgb = tuple(round(a + (b - a) * t)
+                                            for a, b in zip(low_rgb, high_rgb))
+                                styles.append(
+                                    f"background-color: rgb({rgb[0]}, {rgb[1]}, {rgb[2]}); "
+                                    "color: #f2f4f7; font-weight: 500;"
+                                )
+                            return styles
+
+                        mc_display = mc_saved["metrics"].drop(columns=["Daily VaR 95% (%)", "Daily ES 95% (%)"], errors="ignore")
+                        mc_styled = mc_display.style.format({
+                            "Median final (€)": "€{:,.2f}", "Mean final (€)": "€{:,.2f}",
+                            "P5 final (€)": "€{:,.2f}", "P95 final (€)": "€{:,.2f}",
+                            "Probability of loss (%)": "{:.1f}%", "VaR 95% (€)": "€{:,.2f}",
+                            "ES 95% (€)": "€{:,.2f}", "Probability MDD ≤ -20% (%)": "{:.1f}%",
+                        })
+                        for mc_col in mc_green_cols:
+                            mc_styled = mc_styled.apply(
+                                _mc_dark_gradient, subset=[mc_col], axis=0,
+                                low_rgb=(18, 28, 25), high_rgb=(29, 111, 68),
+                            )
+                        for mc_col in mc_red_cols:
+                            if mc_col not in mc_display:
+                                continue
+                            mc_styled = mc_styled.apply(
+                                _mc_dark_gradient, subset=[mc_col], axis=0,
+                                low_rgb=(28, 22, 26), high_rgb=(124, 38, 49),
+                            )
+                        st.dataframe(mc_styled, use_container_width=True)
+                        st.caption("Il costo d’ingresso storico, se noto, è applicato una sola volta in proporzione al capitale. "
+                                   "I costi successivi restano incorporati nei rendimenti netti del NAV. "
+                                   "VaR 95%: perdita rispetto al capitale iniziale al 5° percentile. "
+                                   "ES 95%: perdita media sulla massa esatta del 5%, con peso frazionario al confine. "
+                                   "Le perdite sono riportate come zero se il corrispondente risultato è positivo. "
+                                   "MDD: massimo drawdown all'interno di ciascuna traiettoria.")
+                        st.caption("Daily VaR ed ES usano tutti gli shock giornalieri simulati su capitale fisso, "
+                                   "senza il costo iniziale. Sono misure incondizionate. La VaR di orizzonte "
+                                   "può essere zero anche con VaR giornaliera positiva, se il P5 terminale supera il capitale iniziale.")
+                        mc_view = st.selectbox("Strategia da visualizzare", list(mc_saved["percentiles"]),
+                                               key="mc_view_strategy")
+                        mc_p = mc_saved["percentiles"][mc_view]
+                        mc_show_paths = st.checkbox("Mostra tutte le traiettorie simulate", value=False,
+                            key="mc_show_all_paths",
+                            help="Mostra ogni percorso Monte Carlo come linea sottile e trasparente dietro il ventaglio. "
+                                 "Per mantenere il grafico fluido, la visualizzazione campiona le sedute, "
+                                 "ma i calcoli utilizzano tutte le osservazioni.")
+                        mc_fig = go.Figure()
+                        if mc_show_paths:
+                            mc_paths_array = mc_saved.get("trajectories", {}).get(mc_view)
+                            if mc_paths_array is None:
+                                st.info("Riesegui la simulazione per visualizzare le singole traiettorie.")
+                            else:
+                                # One WebGL trace with NaN separators avoids thousands of traces.
+                                import numpy as _mc_np
+                                mc_stride = max(1, int(_mc_np.ceil((mc_paths_array.shape[1] - 1) / 300)))
+                                mc_idx = _mc_np.unique(_mc_np.r_[_mc_np.arange(0, mc_paths_array.shape[1], mc_stride),
+                                                                mc_paths_array.shape[1] - 1])
+                                mc_sample = mc_paths_array[:, mc_idx]
+                                mc_x = _mc_np.broadcast_to(mc_idx, mc_sample.shape)
+                                mc_fig.add_trace(go.Scattergl(
+                                    x=_mc_np.column_stack([mc_x, _mc_np.full((len(mc_x), 1), _mc_np.nan)]).ravel(),
+                                    y=_mc_np.column_stack([mc_sample, _mc_np.full((len(mc_sample), 1), _mc_np.nan)]).ravel(),
+                                    mode="lines", line=dict(color="rgba(125,190,235,0.10)", width=0.6),
+                                    name=f"{len(mc_sample):,} simulazioni", hoverinfo="skip"))
+
+                        mc_fig.add_trace(go.Scatter(x=mc_p.index, y=mc_p["P95"],
+                            line=dict(width=0), name="95° percentile", hovertemplate="Seduta %{x}: €%{y:,.0f}<extra></extra>"))
+                        mc_fig.add_trace(go.Scatter(x=mc_p.index, y=mc_p["P5"],
+                            fill="tonexty", fillcolor="rgba(56,189,248,0.07)" if mc_show_paths else "rgba(56,189,248,0.12)",
+                            line=dict(width=0), name="5°–95° percentile"))
+                        mc_fig.add_trace(go.Scatter(x=mc_p.index, y=mc_p["P75"],
+                            line=dict(width=0), name="75° percentile"))
+                        mc_fig.add_trace(go.Scatter(x=mc_p.index, y=mc_p["P25"],
+                            fill="tonexty", fillcolor="rgba(56,189,248,0.13)" if mc_show_paths else "rgba(56,189,248,0.22)",
+                            line=dict(width=0), name="25°–75° percentile"))
+                        mc_fig.add_trace(go.Scatter(x=mc_p.index, y=mc_p["Median"],
+                            line=dict(color="#ffbf69", width=3), name="Mediana"))
+                        mc_fig.add_hline(y=float(mc_saved["capital"]), line_dash="dash",
+                            line_color="rgba(255,255,255,0.55)", annotation_text="Capitale iniziale")
+                        mc_fig.update_layout(title=f"{mc_view} — ventaglio delle traiettorie simulate",
+                            xaxis_title="Sedute future", yaxis_title="Valore portafoglio (€)",
+                            template="plotly_dark", hovermode="x unified")
+                        mc_chart_theme(mc_fig)
+                        st.plotly_chart(mc_fig, use_container_width=True, key="mc_fan_chart")
+                        mc_hist = go.Figure()
+                        for mc_name in mc_saved["finals"].columns:
+                            mc_hist.add_trace(go.Histogram(x=mc_saved["finals"][mc_name],
+                                name=mc_name, opacity=0.55, nbinsx=55))
+                        mc_hist.add_vline(x=float(mc_saved["capital"]), line_dash="dash",
+                            line_color="white")
+                        mc_hist.update_layout(title="Distribuzione dei valori finali",
+                            xaxis_title="Valore finale (€)", yaxis_title="Numero di scenari",
+                            barmode="overlay", template="plotly_dark")
+                        mc_chart_theme(mc_hist)
+                        st.plotly_chart(mc_hist, use_container_width=True, key="mc_distribution")
+                        st.download_button("Download Monte Carlo Metrics (CSV)",
+                            mc_saved["metrics"].to_csv().encode("utf-8"),
+                            file_name="monte_carlo_metrics.csv", mime="text/csv", key="mc_download_metrics")
+                        st.download_button("Download Terminal Values (CSV)",
+                            mc_saved["finals"].to_csv(index=False).encode("utf-8"),
+                            file_name="monte_carlo_terminal_values.csv", mime="text/csv", key="mc_download_finals")
+                        st.info("Le simulazioni ripetono o parametrizzano la distribuzione osservata nel campione: "
+                                "non modellano automaticamente cambiamenti strutturali, fiscalità, ordini futuri "
+                                "o la riottimizzazione futura dei portafogli.")
+
+
+                    st.divider()
+                    st.subheader("Monte Carlo — Robustness & Method Comparison")
+                    st.caption(
+                        "Confronta gli stessi portafogli su campioni storici differenti e con tre metodi: "
+                        "Block bootstrap, IID bootstrap e normale multivariata. "
+                        "Questa analisi non cambia le simulazioni principali."
+                    )
+                    with st.container(key="kangemi_controls_mc_robustness"):
+                        rb1, rb2, rb3 = st.columns(3)
+                        with rb1:
+                            mc_rb_paths = st.selectbox("Simulazioni per combinazione", [300, 500, 1000], index=1,
+                                key="mc_rb_paths", help="Numero di scenari per ogni coppia campione/metodo. "
+                                "Più scenari riducono il rumore Monte Carlo, ma aumentano i tempi di calcolo.")
+                        with rb2:
+                            mc_rb_min = st.selectbox("Minimo sedute per sottocampione", [60, 100, 126, 252], index=1,
+                                key="mc_rb_min", help="I sottocampioni troppo corti sono esclusi. "
+                                "Con un anno di storico, le stime delle code restano comunque fragili.")
+                        with rb3:
+                            mc_rb_seed = st.number_input("Seed del confronto", min_value=0, max_value=1000000,
+                                value=42, step=1, key="mc_rb_seed", help="Rende replicabile il confronto statistico.")
+                        st.caption("Campioni: intero periodo, prima metà, seconda metà e ultimo 75% "
+                                   "(quando contengono abbastanza osservazioni). Sono parzialmente sovrapposti: "
+                                   "non costituiscono test indipendenti né una validazione walk-forward.")
+                    if st.button("Run Robustness Comparison", type="primary", key="mc_rb_run",
+                                 disabled=not mc_selected):
+                        st.session_state.pop("mc_rb_results", None)
+                        try:
+                            mc_rb_returns = mc_aligned_returns({name: mc_available[name] for name in mc_selected})
+                            n_rb = len(mc_rb_returns)
+                            candidate_samples = {
+                                "Intero periodo": mc_rb_returns,
+                                "Prima metà": mc_rb_returns.iloc[:n_rb // 2],
+                                "Seconda metà": mc_rb_returns.iloc[n_rb // 2:],
+                                "Ultimo 75%": mc_rb_returns.iloc[n_rb // 4:],
+                            }
+                            samples = {k: v for k, v in candidate_samples.items()
+                                       if len(v) >= max(40, int(mc_rb_min))}
+                            methods = ["Block bootstrap", "IID bootstrap", "Multivariate Gaussian"]
+                            rows = []
+                            with st.spinner(f"Confronto di {len(samples) * len(methods)} configurazioni in corso..."):
+                                for sample_name, sample_returns in samples.items():
+                                    for method_idx, method_name in enumerate(methods):
+                                        m, _, _ = mc_simulate(
+                                            sample_returns, years=int(mc_years), n_paths=int(mc_rb_paths),
+                                            initial_capital=float(mc_capital), method=method_name,
+                                            block_size=int(mc_block),
+                                            seed=int(mc_rb_seed) + method_idx,
+                                            annual_drift_adjustment=float(mc_drift) / 100,
+                                            return_paths=False,
+                                        )
+                                        for strategy_name, vals in m.iterrows():
+                                            rows.append({
+                                                "Strategy": strategy_name, "Sample": sample_name,
+                                                "Method": method_name, "Observations": len(sample_returns),
+                                                "Start": sample_returns.index[0].strftime("%Y-%m-%d"),
+                                                "End": sample_returns.index[-1].strftime("%Y-%m-%d"),
+                                                **vals.to_dict(),
+                                            })
+                            st.session_state["mc_rb_results"] = {
+                                "table": pd.DataFrame(rows), "source": mc_source_name,
+                                "strategies": tuple(mc_selected), "years": int(mc_years),
+                                "capital": float(mc_capital), "drift": float(mc_drift),
+                                "block": int(mc_block), "paths": int(mc_rb_paths),
+                                "min_obs": int(mc_rb_min), "seed": int(mc_rb_seed),
+                            }
+                        except Exception as rb_error:
+                            st.error(f"Monte Carlo robustness comparison failed: {rb_error}")
+
+                    mc_rb_saved = st.session_state.get("mc_rb_results")
+                    if mc_rb_saved:
+                        rb_table = mc_rb_saved["table"]
+                        if (mc_rb_saved["source"] != mc_source_name or
+                                mc_rb_saved["strategies"] != tuple(mc_selected) or
+                                mc_rb_saved["years"] != int(mc_years) or
+                                mc_rb_saved["capital"] != float(mc_capital) or
+                                mc_rb_saved["drift"] != float(mc_drift) or
+                                mc_rb_saved["block"] != int(mc_block) or
+                                mc_rb_saved["paths"] != int(mc_rb_paths) or
+                                mc_rb_saved["min_obs"] != int(mc_rb_min) or
+                                mc_rb_saved["seed"] != int(mc_rb_seed)):
+                            st.warning("I parametri sono cambiati: riesegui Run Robustness Comparison per aggiornare la tabella.")
+                        st.caption(f"{len(rb_table)} risultati · "
+                                   f"{rb_table['Sample'].nunique()} campioni · "
+                                   f"{rb_table['Method'].nunique()} metodi · "
+                                   f"{mc_rb_saved['paths']} scenari per combinazione.")
+                        rb_strategy = st.selectbox("Strategia per il confronto", rb_table["Strategy"].unique(),
+                            key="mc_rb_view_strategy")
+                        rb_metric_options = ["Median final (€)", "Probability of loss (%)",
+                                             "VaR 95% (€)", "ES 95% (€)", "Daily VaR 95% (€)", "Daily ES 95% (€)",
+                                             "Probability MDD ≤ -20% (%)"]
+                        rb_metric_options = [metric for metric in rb_metric_options if metric in rb_table]
+                        rb_metric = st.selectbox("Metrica da confrontare", rb_metric_options,
+                            key="mc_rb_metric")
+                        rb_view = rb_table.loc[rb_table["Strategy"] == rb_strategy]
+                        rb_pivot = rb_view.pivot(index="Sample", columns="Method", values=rb_metric)
+                        rb_order = [x for x in ["Intero periodo", "Prima metà", "Seconda metà", "Ultimo 75%"]
+                                    if x in rb_pivot.index]
+                        rb_pivot = rb_pivot.reindex(rb_order)
+                        rb_fig = go.Figure()
+                        for rb_method in rb_pivot.columns:
+                            rb_fig.add_trace(go.Bar(name=rb_method, x=rb_pivot.index,
+                                                    y=rb_pivot[rb_method]))
+                        rb_fig.update_layout(title=f"{rb_strategy} — {rb_metric}",
+                            xaxis_title="Campione storico", yaxis_title=rb_metric,
+                            barmode="group", template="plotly_dark")
+                        mc_chart_theme(rb_fig)
+                        st.plotly_chart(rb_fig, use_container_width=True, key="mc_rb_chart")
+                        st.dataframe(rb_pivot.style.format("{:,.2f}"), use_container_width=True)
+                        st.caption("La differenza tra campioni misura la sensibilità al periodo storico; "
+                                   "la differenza tra metodi misura la sensibilità alle ipotesi distributive. "
+                                   "Con pochi rendimenti, VaR, ES e probabilità di drawdown possono cambiare molto.")
+                        st.download_button("Download Monte Carlo Robustness (CSV)",
+                            rb_table.to_csv(index=False).encode("utf-8"),
+                            file_name="monte_carlo_robustness_comparison.csv",
+                            mime="text/csv", key="mc_rb_download")
 
 
 with saved_experiments_tab:
@@ -8785,290 +8940,44 @@ with saved_experiments_tab:
 # =========================================================
 # VOLATILITY ANALYTICS & FORECASTING (ISOLATED SECTION)
 # =========================================================
-with volatility_tab:
-    st.header("Volatility Analytics & Forecasting")
-    st.caption("Historical and forward-looking risk estimates; not predictions of price direction.")
-    v_mode = st.radio("Analysis mode", ["Portfolio Volatility", "Asset Volatility"], horizontal=True, key="vol_analysis_mode")
-    if v_mode == "Portfolio Volatility":
-        v_strategy = st.selectbox("Portfolio strategy", ["FF3 Maximum Sharpe", "FF5 Maximum Sharpe", "CAPM Maximum Sharpe", "Maximum Sharpe", "Equal Weight"], key="vol_portfolio_strategy")
-        v_state_map = {
-            "FF3 Maximum Sharpe": ("ff3_results", "weights"),
-            "FF5 Maximum Sharpe": ("ff5_results", "weights"),
-            "CAPM Maximum Sharpe": ("factor_model_results", "weights"),
-            "Maximum Sharpe": ("optimization_results", "max_weights"),
-            "Equal Weight": ("optimization_results", "max_weights"),
-        }
-        v_key, v_weight_key = v_state_map[v_strategy]
-        v_state = st.session_state.get(v_key)
-        if v_state is None or v_weight_key not in v_state:
-            st.info("First run the corresponding Portfolio Optimization or Factor Model to generate current target weights.")
-        else:
-            v_weights = pd.Series(v_state[v_weight_key], dtype=float)
-            v_weights = v_weights[v_weights > 1e-10]
-            if v_strategy == "Equal Weight":
-                v_weights = pd.Series(1.0/len(v_state["prices"].columns), index=v_state["prices"].columns)
-            st.caption(f"{len(v_weights)} holdings from current {v_strategy} allocation. Fixed-weight, daily-rebalanced risk proxy (not an executed backtest).")
-            v_c1, v_c2, v_c3, v_c4 = st.columns(4)
-            with v_c1:
-                v_period = st.selectbox("Historical period", ["1y", "2y", "3y", "5y", "10y"], index=2, key="vol_port_period")
-            with v_c2:
-                v_window = st.selectbox("Rolling window (sessions)", [21,63,126,252], index=1, key="vol_port_window")
-            with v_c3:
-                v_horizon = st.selectbox("Forecast horizon (sessions)", [5,21,63,126], index=1, key="vol_port_horizon")
-            with v_c4:
-                v_decay = st.slider("EWMA decay", 0.80, 0.99, 0.94, 0.01, key="vol_port_decay")
-            v_b1,v_b2 = st.columns(2)
-            with v_b1:
-                v_train = st.number_input("OOS training sessions", min_value=252, max_value=1250, value=500, step=25, key="vol_port_train")
-            with v_b2:
-                v_stride = st.selectbox("OOS step (sessions)", [5,21,63], index=1, key="vol_port_stride")
-            if st.button("Run Portfolio Volatility Analysis", type="primary", key="vol_port_run"):
-                try:
-                    with st.spinner("Downloading constituent prices and estimating portfolio risk..."):
-                        v_px = load_volatility_prices(list(v_weights.index), v_period)
-                        v_returns = portfolio_log_returns(v_px, v_weights)
-                        v_rolling = v_returns.rolling(v_window).std()*np.sqrt(252)*100
-                        from src.volatility_forecasting import ewma_variance
-                        v_ewma = pd.Series(np.sqrt(ewma_variance(v_returns.to_numpy(),v_decay)*252)*100,index=v_returns.index)
-                        v_hist = pd.DataFrame({"Rolling":v_rolling,"EWMA":v_ewma})
-                        v_models = ["Rolling", "EWMA", "GARCH(1,1)", "GJR-GARCH", "EGARCH"] if ARCH_AVAILABLE else ["Rolling", "EWMA"]
-                        v_paths, v_errors = {}, {}
-                        for v_m in v_models:
-                            try:
-                                v_paths[v_m] = forecast_volatility_path(v_returns, v_horizon, v_m, v_window, v_decay)
-                                if v_m not in ("Rolling","EWMA"):
-                                    v_hist[v_m] = filtered_garch_volatility(v_returns, v_m)
-                            except Exception as exc:
-                                v_errors[v_m] = str(exc)
-                        v_contrib, v_port_sigma = portfolio_risk_contributions(v_px, v_weights)
-                        st.session_state["vol_port_results"] = dict(history=v_hist,paths=v_paths,errors=v_errors,returns=v_returns,contrib=v_contrib,sigma=v_port_sigma,weights=v_weights,params=dict(horizon=v_horizon,window=v_window,decay=v_decay,train=v_train,stride=v_stride,strategy=v_strategy,period=v_period))
-                        st.session_state.pop("vol_port_validation", None)
-                except Exception as exc:
-                    st.error(f"Portfolio volatility analysis failed: {exc}")
-            v_result = st.session_state.get("vol_port_results")
-            if v_result:
-                v_p = v_result["params"]
-                if v_p["strategy"] != v_strategy:
-                    st.info("Displayed results refer to the previously analyzed strategy. Run again to update.")
-                st.subheader("Portfolio risk overview")
-                st.metric("Realized portfolio volatility (annualized)", f"{v_result['sigma']:.2f}%")
-                v_forecasts = pd.DataFrame([{"Model":m,"Forecast volatility (%)":float(np.sqrt(np.mean((path.to_numpy()/100)**2))*100)} for m,path in v_result["paths"].items()])
-                st.dataframe(v_forecasts.style.format({"Forecast volatility (%)":"{:.2f}"}),use_container_width=True,hide_index=True)
-                st.caption("Forecast summary is sqrt(mean of predicted daily variances), annualized. In-sample GARCH curves are filtered estimates, NOT historical out-of-sample forecasts.")
-                # Advisory-only Dynamic Risk Management; no orders or backtest changes.
-                from src.risk_alerts import risk_alert
-                st.subheader("Dynamic Risk Management — volatility alerts")
-                st.caption("Traffic-light alerts are based on forecast annualized volatility, not on predicted price direction. Thresholds are provisional and configurable.")
-                dr_c1, dr_c2, dr_c3 = st.columns(3)
-                with dr_c1:
-                    dr_model = st.selectbox("Risk signal model", list(v_result["paths"].keys()),
-                                            index=list(v_result["paths"].keys()).index("EWMA") if "EWMA" in v_result["paths"] else 0,
-                                            key="dr_risk_model")
-                with dr_c2:
-                    dr_target = st.number_input("Target annual volatility (%)", min_value=1.0, max_value=50.0,
-                                                value=15.0, step=1.0, key="dr_target")
-                with dr_c3:
-                    dr_current = st.number_input("Current invested exposure (%)", min_value=0.0, max_value=100.0,
-                                                 value=100.0, step=5.0, key="dr_current")
-                with st.expander("Alert thresholds and rebalancing bands", expanded=False):
-                    dr_t1, dr_t2, dr_t3 = st.columns(3)
-                    with dr_t1:
-                        dr_caution = st.number_input("Yellow from (%)", 1.0, 100.0, 20.0, 1.0, key="dr_caution")
-                    with dr_t2:
-                        dr_warning = st.number_input("Orange from (%)", 1.0, 100.0, 25.0, 1.0, key="dr_warning")
-                    with dr_t3:
-                        dr_critical = st.number_input("Red from (%)", 1.0, 100.0, 30.0, 1.0, key="dr_critical")
-                    dr_b1, dr_b2 = st.columns(2)
-                    with dr_b1:
-                        dr_review = st.number_input("Review exposure gap (pp)", 0.0, 50.0, 5.0, 1.0, key="dr_review")
-                    with dr_b2:
-                        dr_rebalance = st.number_input("Rebalance review gap (pp)", 1.0, 75.0, 10.0, 1.0, key="dr_rebalance")
-                try:
-                    dr_forecast = float(v_forecasts.set_index("Model").loc[dr_model, "Forecast volatility (%)"])
-                    dr = risk_alert(dr_forecast, dr_target, dr_current, dr_caution,
-                                    dr_warning, dr_critical, dr_review, dr_rebalance)
-                    dr_cols = st.columns(4)
-                    dr_kpis = [
-                        ("FORECAST RISK", f"{dr['forecast']:.2f}%", dr['status'], dr['color']),
-                        ("TARGET EXPOSURE", f"{dr['suggested_exposure']:.1f}%", "FF3 risky allocation", "#3b82f6"),
-                        ("SUGGESTED CASH", f"{dr['suggested_cash']:.1f}%", "Before trading costs", "#64748b"),
-                        ("REBALANCING", f"{dr['gap_pp']:.1f} pp", dr['action'],
-                         "#ef4444" if dr['action']=="REBALANCE REVIEW" else "#eab308" if dr['action']=="MONITOR / REVIEW" else "#22c55e"),
-                    ]
-                    for dr_col, (dr_title, dr_value, dr_label, dr_color) in zip(dr_cols, dr_kpis):
-                        with dr_col:
-                            st.markdown(
-                                f'<div style="background:#151b25;border:1px solid {dr_color};border-left:5px solid {dr_color};'
-                                f'border-radius:12px;padding:15px 12px;min-height:126px">'
-                                f'<div style="font-size:12px;color:#b8c2d0;font-weight:700">{dr_title}</div>'
-                                f'<div style="font-size:27px;color:#fff;font-weight:750;margin:7px 0">{dr_value}</div>'
-                                f'<div style="font-size:12px;color:{dr_color};font-weight:700">{dr_label}</div></div>',
-                                unsafe_allow_html=True)
-                    if dr['status']=="CRITICAL":
-                        st.error(f"RED ALERT: {dr_model} forecasts {dr_forecast:.2f}% annual volatility (threshold {dr_critical:.1f}%). Review risk exposure; no trade is executed.")
-                    elif dr['status']=="HIGH":
-                        st.warning(f"HIGH RISK: {dr_model} forecasts {dr_forecast:.2f}% (orange threshold {dr_warning:.1f}%).")
-                    elif dr['status']=="ELEVATED":
-                        st.warning(f"ELEVATED RISK: {dr_model} forecasts {dr_forecast:.2f}% (yellow threshold {dr_caution:.1f}%).")
-                    else:
-                        st.success(f"NORMAL RISK: {dr_model} forecast {dr_forecast:.2f}% is below the yellow threshold ({dr_caution:.1f}%).")
-                    st.caption(
-                        f"Exposure gap = |current {dr_current:.1f}% − proposed {dr['suggested_exposure']:.1f}%|. "
-                        f"Review from {dr_review:.1f} pp; rebalance review from {dr_rebalance:.1f} pp. "
-                        "Exposure is calculated as min(100%, target volatility / forecast volatility). "
-                        "The dashboard does not know your broker positions: enter current exposure manually. "
-                        "Signals are advisory, not automatic sell orders. No transaction costs or cash yield are included in this indication."
-                    )
-                except (ValueError, KeyError) as dr_exc:
-                    st.warning(f"Risk alerts unavailable: {dr_exc}")
+if volatility_tab.open:
+    with volatility_tab:
+        from src.volatility_analytics_ui import render_volatility
 
-                v_fig=go.Figure()
-                for v_m in v_result["history"].columns:
-                    v_fig.add_trace(go.Scatter(x=v_result["history"].index,y=v_result["history"][v_m],name=v_m))
-                v_fig.update_layout(title="Portfolio — historical annualized volatility",yaxis_title="Volatility (%)",hovermode="x unified")
-                st.plotly_chart(v_fig,use_container_width=True)
-                v_fig2=go.Figure()
-                for v_m,v_path in v_result["paths"].items():
-                    v_fig2.add_trace(go.Scatter(x=v_path.index,y=v_path.values,name=v_m))
-                v_fig2.update_layout(title=f"Forecast volatility path — next {v_p['horizon']} sessions",xaxis_title="Trading sessions ahead",yaxis_title="Annualized volatility (%)",hovermode="x unified")
-                st.plotly_chart(v_fig2,use_container_width=True)
-                st.subheader("Portfolio risk contributions")
-                st.dataframe(v_result["contrib"].style.format("{:.2f}"),use_container_width=True)
-                st.caption("Euler contributions based on historical covariance. Assumes target weights are held fixed and rebalanced daily; excludes costs, FX conversions and future changes in weights.")
-                if v_result["errors"]:
-                    st.warning("Some models could not be estimated: " + "; ".join(f"{k}: {v}" for k,v in v_result["errors"].items()))
-                if st.button("Validate all models out of sample",key="vol_port_validate"):
-                    with st.spinner("Rolling-origin validation across the same dates (may take several minutes)..."):
-                        try:
-                            v_validation,v_scores,v_errors=compare_volatility_models(v_result["returns"],v_p["horizon"],v_p["train"],v_p["stride"],v_p["window"],v_p["decay"])
-                            st.session_state["vol_port_validation"]=(v_validation,v_scores,v_errors)
-                        except Exception as exc:
-                            st.error(f"Portfolio volatility validation failed: {exc}")
-                if st.session_state.get("vol_port_validation") is not None:
-                    v_validation,v_scores,v_errors=st.session_state["vol_port_validation"]
-                    st.subheader("Out-of-sample model comparison")
-                    if v_scores.empty:
-                        st.info("Not enough common forecast windows. Increase history or shorten training period.")
-                    else:
-                        st.dataframe(v_scores,hide_index=True,use_container_width=True)
-                        st.caption("Lower QLIKE and variance MSE are better; all models use identical forecast origins. QLIKE can be negative. The number of OOS windows is shown explicitly.")
-                        st.dataframe(v_validation.tail(30),use_container_width=True)
-                        st.download_button("Download portfolio forecast validation CSV",v_validation.to_csv(index=False).encode(),"portfolio_volatility_validation.csv","text/csv",key="vol_port_csv")
-                    if v_errors:
-                        st.warning("Validation model errors: "+"; ".join(f"{k}: {v}" for k,v in v_errors.items()))
-    else:
-        v_source = st.radio("Asset source", ["Current asset selection", "Manual selection"], horizontal=True, key="vol_source")
-        v_universe = market_instruments.drop_duplicates(subset="ticker").copy()
-        v_name_to_ticker = dict(zip(v_universe["name"].astype(str) + " (" + v_universe["ticker"].astype(str) + ")", v_universe["ticker"].astype(str)))
-        if v_source == "Current asset selection":
-            # Prefer the current sidebar selection when it contains assets.
-            # A completed Quant Screening must also be available here when the
-            # sidebar remains in Manual Selection with no manually chosen tickers.
-            v_sidebar_tickers = list(dict.fromkeys(tickers))
-            v_screening_state = st.session_state.get("screening_results")
-            v_screening_valid = (
-                isinstance(v_screening_state, dict)
-                and v_screening_state.get("market") == market
+        st.header("Volatility Analytics & Forecasting")
+        style_backtest_analysis_tabs()
+        with st.container(key="backtest_analysis_tabs_volatility"):
+            portfolio_vol_tab, asset_vol_tab = st.tabs(
+                ["Portfolio Volatility", "Asset Volatility"], key="volatility_view", on_change="rerun",
             )
-            v_market_tickers = set(v_universe["ticker"].astype(str))
-            v_quant_tickers = (
-                [t for t in st.session_state.get("quant_selected_tickers", [])
-                 if t in v_market_tickers]
-                if v_screening_valid else []
-            )
-            v_tickers = v_sidebar_tickers if v_sidebar_tickers else list(dict.fromkeys(v_quant_tickers))
-            v_origin = (
-                "current sidebar selection" if v_sidebar_tickers
-                else "latest Quant Selection screening" if v_quant_tickers
-                else "current selection"
-            )
-            st.caption(f"{len(v_tickers)} assets from {v_origin}.")
-        else:
-            v_choices = st.multiselect("Assets to analyze", options=list(v_name_to_ticker), key="vol_manual_assets")
-            v_tickers = [v_name_to_ticker[x] for x in v_choices]
-        v_c1, v_c2, v_c3, v_c4 = st.columns(4)
-        with v_c1:
-            v_period = st.selectbox("Historical period", ["1y", "2y", "3y", "5y", "10y"], index=2, key="vol_period")
-        with v_c2:
-            v_window = st.selectbox("Rolling window (sessions)", [21, 63, 126, 252], index=1, key="vol_window")
-        with v_c3:
-            v_horizon = st.selectbox("Forecast horizon (sessions)", [5, 21, 63, 126], index=1, key="vol_horizon")
-        with v_c4:
-            v_model = st.selectbox("Forecast model", ["Rolling", "EWMA", "GARCH(1,1)", "GJR-GARCH", "EGARCH"], index=2, key="vol_model")
-        v_d1, v_d2, v_d3 = st.columns(3)
-        with v_d1:
-            v_lambda = st.slider("EWMA decay", 0.80, 0.99, 0.94, 0.01, key="vol_decay")
-        with v_d2:
-            v_train = st.number_input("Forecast backtest training sessions", min_value=252, max_value=1250, value=500, step=25, key="vol_train")
-        with v_d3:
-            v_stride = st.selectbox("Backtest step (sessions)", [5, 21, 63], index=1, key="vol_stride")
-        if v_model in ("GARCH(1,1)", "GJR-GARCH", "EGARCH") and not ARCH_AVAILABLE:
-            st.warning("GARCH models require the 'arch' package. Add arch to requirements.txt and redeploy; Rolling/EWMA work without it.")
-        if st.button("Run Volatility Analysis", type="primary", key="vol_run"):
-            if not v_tickers:
-                st.warning("Select one or more assets, or run Quant Selection first.")
-            elif len(v_tickers) > 30:
-                st.warning("Choose at most 30 assets per analysis to keep computation manageable.")
-            else:
-                with st.spinner("Downloading adjusted prices and estimating volatility..."):
-                    try:
-                        v_prices = load_volatility_prices(v_tickers, v_period)
-                        v_results = {}
-                        for v_ticker in v_tickers:
-                            if v_ticker not in v_prices or v_prices[v_ticker].dropna().shape[0] < max(v_window + 5, 90):
-                                continue
-                            v_results[v_ticker] = analyze_volatility(v_prices[v_ticker], v_window, v_horizon, v_model, v_lambda)
-                        st.session_state["vol_results"] = v_results
-                        st.session_state["vol_run_params"] = dict(model=v_model, horizon=v_horizon, train=v_train, stride=v_stride, window=v_window, decay=v_lambda)
-                    except Exception as e:
-                        st.error(f"Volatility analysis failed: {e}")
-        v_results = st.session_state.get("vol_results", {})
-        if v_results:
-            v_summary = pd.DataFrame([dict(Asset=k, **r["summary"]) for k, r in v_results.items()]).set_index("Asset")
-            st.subheader("Asset volatility overview")
-            st.dataframe(v_summary.style.format({"Rolling volatility (%)": "{:.2f}", "EWMA volatility (%)": "{:.2f}", "Forecast volatility (%)": "{:.2f}", "Volatility percentile (%)": "{:.1f}"}), use_container_width=True)
-            st.download_button("Download volatility summary CSV", v_summary.to_csv().encode("utf-8"), "volatility_summary.csv", "text/csv", key="vol_export")
-            v_asset = st.selectbox("Inspect asset", list(v_results), key="vol_inspect")
-            v_result = v_results[v_asset]
-            v_series = v_result["history"]
-            v_fig = go.Figure()
-            v_fig.add_trace(go.Scatter(x=v_series.index, y=v_series["Rolling"], name="Rolling annualized volatility"))
-            v_fig.add_trace(go.Scatter(x=v_series.index, y=v_series["EWMA"], name="EWMA annualized volatility"))
-            v_fig.update_layout(title=f"{v_asset} — Historical volatility", yaxis_title="Annualized volatility (%)", xaxis_title="Date", hovermode="x unified")
-            st.plotly_chart(v_fig, use_container_width=True)
-            st.metric(f"{st.session_state['vol_run_params']['model']} forecast ({st.session_state['vol_run_params']['horizon']} sessions)", f"{v_result['summary']['Forecast volatility (%)']:.2f}%")
-            st.caption("Forecast is the annualized volatility implied by the average predicted daily variance over the chosen horizon. It does not predict return direction.")
-            if st.button("Validate forecast out of sample", key="vol_validate"):
-                with st.spinner("Rolling-origin forecast validation (no future observations in estimation)..."):
-                    try:
-                        p = st.session_state["vol_run_params"]
-                        v_validation = backtest_volatility(v_result["returns"], p["model"], p["horizon"], p["train"], p["stride"], p["window"], p["decay"])
-                        st.session_state["vol_validation"] = (v_asset, v_validation)
-                    except Exception as e:
-                        st.error(f"Forecast validation failed: {e}")
-            v_stored = st.session_state.get("vol_validation")
-            if v_stored and v_stored[0] == v_asset:
-                v_validation = v_stored[1]
-                if v_validation.empty:
-                    st.info("Insufficient history for the chosen training window and forecast horizon. Increase the historical period.")
-                else:
-                    st.subheader("Out-of-sample forecast accuracy")
-                    v_err = pd.DataFrame({"QLIKE": v_validation.attrs.get("qlike", {}), "MSE (variance)": v_validation.attrs.get("mse", {})})
-                    st.dataframe(v_err, use_container_width=True)
-                    st.caption("Lower QLIKE and MSE are better. All forecasts are compared to the same realized horizon variance. This is model validation, not a trading signal.")
-                    st.dataframe(v_validation.tail(30), use_container_width=True)
-                    st.download_button("Download forecast validation CSV", v_validation.to_csv().encode("utf-8"), "volatility_forecast_validation.csv", "text/csv", key="vol_valid_export")
+        if portfolio_vol_tab.open:
+            with portfolio_vol_tab:
+                render_volatility(True, st.session_state, tickers, current_market_instruments, colored_metric)
+        if asset_vol_tab.open:
+            with asset_vol_tab:
+                screening = st.session_state.get("screening_results") or {}
+                default_assets = tickers or (st.session_state.get("quant_selected_tickers", [])
+                                              if screening.get("market") == market else [])
+                render_volatility(False, st.session_state, default_assets, current_market_instruments, colored_metric)
 
 
-# ML extension — uses shared sidebar portfolio parameters.
-with ml_tab:
-    render_ml_forecasting(tickers, risk_free_rate, max_weight, capital)
+if ml_tab.open:
+    with ml_tab:
+        from src.ml_research_ui import render_ml_research
 
-with ml_tab:
-    st.divider()
-    render_factor_ml_comparison(tickers, risk_free_rate, max_weight, capital)
+        st.header("ML Return Forecasting")
+        render_ml_research(tickers, market, risk_free_rate, max_weight, capital,
+                           style_backtest_analysis_tabs, prepare_portfolio_table, display_portfolio_table)
+
 
 
 if trading_signals_tab.open:
     with trading_signals_tab:
         render_trading_signals(colored_metric)
+
+
+if vix_tab.open:
+    with vix_tab:
+        from src.vix_ui import render_vix
+
+        render_vix(colored_metric)

@@ -112,7 +112,19 @@ def render_factor_ml_comparison(tickers, risk_free_rate, max_weight, capital):
     st.subheader('Portfolio allocation')
     allocations=result['weights'].copy()
     allocations['Target Amount (€)']=allocations['Weight']*capital
-    st.dataframe(allocations.style.format({'Weight':'{:.2%}','Target Amount (€)':'€{:,.2f}'})
+    from src.component_var import component_var
+
+    allocations["Invested"] = allocations["Target Amount (€)"]
+    for _, rows in allocations.groupby("Strategy"):
+        try:
+            exposure = rows.set_index("Ticker")["Invested"]
+            risk, _, _ = component_var(exposure, result["covariance"] / 252)
+            allocations.loc[rows.index, "Marginal VaR (%)"] = risk["Marginal VaR (%)"].to_numpy()
+            allocations.loc[rows.index, "Component VaR (€)"] = risk["Component VaR (EUR)"].to_numpy()
+        except ValueError as exc:
+            st.caption(f"Component VaR unavailable: {exc}")
+    st.dataframe(allocations.style.format({'Weight':'{:.2%}','Target Amount (€)':'€{:,.2f}',
+        'Invested':'€{:,.2f}', 'Marginal VaR (%)':'{:.4f}%', 'Component VaR (€)':'€{:,.2f}'})
         .background_gradient(subset=['Weight'],cmap='Purples'),hide_index=True,use_container_width=True)
     st.caption('Target amounts assume fractional shares. The existing Portfolio Optimization execution table should be used for integer quantities and residual cash.')
     st.subheader('ML prediction quality — purged chronological validation')

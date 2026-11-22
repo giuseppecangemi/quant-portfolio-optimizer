@@ -153,7 +153,10 @@ def optimize_maximum_sharpe(
     by_return = np.argsort(-excess, kind="stable")
     initial_weights = np.zeros(n_assets)
     initial_weights[by_return] = np.clip(1 - max_weight * np.arange(n_assets), 0, max_weight)
-    if initial_weights @ excess <= 0:
+    max_excess = initial_weights @ excess
+    if max_excess == 0:
+        return pd.Series(initial_weights, index=expected_returns.index)
+    if max_excess < 0:
         return _maximum_sharpe_at_vertex(excess, matrix, expected_returns.index, max_weight)
 
     normalized_excess = excess / np.max(np.abs(excess))
@@ -181,14 +184,83 @@ def optimize_maximum_sharpe(
         options={"ftol": 1e-12},
     )
 
-    if not result.success:
-        raise ValueError(
-            f"Ottimizzazione fallita: {result.message}"
-        )
+    def certification_gap(weights):
+        if (not np.isfinite(weights).all() or abs(weights.sum() - 1) > 1e-8
+                or weights.min() < -1e-8 or weights.max() > max_weight + 1e-8
+                or weights @ normalized_excess <= 0 or weights @ matrix @ weights <= 0):
+            return np.inf
+        # A linear oracle checks the first-order condition on the entire capped simplex.
+        grad = gradient(weights)
+        gap = grad @ weights - grad[np.argsort(grad)] @ initial_weights[by_return]
+        return gap / max(1., abs(negative_sharpe(weights)))
 
-    return pd.Series(
-        result.x,
-        index=expected_returns.index
+    def certified(weights):
+        return certification_gap(weights) <= 1e-7
+
+    if certified(result.x):
+        return pd.Series(result.x, index=expected_returns.index)
+
+    # Normalize excess return to one. The resulting convex problem minimizes
+    # variance with linear constraints and recovers the original weights by normalization.
+    target = normalized_excess @ initial_weights
+    cap_matrix = max_weight * np.ones((n_assets, n_assets)) - np.eye(n_assets)
+    transformed = minimize(
+        lambda x: float(x @ matrix @ x),
+        initial_weights,
+        jac=lambda x: 2 * (matrix @ x),
+        method="SLSQP",
+        bounds=[(0., None)] * n_assets,
+        constraints=[
+            {"type": "eq", "fun": lambda x: normalized_excess @ x - target,
+             "jac": lambda x: normalized_excess},
+            {"type": "ineq", "fun": lambda x: cap_matrix @ x,
+             "jac": lambda x: cap_matrix},
+        ],
+        options={"ftol": 1e-13, "maxiter": 500},
+    )
+    convex_gap = np.inf
+    if transformed.x.sum() > 0:
+        weights = transformed.x / transformed.x.sum()
+        convex_gap = certification_gap(weights)
+        if convex_gap <= 1e-7:
+            return pd.Series(weights, index=expected_returns.index)
+
+    # Polish near-optimal iterates with exact feasible pairwise exchanges.
+    # This avoids asking SLSQP to resolve tiny objective changes near a cap.
+    candidates = [(certification_gap(result.x), result.x)]
+    if transformed.x.sum() > 0:
+        candidates.append((convex_gap, weights))
+    gap, candidate = min(candidates, key=lambda entry: entry[0])
+    if gap <= 1e-3:
+        weights = candidate.copy()
+        for _ in range(2000):
+            if certified(weights):
+                return pd.Series(weights, index=expected_returns.index)
+            grad = gradient(weights)
+            source = np.argmax(np.where(weights > 1e-12, grad, -np.inf))
+            destination = np.argmin(np.where(weights < max_weight - 1e-12, grad, np.inf))
+            if grad[source] <= grad[destination]:
+                break
+            bound = min(weights[source], max_weight - weights[destination])
+            marginal = matrix @ weights
+            a = weights @ normalized_excess
+            b = normalized_excess[destination] - normalized_excess[source]
+            c = weights @ marginal
+            d = marginal[destination] - marginal[source]
+            e = matrix[source, source] + matrix[destination, destination] - 2 * matrix[source, destination]
+            curvature = a * e - b * d
+            step = min(bound, (b * c - a * d) / curvature) if curvature > 0 else bound
+            if step <= 0:
+                break
+            weights[source] -= step
+            weights[destination] += step
+
+    raise ValueError(
+        f"Maximum Sharpe failed certification. Ratio SLSQP status={result.status}, "
+        f"iterations={result.nit}: {result.message}. Convex SLSQP "
+        f"status={transformed.status}, iterations={transformed.nit}: {transformed.message}. "
+        f"Certification gaps ratio={certification_gap(result.x):.3g}, convex={convex_gap:.3g}; "
+        f"required <=1e-7. Initial weights={initial_weights.tolist()}."
     )
 
 
