@@ -1,4 +1,4 @@
-"""Daily close series from the index publishers."""
+"""Official index history and a separate spot VIX snapshot."""
 from io import StringIO
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
@@ -6,6 +6,8 @@ from urllib.request import Request, urlopen
 import numpy as np
 import pandas as pd
 import streamlit as st
+
+from src.trading_market import MAX_AGE, aware_timestamp, fetch_intraday, positive
 
 SOURCES = {
     "VIX": ("Cboe", "https://cdn.cboe.com/api/global/us_indices/daily_prices/VIX_History.csv"),
@@ -45,3 +47,40 @@ def load_history(index):
                          if isinstance(exc, HTTPError) else isinstance(exc, (URLError, TimeoutError)))
             if attempt or not retryable:
                 raise ValueError(f"{provider} daily history unavailable ({exc}).") from exc
+
+
+@st.cache_data(ttl=55, max_entries=1, show_spinner=False)
+def load_vix_intraday():
+    return fetch_intraday("^VIX")
+
+
+def vix_snapshot(response, now, confirmed_date=None):
+    """Latest usable spot VIX observation with its original provider timestamp."""
+    bars, meta, error = response
+    zone = "America/New_York"
+    session = now.tz_convert(zone).tz_localize(None).normalize()
+    candidates = []
+    market_time = aware_timestamp(meta.get("regularMarketTime"))
+    market_price = positive(meta.get("regularMarketPrice"))
+    if market_time is not None and market_price is not None:
+        candidates.append((market_time, market_price))
+    if isinstance(bars.index, pd.DatetimeIndex) and bars.index.tz is not None and "Close" in bars:
+        bars = bars.loc[~bars.index.duplicated(keep="last")].sort_index(ascending=False)
+        for stamp, raw in bars["Close"].items():
+            price = positive(raw)
+            if pd.notna(stamp) and stamp <= now and price is not None:
+                candidates.append((stamp, price))
+                break
+    candidates = [(stamp, price) for stamp, price in candidates
+                  if stamp <= now and stamp.tz_convert(zone).date() == session.date()]
+    if confirmed_date is not None and confirmed_date >= session:
+        return None, "Official daily close published"
+    if session.dayofweek >= 5 or not candidates:
+        return None, error or "No current-session quotation"
+    stamp, price = max(candidates, key=lambda quote: quote[0])
+    age = now - stamp
+    if age > MAX_AGE:
+        return None, "Intraday quotation is stale"
+    delay = positive(meta.get("exchangeDataDelayedBy"))
+    delay_label = f"provider delay {delay:g} min" if delay else "feed delay unverified"
+    return (stamp, price), f"{int(age.total_seconds() // 60)} min old · {delay_label}"

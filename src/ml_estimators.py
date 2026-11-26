@@ -83,6 +83,7 @@ def estimate_covariance(returns, method, panel=None):
 
 
 def optimize_inputs(mu, cov, method, rf, cap):
+    from src.portfolio_context import check_minimum
     if method == "Maximum Sharpe":
         w = optimize_maximum_sharpe(mu,cov,risk_free_rate=rf,max_weight=cap)
     elif method == "Minimum Volatility":
@@ -95,6 +96,7 @@ def optimize_inputs(mu, cov, method, rf, cap):
         raise ValueError(f"Unknown optimizer: {method}")
     if not np.isfinite(w).all() or not np.isclose(w.sum(),1,atol=1e-6) or w.min()<-1e-7 or w.max()>cap+1e-6:
         raise ValueError("Optimized portfolio failed weight constraints.")
+    check_minimum(w)
     return w
 
 

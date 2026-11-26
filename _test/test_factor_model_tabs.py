@@ -7,7 +7,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 source = (ROOT / "app_core.py").read_text()
 tree=ast.parse(source)
-names={'render_fama_french_model','render_fama_french_result','factor_estimation_caption','download_portfolio_weights'}
+names={'render_fama_french_model','render_fama_french_result','factor_estimation_caption','download_portfolio_weights','select_eur_rf_methodology'}
 defs='\n\n'.join(ast.get_source_segment(source,n) for n in tree.body if isinstance(n,ast.FunctionDef) and n.name in names)
 app=AppTest.from_string('''
 import streamlit as st
@@ -37,6 +37,8 @@ get_company_name=lambda name:name
 def capture_portfolio_configuration(tickers, market):
     return dict(universe=list(tickers), market=market, selection_mode="Manual Selection")
 from src import trading_signals_ui
+from src.eur_risk_free import EONIA_ESTR, ESTR_ONLY
+from src.portfolio_context import portfolio_settings
 factor_tab, trading_tab = st.tabs(["Factor Models","Trading Signals"], key="main_navigation", on_change="rerun")
 
 '''+defs+'''

@@ -2,7 +2,7 @@ import numpy as np
 import pandas as pd
 
 
-def calculate_capm(
+def _calculate_capm(
     asset_returns: pd.DataFrame,
     market_returns: pd.Series,
     risk_free_rate: float = 0.0,
@@ -60,6 +60,26 @@ def calculate_capm(
         )
 
     return pd.DataFrame(rows).set_index("Ticker")
+
+
+def calculate_capm(asset_returns, market_returns, risk_free_rate=0., periods_per_year=252):
+    from src.portfolio_context import portfolio_settings
+    config = portfolio_settings()
+    if config is None:
+        return _calculate_capm(asset_returns, market_returns, risk_free_rate, periods_per_year)
+
+    from src.factor_currency import factor_regions
+    from src.hybrid_portfolio import BENCHMARKS
+    from src.time_series_market import reporting_history
+    regions = factor_regions(asset_returns.columns)
+    curves = []
+    for region, group in regions.groupby(regions):
+        close = reporting_history(BENCHMARKS[region], config["base_currency"], prior_fx=True)[0]["Adj Close"]
+        r = close.reindex(asset_returns.index).pct_change(fill_method=None).dropna()
+        if len(r) < 2:
+            raise ValueError(f"Insufficient CAPM benchmark coverage for {region}.")
+        curves.append(_calculate_capm(asset_returns[group.index], r, risk_free_rate, periods_per_year))
+    return pd.concat(curves).reindex(asset_returns.columns)
 
 
 def capm_expected_returns(

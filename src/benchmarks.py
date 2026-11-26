@@ -153,7 +153,7 @@ def matched_portfolio_metrics(curve, dates, risk_free_rate, *, gross=False):
 def attach_etf_benchmarks(result, selected, market, risk_free_rate, quotes, fx, errors):
     """Attach optional benchmark outputs after portfolio execution."""
     dates = result["max_sharpe_bt"].index
-    currency = "USD" if market == "USA" else "EUR"
+    currency = result.get("portfolio_currency", "USD" if market == "USA" else "EUR")
     runs, reports, diagnostics = {}, [], []
     failures = dict(errors)
     if LEGACY_BENCHMARK in selected and "ftse_mib_bt" in result:

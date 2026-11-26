@@ -9,6 +9,8 @@ import streamlit as st
 
 from src.mc_coverage import ADAPTIVE, MANUAL, MIN_SESSIONS, STRICT, assess_coverage, download_history
 
+from src.portfolio_context import portfolio_settings
+
 cached_coverage_history = st.cache_data(ttl=3600, show_spinner=False, max_entries=4)(download_history)
 from src.mc_construction import (
     STATES, STRATEGIES, calibrate_ffr, cvar_contributions, draw_paths, equity_logs, scenario_allocation, state_variables,
@@ -101,13 +103,13 @@ def render_mc_construction(tickers, market, rf, cap, theme, benchmark="FTSEMIB.M
         lookback = st.selectbox("Calibration history", [252, 504, 756, 1260], index=1)
         policy = st.selectbox("Universe selection policy", [STRICT, ADAPTIVE, MANUAL])
         minimum = st.number_input("Minimum calibration sessions", MIN_SESSIONS, lookback, min(252, lookback)) if policy == ADAPTIVE else MIN_SESSIONS
-        key = (market, benchmark, tuple(dict.fromkeys(tickers)))
+        key = (market, benchmark, tuple(dict.fromkeys(tickers)), portfolio_settings())
         if st.button("Load daily prices", disabled=not tickers):
             st.session_state.pop("mc_coverage_raw", None)
             st.session_state.pop("mc_coverage_settings", None)
             try:
                 with st.spinner("Checking historical coverage by asset…"):
-                    st.session_state["mc_coverage_raw"] = (key, *cached_coverage_history(key[2], benchmark, market))
+                    st.session_state["mc_coverage_raw"] = (key, *cached_coverage_history(key[2], benchmark, market, key[3]))
             except ValueError as exc:
                 st.error(str(exc))
         raw = st.session_state.get("mc_coverage_raw")
@@ -225,7 +227,7 @@ def render_mc_construction(tickers, market, rf, cap, theme, benchmark="FTSEMIB.M
         st.caption("Risk budgeting and Resampled Portfolio Stacking are outside the implemented equity workflow.")
         if st.button("Optimize scenario portfolio"):
             try:
-                w, metrics = scenario_allocation(paths, strategy, alpha, cap, budget)
+                w, metrics = scenario_allocation(paths, strategy, alpha, cap, budget, assets=logs.columns)
                 if config["simulations"] * (1-alpha) < 10:
                     st.warning("Fewer than ten effective observations in the empirical CVaR tail.")
                 saved_config = {**config, "strategy": strategy, "alpha": alpha, "budget": budget}

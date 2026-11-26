@@ -4,7 +4,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.vix_analytics import PERIODS, compare_markets, date_bounds, rolling_statistics
-from src.vix_data import SOURCES, load_history
+from src.vix_data import load_history, load_vix_intraday, vix_snapshot
 
 COLORS = {"VIX": "#ffb454", "VSTOXX": "#55d9f5"}
 LEVEL_COLORS = ["#79b8a6", "#a6b97a", "#e9be60", "#ff9f55", "#fa7669", "#f25566"]
@@ -52,7 +52,7 @@ def terminal_chart(fig, start, end, ylabel, slider=False, selector=True):
     return fig
 
 
-def index_chart(index, frame, bounds, mean, bands, levels, slider):
+def index_chart(index, frame, bounds, mean, bands, levels, slider, quote=None):
     fig = go.Figure()
     for k in bands:
         for side in ("Lower", "Upper"):
@@ -67,6 +67,27 @@ def index_chart(index, frame, bounds, mean, bands, levels, slider):
                     customdata=frame[["Mean", "Std", "Z", "Percentile"]].to_numpy(),
                     hovertemplate="%{x|%d %b %Y}<br>%{y:.2f} pts<br>Mean %{customdata[0]:.2f} · σ %{customdata[1]:.2f}"
                                   "<br>Z %{customdata[2]:+.2f} · P %{customdata[3]:.1f}%<extra></extra>")
+    if quote is not None and bounds[1] == frame.index[-1]:
+        stamp, level = quote
+        point = stamp.tz_convert("Europe/Rome")
+        chart_time = point.tz_localize(None)
+        if chart_time.normalize() > frame.index[-1]:
+            fig.add_scatter(
+                x=[frame.index[-1], chart_time], y=[frame["Close"].iloc[-1], level],
+                mode="lines+markers", name="Intraday · provisional",
+                line=dict(color=COLORS[index], width=1.5, dash="dash"),
+                marker=dict(color=COLORS[index], size=[0, 9], symbol="diamond"),
+                hovertemplate=["<extra></extra>",
+                               f"{point:%d %b %Y, %H:%M %Z}<br>%{{y:.2f}} pts<extra>Intraday · provisional</extra>"],
+            )
+            fig.add_annotation(
+                x=chart_time, y=level,
+                text=f"<b>{point:%d %b} · {level:.2f} pts</b><br>Intraday · {point:%H:%M %Z}",
+                showarrow=True, arrowhead=0, ax=-77, ay=-34,
+                bgcolor="#202b39", bordercolor=COLORS[index], borderpad=5,
+                font=dict(color="#e2e8f0", size=12),
+            )
+            bounds = bounds[0], chart_time + pd.Timedelta(hours=12)
     for i, row in enumerate(levels):
         if row["Visible"] and pd.notna(row["Level"]) and float(row["Level"]) > 0:
             level = float(row["Level"])
@@ -84,14 +105,17 @@ def show_chart(fig, key):
     })
 
 
-def show_index(index, close, metric):
-    bounds = period_controls(close.index, index)
+def rolling_controls(index):
     a, b = st.columns(2)
     window = a.selectbox("Rolling window", [21, 63, 126, 252, "Custom"], index=3, key=f"{index}_window")
-    if window == "Custom":
-        window = a.number_input("Observations", 2, 5000, 252, key=f"{index}_window_custom")
     bands = b.multiselect("Standard deviation bands", [1, 2, 3], format_func=lambda k: f"±{k}σ",
                           key=f"{index}_bands")
+    if window == "Custom":
+        window = a.number_input("Observations", 2, 5000, 252, key=f"{index}_window_custom")
+    return window, bands
+
+
+def indicator_controls(index, close):
     with st.expander("Indicators and levels"):
         mean = st.checkbox("Rolling mean", value=True, key=f"{index}_mean")
         slider = st.checkbox("Range slider", key=f"{index}_slider")
@@ -115,33 +139,23 @@ def show_index(index, close, metric):
                                 column_config={"Level": st.column_config.NumberColumn(min_value=.01, format="%.2f"),
                                                "Visible": st.column_config.CheckboxColumn(default=True)})
         st.session_state[saved_key] = levels
-    if bounds is None:
-        return
-    frame = rolling_statistics(close, window)
-    visible = frame.loc[bounds[0]:bounds[1]]
-    if visible.empty:
-        st.info("No closes in the selected interval.")
-        return
-    row = visible.iloc[-1]
+    return mean, slider, levels.sort_values("Level").to_dict("records") if show_levels else []
 
+
+def index_metrics(row):
     def fmt(value, spec=".2f", unit=""):
         return f"{value:{spec}}{unit}" if pd.notna(value) else "—"
 
-    metrics = [
-        ("Last", fmt(row["Close"], unit=" pts")),
-        ("Change", f"{fmt(row['Change'], '+.2f', ' pts')} / {fmt(row['Change %'], '+.2f', '%')}"),
+    return [
+        ("Daily close", fmt(row["Close"], unit=" pts")),
+        ("Daily change", f"{fmt(row['Change'], '+.2f', ' pts')} / {fmt(row['Change %'], '+.2f', '%')}"),
         ("Rolling mean", fmt(row["Mean"], unit=" pts")), ("Std dev", fmt(row["Std"], unit=" pts")),
         ("Z-score", fmt(row["Z"], "+.2f")), ("Percentile", fmt(row["Percentile"], ".1f", "%")),
         ("Rolling min", fmt(row["Min"], unit=" pts")), ("Rolling max", fmt(row["Max"], unit=" pts")),
     ]
-    for start in (0, 4):
-        for column, (label, value) in zip(st.columns(4), metrics[start:start+4]):
-            with column:
-                metric(label, value, "yellow" if index == "VIX" else "blue")
-    st.caption(f"KPI as of {visible.index[-1]:%Y-%m-%d} · {window} valid closes")
-    show_chart(index_chart(index, frame, bounds, mean, bands,
-                           levels.sort_values("Level").to_dict("records") if show_levels else [], slider),
-               f"{index}_daily")
+
+
+def show_explanation(index, window, row):
     if pd.isna(row["Mean"]):
         st.caption("Insufficient history for the selected rolling window at this date.")
     else:
@@ -149,6 +163,79 @@ def show_index(index, close, metric):
         context = f"Z-score {row['Z']:+.2f}" if pd.notna(row["Z"]) else "Z-score unavailable (zero dispersion)"
         st.caption(f"{index} is {gap:+.2f} points relative to its {window}-close mean. "
                    f"{context} · trailing empirical percentile {row['Percentile']:.1f}%.")
+
+
+def market_columns(paired):
+    return st.columns(2, gap="medium") if paired else (st.container(),)
+
+
+def show_index_rows(indexes, series, metric, quote=None, *, paired=False):
+    if not series:
+        return
+    bounds, rolling, indicators, results = {}, {}, {}, {}
+    for index, cell in zip(indexes, market_columns(paired)):
+        if index in series:
+            with cell:
+                bounds[index] = period_controls(series[index].index, index)
+    for index, cell in zip(indexes, market_columns(paired)):
+        if index in series:
+            with cell:
+                rolling[index] = rolling_controls(index)
+    for index, cell in zip(indexes, market_columns(paired)):
+        if index in series:
+            with cell:
+                indicators[index] = indicator_controls(index, series[index])
+    for index, close in series.items():
+        selected = bounds[index]
+        if selected is None:
+            continue
+        window, _ = rolling[index]
+        frame = rolling_statistics(close, window)
+        visible = frame.loc[selected[0]:selected[1]]
+        if not visible.empty:
+            results[index] = frame, visible.iloc[-1]
+
+    if paired:
+        st.html("""
+        <style>
+        .st-key-vix_aligned_kpis .kangemi-colored-metric {
+            height: 7rem;
+            overflow: auto;
+        }
+        .st-key-vix_aligned_kpis .kangemi-colored-metric > div:last-child {
+            font-size: clamp(1rem, 1.45vw, 1.55rem) !important;
+            overflow-wrap: anywhere;
+        }
+        </style>
+        """)
+    with st.container(key="vix_aligned_kpis" if paired else None):
+        for start in (0, 4):
+            for index, cell in zip(indexes, market_columns(paired)):
+                if index in results:
+                    with cell:
+                        _, row = results[index]
+                        for card, (label, value) in zip(st.columns(4), index_metrics(row)[start:start + 4]):
+                            with card:
+                                metric(label, value, "yellow" if index == "VIX" else "blue")
+    for index, cell in zip(indexes, market_columns(paired)):
+        with cell:
+            if index in results:
+                _, row = results[index]
+                st.caption(f"KPI as of {row.name:%Y-%m-%d} · {rolling[index][0]} valid closes")
+            elif bounds.get(index) is not None:
+                st.info("No closes in the selected interval.")
+    for index, cell in zip(indexes, market_columns(paired)):
+        if index in results:
+            with cell:
+                frame, _ = results[index]
+                _, bands = rolling[index]
+                mean, slider, levels = indicators[index]
+                show_chart(index_chart(index, frame, bounds[index], mean, bands, levels, slider,
+                                       quote if index == "VIX" else None), f"{index}_daily")
+    for index, cell in zip(indexes, market_columns(paired)):
+        if index in results:
+            with cell:
+                show_explanation(index, rolling[index][0], results[index][1])
 
 
 def show_comparison(series):
@@ -187,24 +274,106 @@ def show_comparison(series):
     st.dataframe(visible.agg(["count", "mean", "std", "min", "median", "max"]).round(2), width="stretch")
 
 
+def show_vix_snapshot(metric):
+    refresh = st.button("Refresh Data", key="vix_refresh")
+    if refresh:
+        load_vix_intraday.clear()
+    close, daily_error = None, None
+    try:
+        close = load_history("VIX")
+    except ValueError as exc:
+        daily_error = str(exc)
+    confirmed_date = close.index[-1] if close is not None else None
+    response = load_vix_intraday()
+    quote, detail = vix_snapshot(response, pd.Timestamp.now(tz="UTC"), confirmed_date)
+    if quote is not None:
+        stamp, level = quote
+        metric("VIX spot · Intraday", f"{level:.2f} pts", "yellow")
+        local = stamp.tz_convert("Europe/Rome")
+        st.caption(f"Yahoo Finance · {local:%d %b %Y, %H:%M:%S %Z} · {detail}")
+        if close is not None:
+            baseline = close.iloc[-1]
+            st.caption(f"{level - baseline:+.2f} pts / {level / baseline - 1:+.2%} "
+                       f"vs Cboe official close of {confirmed_date:%d %b %Y}.")
+    elif close is not None:
+        metric("VIX spot · Official close", f"{close.iloc[-1]:.2f} pts", "yellow")
+        st.caption(f"Cboe · {confirmed_date:%d %b %Y} · {detail}")
+    else:
+        metric("VIX spot · Unavailable", "—", "yellow")
+        st.caption(detail)
+    return close, daily_error, quote
+
+
+MARKET_TITLES = {"VIX": "US Market — CBOE VIX", "VSTOXX": "European Market — VSTOXX"}
+
+
+def load_european_market():
+    try:
+        with st.spinner("Loading VSTOXX daily history…"):
+            return load_history("VSTOXX"), None
+    except ValueError as exc:
+        return None, str(exc)
+
+
+def show_european_status(metric, close, error):
+    if error:
+        st.warning(error)
+    else:
+        metric("VSTOXX · Official close", f"{close.iloc[-1]:.2f} pts", "blue")
+        st.caption(f"STOXX · Latest official close {close.index[-1]:%Y-%m-%d} · "
+                   "[STOXX index page](https://stoxx.com/index/v2tx/)")
+
+
+def show_vix_status(metric):
+    close, error, quote = show_vix_snapshot(metric)
+    if close is None:
+        st.warning(error)
+    elif quote is not None:
+        st.caption(f"Cboe · Latest official close {close.index[-1]:%Y-%m-%d}")
+    return close, quote
+
+
+def show_vix_panel(metric):
+    st.subheader(MARKET_TITLES["VIX"])
+    close, quote = show_vix_status(metric)
+    if close is not None:
+        show_index_rows(("VIX",), {"VIX": close}, metric, quote)
+    return close
+
+
+def show_market_grid(metric, europe):
+    for index, cell in zip(MARKET_TITLES, market_columns(True)):
+        cell.subheader(MARKET_TITLES[index])
+    us_cell, europe_cell = market_columns(True)
+    with us_cell, st.container(height=240, border=False):
+        us, quote = show_vix_status(metric)
+    with europe_cell, st.container(height=240, border=False):
+        show_european_status(metric, *europe)
+    series = {index: close for index, close in zip(MARKET_TITLES, (us, europe[0])) if close is not None}
+    show_index_rows(MARKET_TITLES, series, metric, quote, paired=True)
+    return series
+
+
 def render_vix(metric):
     st.header("VIX | VOLATILITY & MARKET SENTIMENT")
     st.caption("Implied Volatility Monitoring — US & European Equity Markets")
+    interval = st.selectbox("Automatic quote refresh", [1, 2, 3, 4, 5, 0],
+                            format_func=lambda minutes: f"Every {minutes} min" if minutes else "Off")
     layout = st.radio("Chart layout", ["Full width", "Side by side"], index=1, horizontal=True)
-    panels = st.columns(2) if layout == "Side by side" else [st.container(), st.container()]
-    series = {}
-    for panel, (key, title) in zip(panels, [("VIX", "US Market — CBOE VIX"), ("VSTOXX", "European Market — VSTOXX")]):
-        with panel:
-            st.subheader(title)
-            try:
-                with st.spinner(f"Loading {key} daily history…"):
-                    close = load_history(key)
-            except ValueError as exc:
-                st.warning(str(exc))
-                continue
-            series[key] = close
-            st.caption(f"{SOURCES[key][0]} · Daily historical closes · Latest available {close.index[-1]:%Y-%m-%d}")
-            show_index(key, close, metric)
+    run_every = interval * 60 if interval else None
+    if layout == "Side by side":
+        series = st.fragment(show_market_grid, run_every=run_every)(metric, load_european_market())
+    else:
+        series = {}
+        us = st.fragment(show_vix_panel, run_every=run_every)(metric)
+        if us is not None:
+            series["VIX"] = us
+        st.subheader(MARKET_TITLES["VSTOXX"])
+        close, error = load_european_market()
+        show_european_status(metric, close, error)
+        if close is not None:
+            series["VSTOXX"] = close
+            show_index_rows(("VSTOXX",), {"VSTOXX": close}, metric)
     if len(series) == 2:
         show_comparison(series)
     else:

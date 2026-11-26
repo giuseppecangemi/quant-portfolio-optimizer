@@ -30,6 +30,7 @@ from src.ff3_attribution import compute_ff3_attribution, compute_ff5_attribution
 from src.fama_french_5 import load_europe_ff5, load_us_ff5, fit_ff5, estimate_ff5_eur_returns
 from src.eur_risk_free import EONIA_ESTR, ESTR_ONLY
 from src.factor_currency import estimate_factor_returns, factors_for_backtest_signal
+from src.portfolio_context import configure_portfolio, minimum_for, portfolio_settings
 from src.data import get_prices as _get_raw_prices
 from src.fama_french import (
     load_europe_ff3, load_us_ff3, fit_ff3, convert_eur_prices_to_usd,
@@ -126,11 +127,7 @@ def factor_estimation_caption(model, result):
 
 
 def get_prices(tickers, period="5y", *, preserve_missing=False):
-    """Adjusted prices in the selected market's native quotation currency.
-
-    USA equities and ^GSPC remain USD; Borsa Italiana remains EUR.
-    No implicit EUR conversion is performed.
-    """
+    """Adjusted prices for the active selection, in its configured currency."""
     return _get_raw_prices(tickers, period=period, preserve_missing=preserve_missing)
 
 
@@ -148,7 +145,7 @@ def _json_safe(value):
     NaN, +inf e -inf vengono convertiti in None perché non sono valori
     JSON validi quando allow_nan=False.
     """
-    if value is None:
+    if value is None or value is pd.NA or value is pd.NaT:
         return None
 
     if isinstance(value, (float, np.floating)):
@@ -169,7 +166,7 @@ def _json_safe(value):
     if isinstance(value, np.ndarray):
         return {
             "__type__": "ndarray",
-            "data": value.tolist(),
+            "data": _json_safe(value.tolist()),
         }
 
     if isinstance(value, pd.Series):
@@ -206,7 +203,10 @@ def _json_safe(value):
     if isinstance(value, (list, tuple, set)):
         return [_json_safe(item) for item in value]
 
-    if pd.isna(value):
+    if isinstance(value, (pd.Index, pd.api.extensions.ExtensionArray)):
+        return _json_safe(value.tolist())
+
+    if pd.api.types.is_scalar(value) and pd.isna(value):
         return None
 
     return str(value)
@@ -291,21 +291,9 @@ def build_experiment_snapshot(
     if isinstance(fixed_state, dict):
         complete_factor_attributions(fixed_state)
 
-    selected_assets = []
-    for ticker in tickers:
-        match = current_instruments[current_instruments["ticker"] == ticker]
-    if match.empty:
-        match = instruments[instruments["ticker"] == ticker]
-        selected_assets.append(
-            {
-                "ticker": ticker,
-                "name": (
-                    match.iloc[0]["name"]
-                    if not match.empty
-                    else ticker
-                ),
-            }
-        )
+    configured = portfolio_settings()
+    selected_assets = (configured["assets"] if configured else
+                       [{"ticker": ticker, "name": get_company_name(ticker)} for ticker in tickers])
 
     snapshot = {
         "experiment": {
@@ -355,6 +343,9 @@ def build_experiment_snapshot(
         },
     }
 
+    if configured:
+        snapshot["asset_selection"]["hybrid_universe"] = configured
+        snapshot["portfolio_parameters"]["base_currency"] = configured["base_currency"]
     return _json_safe(snapshot)
 
 
@@ -539,7 +530,8 @@ def select_eur_rf_methodology(market, key):
 
 
 def add_factor_attributions(result, market, ff3_factors, ff5_factors, eurusd):
-    if market == "USA":
+    configuration = result.get("selection_configuration")
+    if market == "USA" and not configuration:
         return
     for model, compute, factors in (
         ("ff3", compute_ff3_attribution, ff3_factors),
@@ -547,10 +539,21 @@ def add_factor_attributions(result, market, ff3_factors, ff5_factors, eurusd):
     ):
         for strategy in (model, f"{model}_factor"):
             try:
+                fx = eurusd
+                if configuration:
+                    from src.factor_currency import configured_factor_inputs, factor_covariance_available
+                    from src.portfolio_context import configure_portfolio, portfolio_scope
+
+                    history = result["risk_prices"]
+                    with portfolio_scope():
+                        configure_portfolio(configuration)
+                        if not factor_covariance_available(history.columns):
+                            raise ValueError("This attribution requires a common factor set. The assets use different regional sets.")
+                        _, factors, fx, _, _ = next(configured_factor_inputs(history, factors, model, eurusd))
                 result[f"{strategy}_performance_attribution"] = compute(
                     result[f"{strategy}_bt"], result[f"{model}_factor_cov_exposure_history" if strategy != model
                                                          else f"{model}_factor_exposure_history"],
-                    factors, eurusd, eur_rf_mode=result.get("eur_rf_mode", ESTR_ONLY),
+                    factors, fx, eur_rf_mode=result.get("eur_rf_mode", ESTR_ONLY),
                 )
             except (ValueError, KeyError, TypeError) as error:
                 result[f"{strategy}_attribution_error"] = str(error)
@@ -1265,11 +1268,10 @@ def prepare_portfolio_table(
 
     df["Target Amount"] = df["Weight"] * capital
 
-    df["Price"] = (
-        prices.iloc[-1]
-        .reindex(df.index)
-    )
-
+    execution_close = prices.attrs.get("execution_close")
+    df["Price"] = (pd.Series(execution_close, dtype=float) if execution_close else prices.iloc[-1]).reindex(df.index)
+    if execution_close and (df.Price.isna().any() or df.Price.le(0).any()):
+        raise ValueError("Missing executable common-currency closing prices.")
     if use_fractional_shares:
         df["Quantity"] = (
             df["Target Amount"] / df["Price"]
@@ -1287,6 +1289,10 @@ def prepare_portfolio_table(
         by="Invested",
         ascending=False,
     )
+
+    if config := portfolio_settings():
+        from src.hybrid_portfolio import annotate_allocation
+        df = annotate_allocation(df, capital, config)
 
     return df
 
@@ -1415,13 +1421,20 @@ def style_portfolio_table(
         }
     )
 
+    if "Minimum weight" in df:
+        styled_df = styled_df.format({"Minimum weight": "{:.2%}", "Effective weight": "{:.2%}"})
+        styled_df = styled_df.map(lambda value: "background-color:#7f2637;color:#fff" if value else "",
+                                  subset=["Below minimum"])
+
     return styled_df
 
 
 def capture_portfolio_configuration(tickers, market):
     screening = st.session_state.get("screening_results") or {}
     quant = selection_mode == "Quant Selection"
+    configured = portfolio_settings()
     return {
+        **({"effective_universe": configured} if configured else {}),
         "selection_mode": selection_mode,
         "market": market,
         "universe": list(current_market_instruments["ticker"]) if quant else list(tickers),
@@ -1461,8 +1474,14 @@ def download_portfolio_weights(weights, portfolio_key, result=None, prefix=""):
             "sharpe": float(result[prefix + "sharpe"]),
             "factor_statistics": result["stats"].to_json(orient="split") if "stats" in result else None,
         }
-        stage_trading_portfolio(weights, portfolio_key,
-                                {t: get_company_name(t) for t in weights.index}, metadata)
+        configuration = (metadata["configuration"] or {}).get("effective_universe")
+        requirements = {item["ticker"]: item["minimum"] for item in configuration["assets"]} if configuration else {}
+        if any(weights.get(ticker, 0.) < lower - 1e-8 for ticker, lower in requirements.items()):
+            st.button("Activate in Trading Signals", key=f"stage_trading_{portfolio_key}", disabled=True,
+                      help="This allocation does not satisfy the individual minimum weights.")
+        else:
+            stage_trading_portfolio(weights, portfolio_key,
+                                    {t: get_company_name(t) for t in weights.index}, metadata)
 
     export = weights.rename("Target Weight").rename_axis("Ticker").to_frame()
     export.insert(0, "Instrument", [get_company_name(ticker) for ticker in export.index])
@@ -1893,6 +1912,8 @@ def render_backtesting_comparison(standard_results, fixed_result, key_prefix="li
 def calculate_drawdown(backtest_data):
 
     values = backtest_data["Portfolio Value"]
+    if values.empty:
+        return values.copy()
     running_max = values.cummax().clip(lower=backtest_data.attrs.get("initial_capital", values.iloc[0]))
 
     return (values / running_max) - 1
@@ -2034,6 +2055,8 @@ def _cost_adjusted_metrics(curve, capital, risk_free_rate):
     La curva del portafoglio è mantenuta intatta; viene passata una copia
     con baseline esplicita al motore centralizzato delle metriche.
     """
+    if curve.empty:
+        return {}
     if not np.isfinite(capital) or capital <= 0:
         raise ValueError("Initial capital must be finite and positive")
     metric_curve = curve.copy()
@@ -2117,9 +2140,19 @@ def run_fixed_horizon_engine(
     # =====================================================
     # POINT-IN-TIME ASSET SELECTION AT T0
     # =====================================================
+    from src.factor_currency import factor_covariance_available
+    from src.portfolio_context import IncompatibleAllocation, check_minimum, portfolio_settings
+    from src.hybrid_portfolio import eligible_manual, manual_records, native_ranking_prices
+
+    configured = portfolio_settings()
+    historical_manual = manual_records(configured) if configured else {}
+    manual_status = {}
     if selection_top_n is not None:
+        native_ranking = native_ranking_prices(prices)
+        ranking_window = (estimation_prices if native_ranking is None else
+                          native_ranking.loc[:estimation_prices.index[-1]].tail(estimation_days+1))
         ranking, selected_tickers = screen_quant_point_in_time(
-            estimation_prices, estimation_prices.iloc[-1], estimation_prices.index[-1],
+            ranking_window, ranking_window.iloc[-1], estimation_prices.index[-1],
             historical_fundamentals, top_n=int(selection_top_n),
             min_observations=max(252, min(estimation_days + 1, 253)),
             active_factors=active_factors,
@@ -2127,6 +2160,10 @@ def run_fixed_horizon_engine(
         if selection_audit is not None:
             selection_audit[str(test_prices.index[0].date())] = ranking.copy()
 
+        if historical_manual:
+            selected_tickers, manual_status = eligible_manual(estimation_prices, selected_tickers, historical_manual, ranked=True)
+            if selection_audit is not None:
+                selection_audit[str(test_prices.index[0].date())].attrs["manual_status"] = manual_status
         if len(selected_tickers) < 2:
             raise ValueError("Point-in-time screening produced fewer than two assets.")
 
@@ -2134,6 +2171,9 @@ def run_fixed_horizon_engine(
         test_prices = test_prices[selected_tickers].ffill()
         tickers = selected_tickers
     else:
+        if historical_manual:
+            tickers, manual_status = eligible_manual(estimation_prices, list(estimation_prices.columns), historical_manual)
+            estimation_prices, test_prices = estimation_prices[tickers], test_prices[tickers]
         if not np.isfinite(test_prices.iloc[0]).all() or test_prices.iloc[0].le(0).any():
             raise ValueError("Missing or invalid execution price at the Fixed-Horizon start.")
         test_prices = test_prices.ffill()
@@ -2143,7 +2183,7 @@ def run_fixed_horizon_engine(
     # =====================================================
 
     estimation_returns = calculate_returns(
-        estimation_prices
+        estimation_prices.dropna() if configured else estimation_prices
     )
 
     expected_returns = annualized_returns(
@@ -2211,23 +2251,29 @@ def run_fixed_horizon_engine(
 
     # Factor-implied covariance: same FF3/FF5 expected returns, different risk model.
     from src.factor_covariance import estimate_factor_covariance, factor_risk_record
-    ff3_factor_cov, ff3_risk = estimate_factor_covariance(
-        estimation_prices, signal_ff3, model="ff3", eurusd_prices=eurusd_prices, market=market,
-        return_components=True, eur_rf_mode=eur_rf_mode,
-    )
-    ff5_factor_cov, ff5_risk = estimate_factor_covariance(
-        estimation_prices, signal_ff5, model="ff5", eurusd_prices=eurusd_prices, market=market,
-        return_components=True, eur_rf_mode=eur_rf_mode,
-    )
-    ff3_factor_weights = optimize_maximum_sharpe(
-        ff3_mu, ff3_factor_cov.reindex(index=covariance.index, columns=covariance.columns),
-        risk_free_rate=risk_free_rate, max_weight=max_weight,
-    )
-    ff5_factor_weights = optimize_maximum_sharpe(
-        ff5_mu, ff5_factor_cov.reindex(index=covariance.index, columns=covariance.columns),
-        risk_free_rate=risk_free_rate, max_weight=max_weight,
-    )
+    unavailable = {}
+    ff3_factor_cov = ff5_factor_cov = ff3_risk = ff5_risk = None
+    ff3_factor_weights = ff5_factor_weights = pd.Series(dtype=float)
+    if not configured or factor_covariance_available(estimation_prices.columns):
+        ff3_factor_cov, ff3_risk = estimate_factor_covariance(
+            estimation_prices, signal_ff3, model="ff3", eurusd_prices=eurusd_prices, market=market,
+            return_components=True, eur_rf_mode=eur_rf_mode,
+        )
+        ff5_factor_cov, ff5_risk = estimate_factor_covariance(
+            estimation_prices, signal_ff5, model="ff5", eurusd_prices=eurusd_prices, market=market,
+            return_components=True, eur_rf_mode=eur_rf_mode,
+        )
+        ff3_factor_weights = optimize_maximum_sharpe(
+            ff3_mu, ff3_factor_cov.reindex(index=covariance.index, columns=covariance.columns),
+            risk_free_rate=risk_free_rate, max_weight=max_weight,
+        )
+        ff5_factor_weights = optimize_maximum_sharpe(
+            ff5_mu, ff5_factor_cov.reindex(index=covariance.index, columns=covariance.columns),
+            risk_free_rate=risk_free_rate, max_weight=max_weight,
+        )
 
+    else:
+        unavailable["FF3/FF5 Factor Cov"] = "Different regional factor sets require a joint risk specification."
     # Minimum Volatility calcolato una sola volta
     min_vol_weights = (
         optimize_minimum_volatility(
@@ -2259,11 +2305,24 @@ def run_fixed_horizon_engine(
         index=expected_returns.index,
     )
 
+    if configured:
+        for name, weights in (("HRP", hrp_weights), ("Equal Weight", equal_weight_weights)):
+            try:
+                check_minimum(weights)
+            except IncompatibleAllocation as exc:
+                unavailable[name] = str(exc)
+                if name == "HRP":
+                    hrp_weights = pd.Series(dtype=float)
+                else:
+                    equal_weight_weights = pd.Series(dtype=float)
+
     # =====================================================
     # BUY & HOLD SIMULATION
     # =====================================================
 
     def build_buy_and_hold(weights):
+        if weights.empty:
+            return pd.DataFrame(columns=["Portfolio Value", "Daily Return"], index=pd.DatetimeIndex([]))
 
         weights = (
             weights
@@ -2342,6 +2401,8 @@ def run_fixed_horizon_engine(
         (ff3_factor_bt, ff3_factor_weights, ff3_risk, ff3_factor_cov, True),
         (ff5_factor_bt, ff5_factor_weights, ff5_risk, ff5_factor_cov, True),
     ):
+        if curve.empty or risk_model is None:
+            continue
         try:
             record = factor_risk_record(weights, risk_model, optimizer_cov,
                                         estimation_prices.index[-1], uses_factor_cov)
@@ -2557,6 +2618,8 @@ def run_fixed_horizon_engine(
             "Min Volatility": min_vol_bt, "Risk Parity": risk_parity_bt,
             "HRP": hrp_bt, "Equal Weight": equal_weight_bt,
         }.items():
+            if curve.empty:
+                continue
             log = curve.attrs.get("transaction_log", pd.DataFrame())
             gross = curve.get("Gross Portfolio Value")
             transaction_cost_summary[name] = {
@@ -2579,6 +2642,10 @@ def run_fixed_horizon_engine(
         ("hrp_bt", hrp_weights_history, expected_returns, covariance),
         ("equal_weight_bt", equal_weight_weights_history, expected_returns, covariance),
     ):
+        if risk_matrix is None or (key == "hrp_bt" and "HRP" in unavailable) or (
+            key == "equal_weight_bt" and "Equal Weight" in unavailable
+        ):
+            continue
         weights = history.iloc[0]
         tickers_in_order = weights.index
         expected = portfolio_return(weights.to_numpy(), mu.reindex(tickers_in_order))
@@ -2618,6 +2685,8 @@ def run_fixed_horizon_engine(
         except (ValueError, ImportError, RuntimeError, np.linalg.LinAlgError) as exc:
             ml_errors[name] = f"Historical fit or execution · {effective_start:%Y-%m-%d} · {exc}"
     return {
+        **({"portfolio_currency": configured["base_currency"], "unavailable_strategies": unavailable,
+            "selection_configuration": configured} if configured else {}),
         "ml_runs": ml_runs, "ml_errors": ml_errors,
         "risk_prices": prices,
         "initial_ex_ante_kpis": initial_ex_ante_kpis,
@@ -2789,6 +2858,8 @@ def run_backtest_engine(
 ):
 
     from src.backtest_inputs import prepare_walk_forward_window
+    from src.factor_currency import factor_covariance_available
+    from src.portfolio_context import IncompatibleAllocation, portfolio_settings
 
     prepared = prepare_walk_forward_window(
         prices, lookback_days, selection_policy=selection_policy, models=(),
@@ -2884,9 +2955,24 @@ def run_backtest_engine(
         ff5_factors=ff5_factors, eurusd_prices=eurusd_prices,
         ff5_exposure_records=ff5_exposure_records,
     )
+    configured = portfolio_settings()
+    unavailable = {}
+
+    def optional_strategy(*args, **kwargs):
+        name = kwargs["strategy"]
+        if configured and name in ("ff3_factor_cov_max_sharpe", "ff5_factor_cov_max_sharpe"):
+            if not factor_covariance_available(args[0].columns):
+                unavailable[name] = "Different regional factor sets require a joint risk specification."
+                return pd.DataFrame(columns=["Portfolio Value", "Daily Return"], index=pd.DatetimeIndex([])), pd.DataFrame(index=pd.DatetimeIndex([]))
+        try:
+            return backtest_portfolio(*args, **kwargs)
+        except IncompatibleAllocation as exc:
+            unavailable[name] = str(exc)
+            return pd.DataFrame(columns=["Portfolio Value", "Daily Return"], index=pd.DatetimeIndex([])), pd.DataFrame(index=pd.DatetimeIndex([]))
+
     ff3_factor_records = []
     ff5_factor_records = []
-    ff3_factor_bt, ff3_factor_weights_history = backtest_portfolio(
+    ff3_factor_bt, ff3_factor_weights_history = optional_strategy(
         prices,
         capture_initial_ex_ante=True, strategy="ff3_factor_cov_max_sharpe", market=market, eur_rf_mode=eur_rf_mode,
         initial_capital=capital, lookback_days=lookback_days,
@@ -2898,7 +2984,7 @@ def run_backtest_engine(
         ff3_factors=ff3_factors, eurusd_prices=eurusd_prices,
         ff3_exposure_records=ff3_factor_records,
     )
-    ff5_factor_bt, ff5_factor_weights_history = backtest_portfolio(
+    ff5_factor_bt, ff5_factor_weights_history = optional_strategy(
         prices,
         capture_initial_ex_ante=True, strategy="ff5_factor_cov_max_sharpe", market=market, eur_rf_mode=eur_rf_mode,
         initial_capital=capital, lookback_days=lookback_days,
@@ -2911,8 +2997,8 @@ def run_backtest_engine(
         ff5_exposure_records=ff5_factor_records,
     )
 
-    ff3_factor_cov_exposure_history = pd.DataFrame(ff3_factor_records).set_index("Rebalance Date")
-    ff5_factor_cov_exposure_history = pd.DataFrame(ff5_factor_records).set_index("Rebalance Date")
+    ff3_factor_cov_exposure_history = pd.DataFrame(ff3_factor_records).set_index("Rebalance Date") if ff3_factor_records else pd.DataFrame()
+    ff5_factor_cov_exposure_history = pd.DataFrame(ff5_factor_records).set_index("Rebalance Date") if ff5_factor_records else pd.DataFrame()
 
     ff5_factor_exposure_history = pd.DataFrame(ff5_exposure_records)
     if not ff5_factor_exposure_history.empty:
@@ -2965,7 +3051,7 @@ def run_backtest_engine(
     (
         hrp_bt,
         hrp_weights_history,
-    ) = backtest_portfolio(
+    ) = optional_strategy(
         prices,
         capture_initial_ex_ante=True,
         strategy="hrp",
@@ -2987,7 +3073,7 @@ def run_backtest_engine(
     (
         equal_weight_bt,
         equal_weight_weights_history,
-    ) = backtest_portfolio(
+    ) = optional_strategy(
         prices,
         capture_initial_ex_ante=True,
         strategy="equal_weight",
@@ -3177,6 +3263,8 @@ def run_backtest_engine(
             "Min Volatility": min_vol_bt, "Risk Parity": risk_parity_bt,
             "HRP": hrp_bt, "Equal Weight": equal_weight_bt,
         }.items():
+            if curve.empty:
+                continue
             log = curve.attrs.get("transaction_log", pd.DataFrame())
             gross = curve.get("Gross Portfolio Value")
             transaction_cost_summary[name] = {
@@ -3221,6 +3309,8 @@ def run_backtest_engine(
         except (ValueError, ImportError, RuntimeError, np.linalg.LinAlgError) as exc:
             ml_errors[name] = f"Historical fit or execution · {exc}"
     return {
+        **({"portfolio_currency": configured["base_currency"], "unavailable_strategies": unavailable,
+            "selection_configuration": configured} if configured else {}),
         "ml_runs": ml_runs, "ml_errors": ml_errors,
         "risk_prices": prices,
         "transaction_cost_summary": transaction_cost_summary,
@@ -3717,10 +3807,12 @@ def display_backtest_results(
         etf_runs = {name: run for name, run in etf_runs.items()
                     if run.get("status") != "COMPLETE_WITH_IMPUTATION"}
     show_index = LEGACY_BENCHMARK in benchmark_selection
+    for strategy, reason in result.get("unavailable_strategies", {}).items():
+        st.caption(f"{strategy}: {reason}")
     index_label = (benchmark_label(LEGACY_BENCHMARK, result["benchmark_market"])
                    if "benchmark_market" in result else LEGACY_BENCHMARK)
 
-    value_currency = "USD" if result.get("benchmark_market") == "USA" else "EUR"
+    value_currency = result.get("portfolio_currency") or ("USD" if result.get("benchmark_market") == "USA" else "EUR")
     value_symbol = "$" if value_currency == "USD" else "€"
 
     st.header(title)
@@ -3903,7 +3995,7 @@ def display_backtest_results(
         ("FF5 Factor Cov Maximum Sharpe", "ff5_factor_bt", "#FFD166"),
     ):
         factor_curve = result.get(factor_key)
-        if isinstance(factor_curve, pd.DataFrame) and "Portfolio Value" in factor_curve.columns:
+        if isinstance(factor_curve, pd.DataFrame) and not factor_curve.empty and "Portfolio Value" in factor_curve.columns:
             portfolio_fig.add_trace(go.Scatter(
                 x=factor_curve.index, y=factor_curve["Portfolio Value"],
                 mode="lines", name=factor_label,
@@ -4128,7 +4220,7 @@ def display_backtest_results(
         ("FF5 Factor Cov Maximum Sharpe", "ff5_factor_bt", "#FFD166"),
     ):
         factor_curve = result.get(factor_key)
-        if isinstance(factor_curve, pd.DataFrame) and "Portfolio Value" in factor_curve.columns:
+        if isinstance(factor_curve, pd.DataFrame) and not factor_curve.empty and "Portfolio Value" in factor_curve.columns:
             factor_drawdown = calculate_drawdown(factor_curve)
             drawdown_fig.add_trace(go.Scatter(
                 x=factor_drawdown.index, y=factor_drawdown,
@@ -4778,7 +4870,7 @@ FTSE_MIB_TICKER = ACTIVE_BENCHMARK  # Legacy name used by existing engines.
 st.sidebar.caption(
     f"Universe: {len(market_instruments)} securities | Benchmark: {benchmark_label}"
 )
-if market == "USA":
+if market == "USA" and not st.session_state.get("hybrid_manual"):
     st.sidebar.caption(
         "US stock prices and S&P 500 benchmark remain in USD. "
         "FF3/FF5 use US factors in USD; no FX conversion."
@@ -4841,6 +4933,14 @@ else:
             f"{len(tickers)} instruments selected by the quant screener"
         )
 
+
+from src.hybrid_ui import active_universe
+
+effective_selection = active_universe(market, current_market_instruments)
+if effective_selection is not None:
+    configure_portfolio(effective_selection)
+    tickers = [asset["ticker"] for asset in effective_selection["assets"]]
+    st.sidebar.caption(f"Final universe: {len(tickers)} assets · {effective_selection['base_currency']}")
 
 # ---------------------------------------------------------
 # RISK-FREE RATE
@@ -5052,7 +5152,7 @@ with st.sidebar.expander(
 # =========================================================
 
 with st.container(key="kangemi_main_navigation"):
-    asset_selection_tab, optimization_tab, factor_models_tab, backtest_tab, robustness_tab, vix_tab, trading_signals_tab, monte_carlo_tab, mc_construction_tab, volatility_tab, saved_experiments_tab, ml_tab = st.tabs(
+    asset_selection_tab, optimization_tab, factor_models_tab, backtest_tab, robustness_tab, vix_tab, trading_signals_tab, time_series_tab, monte_carlo_tab, mc_construction_tab, volatility_tab, saved_experiments_tab, ml_tab = st.tabs(
         [
             "Asset Selection",
             "Portfolio Optimization",
@@ -5061,6 +5161,7 @@ with st.container(key="kangemi_main_navigation"):
             "Robustness Analysis",
             "VIX",
             "Trading Signals",
+            "Time Series Portfolio",
             "Monte Carlo Simulation",
             "Monte Carlo Portfolio Construction",
             "Volatility Analytics",
@@ -5109,6 +5210,9 @@ def render_diversification_var_kpis(weights, covariance, portfolio_capital):
 
 
 with asset_selection_tab:
+    if asset_selection_tab.open:
+        from src.hybrid_ui import render_manual_selection
+        render_manual_selection(market, current_market_instruments)
 
     st.markdown("### Quantitative asset screener")
     with st.container(key="kangemi_controls_screener"):
@@ -5552,6 +5656,10 @@ with optimization_tab:
                             max_weight=max_weight,
                         )
                     )
+
+                    hrp_minimum = minimum_for(hrp_weights.index) or {}
+                    if any(hrp_weights[t] < bound-1e-8 for t, bound in hrp_minimum.items()):
+                        st.warning("HRP does not satisfy the selected minima. Its original weights are shown as an unconstrained reference only.")
 
                     hrp_order = hrp_cluster_order(
                         covariance
@@ -6358,9 +6466,21 @@ def render_fama_french_model(model, tickers, market, capital, max_weight,
         )
     eur_rf_mode = select_eur_rf_methodology(market, f"{code}_eur_rf_methodology")
     use_factor_cov = covariance_choice == "Factor Cov"
+    from src.factor_currency import factor_covariance_available
+
+    common = True
+    if use_factor_cov and portfolio_settings():
+        try:
+            common = factor_covariance_available(tickers)
+        except ValueError as exc:
+            st.warning(str(exc))
+            common = False
+        else:
+            if not common:
+                st.info("Factor Covariance requires a common factor set. These assets use different regional sets.")
     result_key = f"{code}_factor_results" if use_factor_cov else f"{code}_results"
 
-    if action.button(f"Run {model}", type="primary", width="stretch") and validate_portfolio(tickers, max_weight):
+    if action.button(f"Run {model}", type="primary", width="stretch", disabled=not common) and validate_portfolio(tickers, max_weight):
         try:
             with st.spinner(f"Estimating {model}..."):
                 prices = get_prices(tickers, period=period, preserve_missing=True)
@@ -7727,7 +7847,7 @@ with backtest_tab:
 
     bt_snapshot = configuration_snapshot(dict(
         market=market, tickers=tickers, capital=capital, risk_free_rate=risk_free_rate,
-        max_weight=max_weight, selection_mode=selection_mode,
+        max_weight=max_weight, selection_mode=selection_mode, effective_universe=portfolio_settings(),
         quant_factors=quant_factors if selection_mode == "Quant Selection" else None,
         run_standard=run_standard, run_fixed=run_fixed, standard_period=standard_period,
         standard_lookback=standard_lookback_days, standard_oos=standard_oos_days,
@@ -7737,6 +7857,19 @@ with backtest_tab:
         selected=selected_strategies, overlay_selected=overlay_selected,
         overlay_models=overlay_models, overlay_settings=overlay_settings,
     ))
+    def backtest_candidate_prices(catalog, period):
+        from src.portfolio_context import portfolio_scope
+        with portfolio_scope():
+            native = build_price_matrix(catalog, period=period)
+        if not portfolio_settings():
+            return native
+        from src.hybrid_portfolio import historical_panel, hybrid_sessions
+        config = portfolio_settings()
+        converted = historical_panel(native, config).reindex(hybrid_sessions(native.index, config))
+        converted.attrs.update(portfolio_currency=config["base_currency"],
+                               ranking_source=native.to_json(orient="split", date_format="iso", double_precision=15))
+        return converted
+
     if run_backtests:
         sections = [section for enabled, section in ((run_standard, "Standard Walk-Forward"),
                     (run_fixed, "Fixed Horizon")) if enabled] or ["Backtesting"]
@@ -7773,7 +7906,7 @@ with backtest_tab:
             synced_quant_prices = None
             effective_standard_lookback_days = standard_lookback_days
             if sync_quant_dates:
-                synced_quant_prices = build_price_matrix(
+                synced_quant_prices = backtest_candidate_prices(
                     market_instruments, period="10y"
                 )
                 synced_required_rows = (
@@ -7821,7 +7954,7 @@ with backtest_tab:
                     ):
 
                         backtest_selection_top_n = (
-                            len(tickers)
+                            (st.session_state.screening_results or {}).get("top_n", len(tickers))
                             if selection_mode == "Quant Selection"
                             else None
                         )
@@ -7831,7 +7964,7 @@ with backtest_tab:
                             standard_prices = (
                                 synced_quant_prices.copy()
                                 if sync_quant_dates
-                                else build_price_matrix(
+                                else backtest_candidate_prices(
                                     market_instruments,
                                     period=standard_period,
                                 )
@@ -7942,7 +8075,7 @@ with backtest_tab:
                                         st.dataframe(audit_table, width="stretch")
                                         st.download_button("Download historical ranking CSV", audit_table.to_csv(index=False), file_name=f"quant_selection_{audit_date}.csv", key=f"pit_standard_{audit_date}_{policy}")
                             standard_result["drbt_price_history"] = standard_prices
-                            if market != "USA":
+                            if market != "USA" or portfolio_settings():
                                 standard_result["_factor_attribution_inputs"] = (
                                     market, standard_ff3_factors, standard_ff5_factors, standard_eurusd,
                                 )
@@ -7995,7 +8128,7 @@ with backtest_tab:
                     ):
 
                         backtest_selection_top_n = (
-                            len(tickers)
+                            (st.session_state.screening_results or {}).get("top_n", len(tickers))
                             if selection_mode == "Quant Selection"
                             else None
                         )
@@ -8005,7 +8138,7 @@ with backtest_tab:
                             fixed_prices = (
                                 synced_quant_prices.copy()
                                 if sync_quant_dates
-                                else build_price_matrix(
+                                else backtest_candidate_prices(
                                     market_instruments,
                                     period="10y",
                                 )
@@ -8091,7 +8224,7 @@ with backtest_tab:
                                 with st.expander(f"Historical Quant Selection ranking — {audit_date}"):
                                     st.dataframe(audit_table, width="stretch")
                                     st.download_button("Download historical ranking CSV", audit_table.to_csv(index=False), file_name=f"quant_selection_{audit_date}.csv", key=f"pit_fixed_{audit_date}")
-                        if market != "USA":
+                        if market != "USA" or portfolio_settings():
                             fixed_result["_factor_attribution_inputs"] = (
                                 market, fixed_ff3_factors, fixed_ff5_factors, fixed_eurusd,
                             )
@@ -9118,7 +9251,11 @@ if volatility_tab.open:
                 screening = st.session_state.get("screening_results") or {}
                 default_assets = tickers or (st.session_state.get("quant_selected_tickers", [])
                                               if screening.get("market") == market else [])
-                render_volatility(False, st.session_state, default_assets, current_market_instruments, colored_metric)
+                volatility_catalog = current_market_instruments
+                if effective_selection:
+                    manual = pd.DataFrame(effective_selection["assets"])[["ticker", "name"]]
+                    volatility_catalog = pd.concat([volatility_catalog, manual]).drop_duplicates("ticker")
+                render_volatility(False, st.session_state, default_assets, volatility_catalog, colored_metric)
 
 
 if ml_tab.open:
@@ -9141,3 +9278,13 @@ if vix_tab.open:
         from src.vix_ui import render_vix
 
         render_vix(colored_metric)
+
+
+if time_series_tab.open:
+    with time_series_tab:
+        from src.time_series_ui import render_time_series_portfolio
+
+        render_time_series_portfolio(
+            current_market_instruments, market, tickers if portfolio_settings() else st.session_state.quant_selected_tickers,
+            colored_metric, style_portfolio_table, get_company_name,
+        )

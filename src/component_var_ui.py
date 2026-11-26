@@ -5,6 +5,7 @@ import streamlit as st
 
 from src.component_var import dynamic_component_var
 from src.backtest_registry import backtest_strategies
+from src.return_distribution_ui import render_distributions
 
 
 @st.cache_data(show_spinner=False, max_entries=24)
@@ -25,8 +26,13 @@ def render_dynamic_component_var(result, key, company_name):
     frequency = cols[2].selectbox("Display frequency", ["Daily", "Weekly", "Monthly"],
                                   key=f"component_var_frequency_{key}")
     curve = strategies[strategy]["curve"]
-    marks = curve.attrs.get("risk_position_marks")
     prices = result.get("risk_prices")
+    render_component_chart(curve, prices, window, frequency, strategy, key, company_name)
+    render_distributions(curve, prices, strategies[strategy]["weights"], strategy, key, company_name)
+
+
+def render_component_chart(curve, prices, window, frequency, strategy, key, company_name):
+    marks = curve.attrs.get("risk_position_marks")
     if marks is None or prices is None:
         st.info("Rerun this backtest to capture executed position values and estimation prices.")
         return
@@ -48,9 +54,12 @@ def render_dynamic_component_var(result, key, company_name):
     fig = go.Figure()
     totals = daily.groupby("Date")["Total Portfolio VaR (EUR)"].first().reindex(dates)
     for asset, rows in daily.groupby("Asset"):
-        # Zero when unheld on a valid date, undefined when portfolio VaR is zero.
-        shown = rows.set_index("Date").reindex(dates, fill_value=0)
-        percent = shown["Component VaR Contribution (%)"].where(totals.ne(0))
+        # The estimator emits rows only for held assets. Align the two plotted
+        # measures to valid portfolio dates, using zero only for unheld assets.
+        shown = rows.set_index("Date")[
+            ["Component VaR (EUR)", "Component VaR Contribution (%)"]
+        ].reindex(dates, fill_value=0.)
+        percent = shown["Component VaR Contribution (%)"].where(totals.notna() & totals.ne(0))
         fig.add_scatter(
             x=dates, y=percent, name=f"{company_name(asset)} ({asset})", mode="lines+markers",
             marker=dict(size=3), customdata=shown["Component VaR (EUR)"],

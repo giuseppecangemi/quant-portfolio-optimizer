@@ -157,7 +157,7 @@ def cvar_contributions(paths, weights, alpha):
     return marginal, weights * marginal
 
 
-def scenario_allocation(paths, strategy, alpha, cap, budget=None):
+def scenario_allocation(paths, strategy, alpha, cap, budget=None, *, assets=None):
     """Linear programs on cumulative simple P&L relative to initial capital."""
     if (paths.ndim != 3 or min(paths.shape) < 1 or not np.isfinite(paths).all()
             or strategy not in STRATEGIES or not 0 < alpha < 1 or not 0 < cap <= 1):
@@ -180,8 +180,13 @@ def scenario_allocation(paths, strategy, alpha, cap, budget=None):
         lhs = vstack((lhs, csr_matrix(objective)), format="csr")
         rhs = np.r_[rhs, budget]
         objective = np.r_[-terminal.mean(axis=0), np.zeros(s+1)]
+    bounds = [(0, cap)] * n
+    if assets is not None:
+        from src.optimization import weight_bounds
+
+        bounds = list(zip(*weight_bounds(assets, cap)))
     fit = linprog(objective, A_ub=lhs, b_ub=rhs, A_eq=[np.r_[np.ones(n), np.zeros(s+1)]],
-                  b_eq=[1], bounds=[(0, cap)]*n + [(0 if cml else None, None)] + [(0, None)]*s,
+                  b_eq=[1], bounds=bounds + [(0 if cml else None, None)] + [(0, None)]*s,
                   method="highs")
     if not fit.success:
         raise ValueError(f"Scenario optimization failed ({fit.status}): {fit.message}")
@@ -228,7 +233,7 @@ def fit_construction(prices, config, rf, cap, cache=None):
             del cache[old_keys[0]]
         cache[key] = draw_paths(calibrated, config["simulations"], config["horizon"], config["seed"])[0]
     paths = cache[key]
-    w, _ = scenario_allocation(paths, config["strategy"], config["alpha"], cap, config["budget"])
+    w, _ = scenario_allocation(paths, config["strategy"], config["alpha"], cap, config["budget"], assets=prices.columns)
     # Existing allocation cards expect annualized simple daily moments.
     cumulative = 1 + paths
     daily = np.diff(cumulative, axis=2, prepend=1.) / np.concatenate(

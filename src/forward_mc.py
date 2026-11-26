@@ -4,7 +4,8 @@ import pandas as pd
 from sklearn.covariance import LedoitWolf
 
 from src.factor_covariance import FACTOR_NAMES
-from src.factor_currency import factor_sample, factors_for_backtest_signal
+from src.factor_currency import configured_factor_inputs, factor_sample, factors_for_backtest_signal
+from src.portfolio_context import check_minimum, portfolio_settings
 from src.monte_carlo import empirical_tail_mean
 from src.optimization import (
     optimize_hrp, optimize_maximum_sharpe, optimize_minimum_volatility, optimize_risk_parity,
@@ -14,7 +15,10 @@ from src.transaction_costs import fund_orders
 
 def calibration(prices, date, window, benchmark=None, factor_inputs=None, market="Borsa Italiana", rf_daily=0.):
     date = pd.Timestamp(date)
-    prices = prices.sort_index().loc[:date].tail(window+1)
+    prices = prices.sort_index().loc[:date]
+    if portfolio_settings():
+        prices = prices.dropna()
+    prices = prices.tail(window+1)
     returns = prices.pct_change(fill_method=None).iloc[1:]
     if len(returns) < window or not np.isfinite(returns.to_numpy()).all() or (prices <= 0).any().any():
         raise ValueError(f"Need {window} consecutive complete returns for every selected asset.")
@@ -29,7 +33,11 @@ def calibration(prices, date, window, benchmark=None, factor_inputs=None, market
     for name, (factors, fx) in (factor_inputs or {}).items():
         factors = factors_for_backtest_signal(factors, date)
         fx = fx.sort_index().loc[:date] if fx is not None else None
-        assets, converted = factor_sample(prices, factors, fx, market=market)
+        if portfolio_settings():
+            group, factors, fx, base_market, eur_rf = next(configured_factor_inputs(prices, factors, name, fx))
+            assets, converted = factor_sample(group, factors, fx, market=base_market, eur_rf_mode=eur_rf)
+        else:
+            assets, converted = factor_sample(prices, factors, fx, market=market)
         names = list(FACTOR_NAMES[name.lower()])
         joined = assets.join(converted[[*names, "RF"]]).dropna()
         fits[name] = (joined[returns.columns].to_numpy(), joined[names].to_numpy(),
@@ -102,6 +110,7 @@ def portfolio_weights(returns, fits, strategies, rf, cap, sessions):
                 w = optimize_maximum_sharpe(mu, risk, risk_free_rate=rf, max_weight=cap)
             if not np.isfinite(w).all() or (w < -1e-8).any() or not np.isclose(w.sum(), 1):
                 raise ValueError("Optimizer returned invalid weights.")
+            check_minimum(w)
             weights[strategy] = w.clip(lower=0)/w.clip(lower=0).sum()
         except (ValueError, KeyError, RuntimeError) as exc:
             unavailable[strategy] = str(exc)

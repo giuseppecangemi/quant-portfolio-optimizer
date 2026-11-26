@@ -26,7 +26,7 @@ def cached_adjusted(symbol, currency, start, end, *, listing=None):
 
 def prepare_result_benchmarks(result, selected, market, risk_free_rate):
     dates = result["max_sharpe_bt"].index
-    currency = "USD" if market == "USA" else "EUR"
+    currency = result.get("portfolio_currency", "USD" if market == "USA" else "EUR")
     if "run_provenance" in result:
         start, end = str(dates[0].date()), str(dates[-1].date())
         result["run_provenance"].update(oos_start=start, oos_end=end,

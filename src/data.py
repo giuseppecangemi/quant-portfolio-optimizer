@@ -63,6 +63,31 @@ def get_prices(tickers: list[str], period: str = "5y", *, preserve_missing: bool
     """
     if not tickers:
         raise ValueError("Ticker list is empty")
+    from src.portfolio_context import portfolio_settings
+
+    config = portfolio_settings()
+    if config is not None and not all(str(t).endswith("=X") for t in tickers):
+        from src.hybrid_portfolio import load_hybrid_prices
+        end = pd.Timestamp.now(tz="UTC").tz_localize(None).normalize()
+        start = None
+        if period != "max":
+            units = {"y": "years", "mo": "months", "d": "days"}
+            unit = next((key for key in units if period.endswith(key)), None)
+            if unit is None:
+                raise ValueError(f"Unsupported portfolio price period: {period}")
+            start = end - pd.DateOffset(**{units[unit]: int(period.removesuffix(unit))})
+        close, adjusted, _, provenance = load_hybrid_prices(tickers, config["base_currency"])
+        result = adjusted.loc[start:]
+        if not preserve_missing:
+            result = result.dropna()
+        if len(result) < 2:
+            raise ValueError("Insufficient common portfolio prices after FX conversion.")
+        last = result.dropna().last_valid_index() if len(tickers) > 1 else result.last_valid_index()
+        result.attrs.update(portfolio_currency=config["base_currency"], execution_close=(
+            close.loc[last].to_dict() if last is not None and last in close.index else {}
+        ), price_provenance=provenance)
+        return result
+
     prices = {}
     for ticker in tickers:
         errors = []

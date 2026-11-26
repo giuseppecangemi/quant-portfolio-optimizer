@@ -7,6 +7,7 @@ from scipy.optimize import minimize
 from scipy.cluster.hierarchy import linkage, leaves_list
 from scipy.spatial.distance import squareform
 
+from src.portfolio_context import minimum_for
 from src.risk import portfolio_return, portfolio_volatility
 
 
@@ -29,10 +30,69 @@ def _validated_covariance(covariance, labels):
     return covariance, scale
 
 
+def weight_bounds(labels, max_weight, minimum_weights=None):
+    minimum_weights = minimum_for(labels, minimum_weights)
+    minimum = pd.Series(dtype=float) if minimum_weights is None else pd.Series(minimum_weights, dtype=float)
+    if not minimum.index.is_unique or not minimum.index.isin(labels).all():
+        raise ValueError("Minimum weights must refer to unique tickers in the universe.")
+    lower = minimum.reindex(labels, fill_value=0.).to_numpy()
+    upper = np.full(len(labels), min(max_weight, 1.))
+    if (not np.isfinite(max_weight) or not np.isfinite(lower).all() or (lower < 0).any()
+            or (lower > upper).any() or lower.sum() > 1 + 1e-12 or upper.sum() < 1 - 1e-12):
+        raise ValueError("Infeasible individual weight bounds.")
+    return lower, upper
+
+
+def _linear_weights(coefficients, lower, upper):
+    order = np.argsort(-np.asarray(coefficients), kind="stable")
+    capacity = (upper - lower)[order]
+    remaining = 1 - lower.sum() - np.r_[0., capacity.cumsum()[:-1]]
+    weights = lower.copy()
+    weights[order] += np.clip(remaining, 0., capacity)
+    return weights
+
+
+def _check_weights(weights, lower, upper):
+    if (not np.isfinite(weights).all() or abs(weights.sum()-1) > 1e-8
+            or (weights < lower - 1e-8).any() or (weights > upper + 1e-8).any()):
+        raise ValueError("Optimizer did not satisfy the individual weight constraints.")
+
+
+def _bounded_vertices(lower, upper):
+    """Every box-simplex vertex has at most one free coordinate."""
+    cap = upper - lower
+    budget = 1 - lower.sum()
+    if budget <= 1e-12:
+        yield lower.copy()
+        return
+    for free in range(len(cap)):
+        if cap[free] <= 1e-12:
+            continue
+        others = [i for i in range(len(cap)) if i != free and cap[i] > 1e-12]
+        suffix = np.r_[np.cumsum(cap[others][::-1])[::-1], 0.]
+        increment = np.zeros(len(cap))
+
+        def visit(offset, remaining):
+            if remaining < -1e-12 or remaining > suffix[offset] + cap[free] + 1e-12:
+                return
+            if offset == len(others):
+                increment[free] = np.clip(remaining, 0., cap[free])
+                yield lower + increment
+                return
+            i = others[offset]
+            increment[i] = 0.
+            yield from visit(offset+1, remaining)
+            increment[i] = cap[i]
+            yield from visit(offset+1, remaining-cap[i])
+
+        yield from visit(0, budget)
+
+
 def optimize_minimum_volatility(
     expected_returns: pd.Series,
     covariance: pd.DataFrame,
-    max_weight: float = 1.0
+    max_weight: float = 1.0,
+    *, minimum_weights=None
 ) -> pd.Series:
     """
     Trova il portafoglio con la minima volatilità.
@@ -42,17 +102,12 @@ def optimize_minimum_volatility(
     """
 
     covariance, scale = _validated_covariance(covariance, expected_returns.index)
-    n_assets = len(expected_returns)
-
-    initial_weights = np.ones(n_assets) / n_assets
-
-    if max_weight < 1 / n_assets:
-        raise ValueError(
-            "Il peso massimo per asset è troppo basso "
-            "rispetto al numero di asset."
-        )
-
-    bounds = [(0.0, max_weight)] * n_assets
+    lower, upper = weight_bounds(expected_returns.index, max_weight, minimum_weights)
+    initial_weights = (lower + (1-lower.sum())*(upper-lower)/(upper-lower).sum()
+                       if (upper-lower).sum() > 0 else lower.copy())
+    bounds = list(zip(lower, upper))
+    if np.isclose(lower.sum(), 1., rtol=0, atol=1e-12):
+        return pd.Series(lower, index=expected_returns.index)
 
     constraints = {
         "type": "eq",
@@ -77,6 +132,7 @@ def optimize_minimum_volatility(
             f"Ottimizzazione fallita: {result.message}"
         )
 
+    _check_weights(result.x, lower, upper)
     return pd.Series(
         result.x,
         index=expected_returns.index
@@ -113,7 +169,8 @@ def optimize_maximum_sharpe(
     expected_returns: pd.Series,
     covariance: pd.DataFrame,
     risk_free_rate: float = 0.0,
-    max_weight: float = 1.0
+    max_weight: float = 1.0,
+    *, minimum_weights=None
 ) -> pd.Series:
     """
     Trova il portafoglio con il massimo Sharpe Ratio.
@@ -127,14 +184,8 @@ def optimize_maximum_sharpe(
     if not np.isfinite(excess).all():
         raise ValueError("Expected excess returns must be finite")
     n_assets = len(expected_returns)
-
-    if not np.isfinite(max_weight) or max_weight < 1 / n_assets:
-        raise ValueError(
-            "Il peso massimo per asset è troppo basso "
-            "rispetto al numero di asset."
-        )
-
-    bounds = [(0.0, max_weight)] * n_assets
+    lower, upper = weight_bounds(expected_returns.index, max_weight, minimum_weights)
+    bounds = list(zip(lower, upper))
 
     constraints = {
         "type": "eq",
@@ -145,19 +196,27 @@ def optimize_maximum_sharpe(
         raise ValueError("Sharpe is undefined for a zero-risk covariance")
     matrix = covariance.to_numpy() / scale
     if np.linalg.eigvalsh(matrix)[0] <= 1e-10:
-        min_risk = optimize_minimum_volatility(expected_returns, covariance, max_weight).to_numpy()
+        min_risk = optimize_minimum_volatility(expected_returns, covariance, max_weight, minimum_weights=minimum_weights).to_numpy()
         if min_risk @ matrix @ min_risk <= 1e-12:
             raise ValueError("Sharpe is undefined on a feasible zero-risk portfolio")
 
-    # The highest-return allocation under a common cap is obtained greedily.
-    by_return = np.argsort(-excess, kind="stable")
-    initial_weights = np.zeros(n_assets)
-    initial_weights[by_return] = np.clip(1 - max_weight * np.arange(n_assets), 0, max_weight)
+    initial_weights = _linear_weights(excess, lower, upper)
     max_excess = initial_weights @ excess
-    if max_excess == 0:
+    if max_excess == 0 or np.isclose(lower.sum(), 1., rtol=0, atol=1e-12):
         return pd.Series(initial_weights, index=expected_returns.index)
     if max_excess < 0:
-        return _maximum_sharpe_at_vertex(excess, matrix, expected_returns.index, max_weight)
+        if not lower.any():
+            return _maximum_sharpe_at_vertex(excess, matrix, expected_returns.index, max_weight)
+        best, best_score = None, -np.inf
+        for count, weights in enumerate(_bounded_vertices(lower, upper), start=1):
+            if count > 100_000:
+                raise ValueError("Too many feasible vertices to certify nonpositive-excess Maximum Sharpe.")
+            score = weights @ excess / np.sqrt(weights @ matrix @ weights)
+            if score > best_score:
+                best, best_score = weights, score
+        if best is None:
+            raise ValueError("No feasible vertex for Maximum Sharpe.")
+        return pd.Series(best, index=expected_returns.index)
 
     normalized_excess = excess / np.max(np.abs(excess))
     constraints = [constraints, {
@@ -186,12 +245,12 @@ def optimize_maximum_sharpe(
 
     def certification_gap(weights):
         if (not np.isfinite(weights).all() or abs(weights.sum() - 1) > 1e-8
-                or weights.min() < -1e-8 or weights.max() > max_weight + 1e-8
+                or (weights < lower - 1e-8).any() or (weights > upper + 1e-8).any()
                 or weights @ normalized_excess <= 0 or weights @ matrix @ weights <= 0):
             return np.inf
         # A linear oracle checks the first-order condition on the entire capped simplex.
         grad = gradient(weights)
-        gap = grad @ weights - grad[np.argsort(grad)] @ initial_weights[by_return]
+        gap = grad @ (weights - _linear_weights(-grad, lower, upper))
         return gap / max(1., abs(negative_sharpe(weights)))
 
     def certified(weights):
@@ -203,7 +262,9 @@ def optimize_maximum_sharpe(
     # Normalize excess return to one. The resulting convex problem minimizes
     # variance with linear constraints and recovers the original weights by normalization.
     target = normalized_excess @ initial_weights
-    cap_matrix = max_weight * np.ones((n_assets, n_assets)) - np.eye(n_assets)
+    cap_matrix = upper[:, None] - np.eye(n_assets)
+    floor_matrix = np.eye(n_assets) - lower[:, None]
+    box_matrix = np.vstack([cap_matrix, floor_matrix])
     transformed = minimize(
         lambda x: float(x @ matrix @ x),
         initial_weights,
@@ -213,8 +274,8 @@ def optimize_maximum_sharpe(
         constraints=[
             {"type": "eq", "fun": lambda x: normalized_excess @ x - target,
              "jac": lambda x: normalized_excess},
-            {"type": "ineq", "fun": lambda x: cap_matrix @ x,
-             "jac": lambda x: cap_matrix},
+            {"type": "ineq", "fun": lambda x: box_matrix @ x,
+             "jac": lambda x: box_matrix},
         ],
         options={"ftol": 1e-13, "maxiter": 500},
     )
@@ -237,11 +298,11 @@ def optimize_maximum_sharpe(
             if certified(weights):
                 return pd.Series(weights, index=expected_returns.index)
             grad = gradient(weights)
-            source = np.argmax(np.where(weights > 1e-12, grad, -np.inf))
-            destination = np.argmin(np.where(weights < max_weight - 1e-12, grad, np.inf))
+            source = np.argmax(np.where(weights > lower + 1e-12, grad, -np.inf))
+            destination = np.argmin(np.where(weights < upper - 1e-12, grad, np.inf))
             if grad[source] <= grad[destination]:
                 break
-            bound = min(weights[source], max_weight - weights[destination])
+            bound = min(weights[source]-lower[source], upper[destination]-weights[destination])
             marginal = matrix @ weights
             a = weights @ normalized_excess
             b = normalized_excess[destination] - normalized_excess[source]
@@ -266,7 +327,8 @@ def optimize_maximum_sharpe(
 
 def optimize_risk_parity(
     covariance: pd.DataFrame,
-    max_weight: float = 1.0
+    max_weight: float = 1.0,
+    *, minimum_weights=None
 ) -> pd.Series:
     """
     Trova un portafoglio Equal Risk Contribution (Risk Parity).
@@ -284,31 +346,20 @@ def optimize_risk_parity(
     """
 
     n_assets = len(covariance)
-
-    if n_assets == 0:
-        raise ValueError(
-            "La matrice di covarianza è vuota."
-        )
-
-    if max_weight < 1 / n_assets:
-        raise ValueError(
-            "Il peso massimo per asset è troppo basso "
-            "rispetto al numero di asset."
-        )
-
     covariance, scale = _validated_covariance(covariance, covariance.index)
+    lower, upper = weight_bounds(covariance.index, max_weight, minimum_weights)
     if scale == 0:
         raise ValueError("Risk contributions are undefined for zero portfolio variance")
     covariance_values = covariance.to_numpy() / scale
+    initial_weights = lower + (1-lower.sum())*(upper-lower)/(upper-lower).sum() if (upper-lower).sum() else lower
+    bounds = list(zip(lower, upper))
+    if minimum_weights is not None and (np.isclose(lower.sum(), 1., rtol=0, atol=1e-12)
+                                        or np.isclose(upper.sum(), 1., rtol=0, atol=1e-12)):
+        _check_weights(initial_weights, lower, upper)
+        if initial_weights @ covariance_values @ initial_weights <= 0:
+            raise ValueError("Risk contributions are undefined for zero portfolio variance")
+        return pd.Series(initial_weights, index=covariance.index)
 
-    initial_weights = (
-        np.ones(n_assets) / n_assets
-    )
-
-    bounds = [
-        (0.0, max_weight)
-        for _ in range(n_assets)
-    ]
 
     constraints = {
         "type": "eq",
@@ -378,6 +429,10 @@ def optimize_risk_parity(
     weights = result.x
     if weights @ covariance_values @ weights <= 0:
         raise ValueError("Risk contributions are undefined for zero portfolio variance")
+
+    if lower.any():
+        _check_weights(weights, lower, upper)
+        return pd.Series(weights, index=covariance.index)
 
     # Pulizia dei piccoli residui numerici.
     weights[
@@ -656,7 +711,8 @@ def efficient_frontier(
     expected_returns: pd.Series,
     covariance: pd.DataFrame,
     points: int = 100,
-    max_weight: float = 1.0
+    max_weight: float = 1.0,
+    *, minimum_weights=None
 ) -> pd.DataFrame:
     """
     Calcola la frontiera di Markowitz.
@@ -677,7 +733,7 @@ def efficient_frontier(
         optimize_minimum_volatility(
             expected_returns,
             covariance,
-            max_weight=max_weight
+            max_weight=max_weight, minimum_weights=minimum_weights
         )
     )
 
@@ -705,6 +761,17 @@ def efficient_frontier(
         (0.0, max_weight)
         for _ in range(n_assets)
     ]
+
+    if minimum_for(expected_returns.index, minimum_weights):
+        lower, upper = weight_bounds(expected_returns.index, max_weight, minimum_weights)
+        bounds = list(zip(lower, upper))
+        initial_weights = min_volatility_weights.to_numpy()
+        max_feasible = expected_returns @ _linear_weights(expected_returns, lower, upper)
+        if np.isclose(max_feasible, min_volatility_return, rtol=1e-10, atol=1e-12):
+            return pd.DataFrame({"return": [min_volatility_return],
+                                 "volatility": [portfolio_volatility(initial_weights, covariance)],
+                                 "efficient": [True]})
+        target_returns = np.linspace(min_volatility_return, max_feasible, points)
 
     frontier = []
 

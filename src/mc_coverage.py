@@ -10,7 +10,23 @@ MANUAL = "Manual Universe Selection"
 MIN_SESSIONS = 101  # 80 usable observations after trailing state warm-up
 
 
-def download_history(tickers, benchmark, market):
+def download_history(tickers, benchmark, market, configuration=None):
+    if configuration:
+        from src.hybrid_portfolio import hybrid_sessions
+        from src.time_series_market import reporting_history
+
+        currency = configuration["base_currency"]
+        dates = reporting_history(benchmark, currency, prior_fx=True)[0]["Adj Close"].dropna().index
+        calendar = hybrid_sessions(dates, configuration)
+        series, errors = {}, {}
+        for ticker in tickers:
+            try:
+                series[ticker] = reporting_history(ticker, currency, prior_fx=True)[0]["Adj Close"]
+            except ValueError as exc:
+                series[ticker] = pd.Series(dtype=float)
+                errors[ticker] = str(exc)
+        return series, calendar, errors
+
     from src.data import _INDEX_ALIASES, _fetch_one
 
     zone = "America/New_York" if market == "USA" else "Europe/Rome"

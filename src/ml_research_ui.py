@@ -5,6 +5,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
+from src.portfolio_context import portfolio_settings
 from src.forward_mc_ui import load_prices
 from src.ml_estimators import (
     ANNUAL, CONFIGS, MODELS, OPTIMIZERS, checked_prices, efficient_frontier,
@@ -44,6 +45,8 @@ def render_ml_research(tickers, market, rf, cap, capital, theme_tabs, allocation
                         prices=load_prices(tuple(tickers))
                         zone="America/New_York" if market=="USA" else "Europe/Rome"
                         prices=prices.loc[prices.index.date<pd.Timestamp.now(tz=zone).date(),list(tickers)]
+                        if portfolio_settings():
+                            prices = prices.dropna()
                         prices=checked_prices(prices.tail(int(history[:-1])*ANNUAL+1))
                         returns=prices.pct_change(fill_method=None).iloc[1:]
                         panel=return_panel(prices,horizon)

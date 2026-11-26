@@ -30,6 +30,7 @@ class Portfolio:
     as_of: pd.Timestamp
     optimized_at: str | None
     max_weight: float | None
+    configuration: dict | None = None
 
 
 def available_portfolios(state):
@@ -46,7 +47,8 @@ def available_portfolios(state):
             continue
         as_of = prices.index.max() if isinstance(prices, pd.DataFrame) else pd.NaT
         portfolios[name] = Portfolio(weights, source, as_of, stored.get("optimized_at"),
-                                     stored.get("max_weight") if field else None)
+                                     stored.get("max_weight") if field else None,
+                                     (stored.get("selection_configuration") or {}).get("effective_universe"))
     ml = state.get("factor_ml_compare")
     if ml:
         table = ml[0]["weights"]

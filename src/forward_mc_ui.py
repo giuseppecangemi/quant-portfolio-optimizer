@@ -11,6 +11,8 @@ import streamlit as st
 
 from src.forward_mc import calibration, portfolio_weights, simulate_forward
 from src.transaction_costs import PRESETS
+from src.portfolio_context import portfolio_settings
+from src.factor_currency import factor_covariance_available, factor_regions
 
 
 STRATEGIES = [
@@ -20,8 +22,12 @@ STRATEGIES = [
 ]
 
 
-@st.cache_data(ttl=3600, show_spinner=False, max_entries=8)
 def load_prices(tickers):
+    return _cached_prices(tickers, portfolio_settings())
+
+
+@st.cache_data(ttl=3600, show_spinner=False, max_entries=8)
+def _cached_prices(tickers, configuration):
     from src.data import get_prices
     return get_prices(list(tickers), period="max", preserve_missing=True)
 
@@ -33,7 +39,8 @@ def render_forward_mc(tickers, market, benchmark, risk_free, max_weight, theme):
     if market not in ("Borsa Italiana", "USA"):
         st.info("Forward simulation currently supports Italian and US equities.")
         return
-    currency = "EUR" if market == "Borsa Italiana" else "USD"
+    configuration = portfolio_settings()
+    currency = configuration["base_currency"] if configuration else ("EUR" if market == "Borsa Italiana" else "USD")
     try:
         prices = load_prices(tuple(tickers))
         if not set(tickers).issubset(prices.columns):
@@ -49,7 +56,7 @@ def render_forward_mc(tickers, market, benchmark, risk_free, max_weight, theme):
     except Exception as exc:
         st.warning(f"Market history unavailable: {exc}")
         return
-    st.caption(f"Fixed candidate universe from Asset Selection · native currency {currency}. "
+    st.caption(f"Fixed candidate universe from Asset Selection · {'base currency' if configuration else 'native currency'} {currency}. "
                "Historical analysis is conditional on this universe and on retrospective price data.")
     with st.container(key="kangemi_controls_forward_mc"):
         left, right = st.columns(2)
@@ -82,7 +89,8 @@ def render_forward_mc(tickers, market, benchmark, risk_free, max_weight, theme):
                   model=model, method=method, covariance_method=cov, window=window,
                   decay=decay, block=block, sessions=sessions, rebalance=rebalance,
                   costs=cost, parameter_draws=draws, rf=risk_free, max_weight=max_weight,
-                  market=market, currency=currency, tickers=list(tickers), strategies=strategies)
+                  market=market, currency=currency, tickers=list(tickers), strategies=strategies,
+                  effective_universe=configuration)
     if run:
         st.session_state.pop("forward_mc_result", None)
         try:
@@ -90,13 +98,23 @@ def render_forward_mc(tickers, market, benchmark, risk_free, max_weight, theme):
                 from src.fama_french import load_us_ff3, load_europe_ff3
                 from src.fama_french_5 import load_us_ff5, load_europe_ff5
                 required = {model, *(name.split()[0] for name in strategies)}
-                benchmark_prices = load_prices((benchmark,))[benchmark] if "CAPM" in required else None
+                benchmark_prices = None
                 loaders = {"FF3": (load_europe_ff3, load_us_ff3), "FF5": (load_europe_ff5, load_us_ff5)}
                 factor_inputs = {}
-                for name in required.intersection(loaders):
+                requires_factors = bool(required.intersection({"CAPM", "FF3", "FF5"}))
+                common_factors = not requires_factors or factor_covariance_available(prices.columns)
+                if not common_factors:
+                    st.warning("A joint factor simulation requires a common factor set. For this regional configuration, use Historical Mean and historical strategies.")
+                if common_factors and "CAPM" in required:
+                    if configuration:
+                        from src.hybrid_portfolio import BENCHMARKS
+
+                        benchmark = BENCHMARKS[factor_regions(prices.columns).iloc[0]]
+                    benchmark_prices = load_prices((benchmark,))[benchmark]
+                for name in required.intersection(loaders) if common_factors else ():
                     try:
                         fx = load_prices(("EURUSD=X",)).iloc[:,0] if currency == "EUR" else None
-                        factor_inputs[name] = loaders[name][currency == "USD"](), fx
+                        factor_inputs[name] = (pd.DataFrame(index=prices.index) if configuration else loaders[name][currency == "USD"]()), fx
                     except Exception as exc:
                         st.warning(f"{name} data unavailable: {exc}")
                 history, fits = calibration(prices, date, window, benchmark_prices, factor_inputs,

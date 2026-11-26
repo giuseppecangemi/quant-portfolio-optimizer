@@ -1,6 +1,7 @@
 """Streamlit view for the prospective trading journal."""
 import os
 import re
+from dataclasses import replace
 from datetime import date, timedelta
 from uuid import uuid4
 
@@ -11,6 +12,10 @@ import streamlit as st
 import yfinance as yf
 from scipy import stats
 
+from src.trading_market import (
+    confirmed_history, current_equity, fetch_intraday, fx_symbol, select_quote,
+    snapshot_values, temporary_series,
+)
 from src.trading_signals import Store, coverage_tests, forecast, indicators, monitor, paper_orders, signal, tail
 
 
@@ -25,13 +30,14 @@ def stage(weights, key, names, metadata):
         st.session_state.pop("ts_preview", None)
         st.session_state["main_navigation"] = "Trading Signals"
         st.session_state["ts_workspace"] = "Activate"
-        st.session_state["ts_portfolio_type"] = "Historical Activation"
+        configured = (metadata.get("configuration") or {}).get("effective_universe")
+        st.session_state["ts_portfolio_type"] = "Paper" if configured else "Historical Activation"
 
     st.button("Activate in Trading Signals", key=f"stage_trading_{key}", on_click=transfer)
 
 
 @st.cache_data(ttl=900, show_spinner=False)
-def quotes(tickers, start, currency):
+def quotes(tickers, start, currency, *, monitoring=False):
     data = {}
     for ticker in tickers:
         if not re.fullmatch(r"[A-Z0-9.^=/-]{1,30}", ticker):
@@ -39,8 +45,11 @@ def quotes(tickers, start, currency):
         instrument = yf.Ticker(ticker)
         h = instrument.history(start=str(start), auto_adjust=False, actions=True, raise_errors=True)
         meta = instrument.history_metadata
-        if meta.get("currency") != currency:
+        if currency is not None and meta.get("currency") != currency:
             raise ValueError(f"{ticker}: expected {currency}, provider reports {meta.get('currency')}.")
+        if monitoring:
+            data[ticker] = confirmed_history(h, meta, pd.Timestamp.now(tz="UTC"))
+            continue
         h.index = h.index.tz_localize(None).normalize()
         # Only completed calendar days in the exchange's time zone.
         today = pd.Timestamp.now(tz=meta["exchangeTimezoneName"]).date()
@@ -49,6 +58,29 @@ def quotes(tickers, start, currency):
             raise ValueError(f"No completed quotes for {ticker}.")
         data[ticker] = h
     return data
+
+
+def paper_quotes(draft, start, currency):
+    configuration = (draft.get("configuration") or {}).get("effective_universe")
+    tickers = tuple(draft["weights"])
+    if not configuration:
+        return quotes(tickers, start, currency)
+
+    from src.time_series_market import conversion_pair
+    from src.time_series_portfolio import prices_in_currency
+
+    history = quotes(tickers, start, None)
+    assets = {row["ticker"]: row for row in configuration["assets"]}
+    for ticker, frame in history.items():
+        quoted = assets[ticker]["quote_currency"]
+        denomination = "GBP" if quoted in {"GBp", "GBX"} else quoted
+        unit = .01 if denomination != quoted else 1.
+        fx = None if denomination == currency else conversion_pair(denomination, currency, allow_inverse=True)[0]
+        for field in ("Open", "High", "Low", "Close", "Adj Close", "Dividends"):
+            if field in frame:
+                prices = frame[field] * unit
+                frame[field] = prices if fx is None else prices_in_currency(prices, fx, prior_day=True)
+    return history
 
 
 def open_store():
@@ -154,7 +186,7 @@ def entry_analysis(draft, start, currency):
     if not st.button("Run Pre-Trade Analysis"):
         return
     weights = pd.Series(draft["weights"], dtype=float)
-    history = quotes(tuple(weights.index), start - timedelta(days=730), currency)
+    history = paper_quotes(draft, start - timedelta(days=730), currency)
     prices = pd.DataFrame({ticker: history[ticker]["Adj Close"] for ticker in weights.index}).sort_index()
     returns = prices.pct_change(fill_method=None).mul(weights).sum(axis=1, min_count=len(weights))
     # Restart after a gap rather than connect levels across unknown returns.
@@ -209,7 +241,7 @@ def render_portfolio_charts(display, base, realized, returns, initial, start, su
     else:
         st.caption("GARCH unavailable. It requires at least 126 returns and a valid fit.")
 
-def render_entry_assessment(data, realized, initial, *, exit_view=False):
+def render_entry_assessment(data, realized, initial, *, exit_view=False, signal_status=None):
     row = data.iloc[-1]
     trend_inputs = row[["SMA50", "SMA200", "Momentum 63"]]
     bullish = row.Price > row.SMA50 > row.SMA200
@@ -229,6 +261,11 @@ def render_entry_assessment(data, realized, initial, *, exit_view=False):
         if state != "Insufficient Data" and bearish and momentum < 0:
             state = "Evaluate Exit" if row["Momentum 126"] < 0 else "Evaluate Reduction"
         tone = {"Hold": "green", "Evaluate Exit": "red", "Evaluate Reduction": "orange"}.get(state, "gray")
+    if exit_view:
+        if state == "Insufficient Data" or signal_status == "UNAVAILABLE":
+            signal_status = "UNAVAILABLE"
+            state, tone = "Insufficient Data", "gray"
+        heading = f"{heading} · {signal_status}"
     st.markdown(f"### {heading} · :{tone}-badge[{state}] · {data.index[-1]:%d %b %Y}")
     trend = "Bullish" if bullish else "Bearish" if bearish else "Mixed"
     latest_vol = realized.iloc[-1] if not realized.empty else np.nan
@@ -238,7 +275,9 @@ def render_entry_assessment(data, realized, initial, *, exit_view=False):
     if exit_view:
         if trend_inputs.isna().any():
             cards[0] = ("Trend", "Insufficient Data", cards[0][2])
-        cards.insert(1, ("Exit Signal", state, "Uses trend and medium-term momentum."))
+        cards.insert(1, ("Exit Signal", state,
+                         "PROVISIONAL uses current session quotes. CONFIRMED uses completed sessions. "
+                         "STALE uses older quotations. UNAVAILABLE indicates insufficient usable data."))
     for months, sessions in ((1, 21), (3, 63), (6, 126)):
         value = row[f"Momentum {sessions}"]
         cards.append((f"Momentum {months}M", f"{value:+.2%}" if pd.notna(value) else "—",
@@ -321,7 +360,7 @@ def activation(store, mode):
             return
         st.caption("Simulated at the latest common completed close on or before the requested date. Historical replay uses saved target weights and is labelled separately; it is not a historical forecast.")
         if st.button("Preview paper orders"):
-            history = quotes(tuple(draft["weights"]), day-timedelta(days=10), currency)
+            history = paper_quotes(draft, day-timedelta(days=10), currency)
             closes = pd.DataFrame({t:h.Close for t,h in history.items()}).loc[:str(day)].dropna()
             if closes.empty:
                 raise ValueError("No common completed close within ten days.")
@@ -399,24 +438,152 @@ def monitor_indicator_returns(full_close, quantities, returns, cash):
     return pd.concat([warmup, returns])
 
 
+intraday_response = st.cache_data(ttl=55, max_entries=256, show_spinner=False)(fetch_intraday)
+
+
+def monitor_market_inputs(tickers, start, currency, refresh):
+    history, fx_history = {}, {}
+    daily_errors = {}
+    last_good = st.session_state.setdefault("ts_confirmed_quotes", {})
+    empty_columns = ["Close", "Adj Close", "Dividends", "Stock Splits"]
+
+    def completed(symbol, expected_currency):
+        key = (symbol, start, expected_currency)
+        try:
+            daily = quotes((symbol,), start, expected_currency, monitoring=True)[symbol]
+            if daily.empty:
+                raise ValueError("No completed observations")
+            last_good[key] = daily
+            if len(last_good) > 128:
+                last_good.pop(next(iter(last_good)))
+            return daily
+        except Exception as exc:
+            daily_errors[symbol] = f"Daily feed unavailable ({type(exc).__name__})"
+            return last_good.get(key, pd.DataFrame(columns=empty_columns, index=pd.DatetimeIndex([])))
+
+    for ticker in tickers:
+        history[ticker] = completed(ticker, None)
+    currencies = {h.attrs.get("market", {}).get("currency") for h in history.values()} - {currency, None}
+    for source in sorted(currencies):
+        fx_history[source] = completed(fx_symbol(source, currency), currency)
+
+    inputs = {**history, **{fx_symbol(source, currency): h for source, h in fx_history.items()}}
+    responses = {}
+    now = pd.Timestamp.now(tz="UTC")
+    empty_response = pd.DataFrame(), {}, ""
+    for symbol, daily in inputs.items():
+        if refresh:
+            intraday_response.clear(symbol)
+        if not refresh and select_quote(symbol, daily, empty_response, now).status == "OFFICIAL_CLOSE":
+            responses[symbol] = empty_response
+        else:
+            responses[symbol] = intraday_response(symbol)
+    stamp = pd.Timestamp.now(tz="UTC")
+    selected = {}
+    for symbol, daily in inputs.items():
+        quote = select_quote(symbol, daily, responses[symbol], stamp)
+        if symbol in daily_errors:
+            quote = replace(quote, detail=f"{quote.detail} · {daily_errors[symbol]}")
+        selected[symbol] = quote
+    return (history, fx_history, {t: selected[t] for t in tickers},
+            {source: selected[fx_symbol(source, currency)] for source in fx_history}, stamp)
+
+
+def market_status(live, live_fx, rates, status, stamp):
+    def local_time(timestamp, zone):
+        return timestamp.tz_convert(zone).strftime("%d %b %Y, %H:%M %Z") if timestamp is not None else "—"
+
+    quotations = [*live.values(), *live_fx.values()]
+    times = [q.timestamp for q in quotations if q.timestamp is not None]
+    latest = local_time(max(times), "Europe/Rome") if times else "—"
+    markets = " / ".join(sorted({q.market for q in quotations}))
+    st.caption(f"{status} · Yahoo Finance via yfinance · {markets} · Latest quote {latest} · "
+               f"Valued {local_time(stamp, 'Europe/Rome')}")
+    if status in {"STALE", "UNAVAILABLE"}:
+        st.warning("One or more current security or FX quotations are stale or unavailable. See the quotation details.")
+    if len(set(times)) > 1:
+        st.caption("Security and FX marks have different timestamps. See the individual quotation times below.")
+    with st.expander("Market quotation details"):
+        st.dataframe([{
+            "Ticker": q.ticker, "Price": q.price, "Currency": q.currency,
+            "FX to portfolio currency": rates.get(q.ticker),
+            "Exchange": q.timezone, "Timestamp": local_time(q.timestamp, q.timezone or "UTC"),
+            "Previous close": q.previous_close, "Market": q.market, "Price status": q.status,
+            "Provider": q.provider, "Freshness": q.detail,
+        } for q in quotations], hide_index=True)
+
+
 def dashboard(store, identifier, meta, metric):
-    if st.button("Refresh Data"):
-        quotes.clear()
-    orders = [v for _,_,v in store.read("transaction", identifier)]
+    refresh = st.button("Refresh Data")
+    orders = [v for _, _, v in store.read("transaction", identifier)]
     snapshot = store.read("snapshot", identifier)[0][2]
     start = pd.Timestamp(meta["start"])
-    history = quotes(tuple(sorted({o["ticker"] for o in orders})), start.date()-timedelta(days=400), meta["currency"])
+    ccy = meta["currency"]
+    tickers = tuple(sorted({o["ticker"] for o in orders}))
+    history, fx_history, live, live_fx, stamp = monitor_market_inputs(
+        tickers, start.date() - timedelta(days=400), ccy, refresh,
+    )
+
     def frame(column):
-        return pd.DataFrame({t:h[column] for t,h in history.items()}).sort_index()
-    close = frame("Close").loc[start:]
-    nav, returns, dd, marks, qty, flows = monitor(orders, close, frame("Dividends").reindex(close.index),
-                                                 frame("Stock Splits").reindex(close.index), meta["cash"])
-    if nav.empty or pd.isna(nav.iloc[-1]):
-        raise ValueError("Latest session is missing a quote for an active position; valuation paused.")
-    last = nav.index[-1]
-    stamp = pd.Timestamp.now(tz="UTC")
-    store.put(identifier,[("daily_value",str(d.date()),{"nav":float(v)}) for d,v in nav.dropna().items()])
-    st.caption(f"{meta['mode']} · {meta['model']} · Activated {meta['start']} · Latest close {last.date()} · Updated {stamp:%Y-%m-%d %H:%M} UTC")
+        return pd.DataFrame({t: h[column] for t, h in history.items()}).sort_index()
+
+    if any(h.empty for h in history.values()):
+        market_status(live, live_fx, {}, "UNAVAILABLE", stamp)
+        st.warning("Completed history for an active position is unavailable. Portfolio accounting could not be reconciled.")
+        return
+
+    full_close = frame("Close")
+    original_dividends = frame("Dividends")
+    dividends = original_dividends.copy()
+    for ticker, h in history.items():
+        source = h.attrs["market"]["currency"]
+        if source != ccy:
+            fx = fx_history.get(source)
+            rate = fx.Close.reindex(full_close.index).map(
+                lambda value: value if np.isfinite(value) and value > 0 else np.nan
+            ) if fx is not None else pd.Series(np.nan, index=full_close.index)
+            full_close[ticker] *= rate
+            dividends[ticker] = (dividends[ticker] * rate).where(dividends[ticker].ne(0), 0.)
+            if (original_dividends[ticker].fillna(0).ne(0) & rate.isna()).any():
+                live[ticker] = replace(live[ticker], price=None, status="UNAVAILABLE",
+                                       detail="Missing confirmed FX for historical dividend accounting")
+
+    close = full_close.loc[start:]
+    if close.empty:
+        market_status(live, live_fx, {}, "UNAVAILABLE", stamp)
+        st.warning("No completed observations since activation.")
+        return
+    nav, returns, dd, marks, qty, flows = monitor(
+        orders, close, dividends.reindex(close.index), frame("Stock Splits").reindex(close.index), meta["cash"],
+    )
+    last = nav.last_valid_index()
+    if last is None or (flows.loc[nav.index > last] != 0).any():
+        market_status(live, live_fx, {}, "UNAVAILABLE", stamp)
+        st.warning("No complete post-activation valuation is available for all recorded purchases.")
+        return
+    nav, returns, dd, marks, qty, flows = (
+        values.loc[:last] for values in (nav, returns, dd, marks, qty, flows)
+    )
+    cash = nav.iloc[-1] - marks.iloc[-1].sum()
+    value, market_values, fx_rates, live_status = snapshot_values(qty.iloc[-1], cash, live, ccy, live_fx)
+    pending_dividend = any(h.loc[h.index > last, "Dividends"].fillna(0).ne(0).any()
+                           for h in history.values())
+    if pending_dividend and live_status != "UNAVAILABLE":
+        live_status = "STALE"
+    live_day = max((q.session for q in [*live.values(), *live_fx.values()] if q.session is not None),
+                   default=last)
+    if live_status == "CONFIRMED" and live_day > last:
+        live_status = "PROVISIONAL"
+        st.caption("Individual closes are available while a complete daily portfolio valuation is pending.")
+    market_status(live, live_fx, fx_rates, live_status, stamp)
+    if pending_dividend:
+        st.caption("A dividend is awaiting reconciliation in the complete daily portfolio valuation.")
+    daily_key = f"ts_daily_archived_{identifier}"
+    if st.session_state.get(daily_key) != last:
+        store.put(identifier, [("daily_value", str(d.date()), {"nav": float(v)})
+                               for d, v in nav.dropna().items()])
+        st.session_state[daily_key] = last
+    st.caption(f"{meta['mode']} · {meta['model']} · Activated {meta['start']} · Latest complete NAV {last.date()}")
     if meta.get("replay"):
         st.caption("Historical replay: these target weights were not necessarily available at the simulated entry.")
     if meta.get("historical"):
@@ -446,47 +613,67 @@ def dashboard(store, identifier, meta, metric):
                 chart.update_yaxes(tickformat=".1%")
                 st.plotly_chart(chart)
                 st.caption("Reconstructed forecasts, separate from forecasts archived in real time.")
-    ccy = meta["currency"]
     realized = returns.rolling(21).std()*np.sqrt(252)
     initial = snapshot.get("volatility")
     live_fit = cached_forecast(returns, "normal")
-    for col, (label, value, color) in zip(st.columns(3), [
+    for col, (label, volatility, color) in zip(st.columns(3), [
         ("Initial ex-ante volatility", initial, "blue"),
         ("Realized volatility · 21 sessions", realized.iloc[-1], "red"),
         ("GARCH next session · annualized", live_fit["sigma"]*np.sqrt(252) if live_fit else None, "purple"),
     ]):
         with col:
-            metric(label, f"{value:.2%}" if value is not None and np.isfinite(value) else "—", color)
-    for col,(label,value,color) in zip(st.columns(4),[
-        ("Initial capital",f"{ccy} {meta['capital']:,.2f}","blue"),
-        ("Current value",f"{ccy} {nav.iloc[-1]:,.2f}","blue"),
-        ("P&L",f"{ccy} {nav.iloc[-1]-meta['capital']:,.2f}","green"),
-        ("Current / max drawdown",f"{dd.iloc[-1]:.2%} / {dd.min():.2%}","red")]):
+            metric(label, f"{volatility:.2%}" if volatility is not None and np.isfinite(volatility) else "—", color)
+    equity = (1 + returns).cumprod()
+    level, current_dd = None, None
+    if value is not None and nav.iloc[-1] > 0:
+        peak_key = f"ts_intraday_peak_{identifier}"
+        peak_day, peak = st.session_state.get(peak_key, (None, 1.))
+        if peak_day != live_day or live_status == "CONFIRMED":
+            peak = 1.
+        level, current_dd = current_equity(equity, nav.iloc[-1], value, peak)
+        if live_status == "PROVISIONAL" and level is not None:
+            st.session_state[peak_key] = (live_day, max(peak, level))
+    pnl = value - meta["capital"] if value is not None else None
+    for col, (label, text, color) in zip(st.columns(4), [
+        ("Initial capital", f"{ccy} {meta['capital']:,.2f}", "blue"),
+        ("Current value", f"{ccy} {value:,.2f}" if value is not None else "—", "blue"),
+        ("P&L", f"{ccy} {pnl:,.2f}" if pnl is not None else "—", "green"),
+        ("Current / max drawdown",
+         f"{current_dd:.2%} / {dd.min():.2%}" if current_dd is not None else f"— / {dd.min():.2%}", "red"),
+    ]):
         with col:
-            metric(label,value,color)
-    st.caption(f"Cash incl. credited dividends: {ccy} {nav.iloc[-1]-marks.iloc[-1].sum():,.2f} · "
-               f"P&L / contributed capital: {(nav.iloc[-1]/meta['capital']-1):.2%}")
-    indicator_returns = monitor_indicator_returns(frame("Close"), qty, returns, meta["cash"])
+            metric(label, text, color)
+    pct = f"{pnl / meta['capital']:.2%}" if pnl is not None else "—"
+    st.caption(f"Cash incl. credited dividends {ccy} {cash:,.2f} · P&L / contributed capital {pct} · "
+               "Maximum drawdown through the latest complete NAV.")
+    if live_status == "PROVISIONAL":
+        st.caption("Current drawdown includes the highest observed mark this session.")
+    indicator_returns = monitor_indicator_returns(full_close, qty, returns, meta["cash"])
     indicator_index = (1 + indicator_returns).cumprod()
-    assessment = indicators(indicator_index)
+    analysis_level = level if live_status != "CONFIRMED" else None
+    live_index = temporary_series(indicator_index, live_day, analysis_level)
+    assessment = indicators(live_index)
     displayed = assessment.loc[start:]
     st.caption("Pre-activation warm-up uses opening quantities and cash with historical closing prices. "
                "It is a conditional reconstruction and excludes pre-activation dividends. "
                "The index uses realized portfolio returns from activation onward.")
-    render_entry_assessment(assessment, realized, initial, exit_view=True)
+    render_entry_assessment(assessment, realized, initial, exit_view=True, signal_status=live_status)
     indicator_vol = indicator_returns.rolling(21).std() * np.sqrt(252)
     render_portfolio_charts(displayed, displayed.Price.iloc[0], indicator_vol, indicator_returns,
-                            initial, start, "Opening-basket warm-up · displayed base 1", monitor_view=True)
-    equity = (1+returns).cumprod()
-    target = pd.Series(snapshot.get("weights", {}),dtype=float)
-    positions = pd.DataFrame({"Quantity":qty.iloc[-1],"Price":close.iloc[-1],"Market value":marks.iloc[-1],
-                              "Target weight":target,"Current weight":marks.iloc[-1]/nav.iloc[-1]})
-    basis = pd.Series({t:sum(o["quantity"]*o["price"]+o["fee"] for o in orders if o["ticker"]==t) for t in marks})
+                            initial, start, f"Opening-basket warm-up · {live_status} · displayed base 1", monitor_view=True)
+    target = pd.Series(snapshot.get("weights", {}), dtype=float)
+    positions = pd.DataFrame({
+        "Quantity": qty.iloc[-1], "Price": {t: q.price for t, q in live.items()},
+        "Market value": market_values, "Target weight": target,
+        "Current weight": market_values / value if value else np.nan,
+    })
+    basis = pd.Series({t: sum(o["quantity"] * o["price"] + o["fee"] for o in orders if o["ticker"] == t)
+                       for t in marks})
     positions["Acquisition cost"] = basis
     positions["Position P&L excl. dividends"] = positions["Market value"]-basis
     positions["Initial price (split-normalized)"] = basis / qty.iloc[-1]
     weights = positions["Current weight"].dropna()
-    cov = close.pct_change(fill_method=None).dropna().tail(63).cov().reindex(index=weights.index,columns=weights.index)
+    cov = close.loc[:last].pct_change(fill_method=None).dropna().tail(63).cov().reindex(index=weights.index,columns=weights.index)
     variance = weights @ cov @ weights
     positions["Risk contribution"] = weights * (cov @ weights) / variance if variance > 0 else np.nan
     st.dataframe(positions)
@@ -504,7 +691,7 @@ def dashboard(store, identifier, meta, metric):
             continue
         # A forecast first produced after the next exchange session started is
         # displayed live but must not be retroactively scored.
-        # Quotes exclude today's bar. Archive only if the latest bar is
+        # Archive only if the latest completed bar is
         # recent enough that an unobserved session cannot already have closed.
         next_day = (last + pd.offsets.BDay()).date()
         if meta.get("historical"):
@@ -528,15 +715,35 @@ def dashboard(store, identifier, meta, metric):
     else:
         z = st.number_input("Z-score threshold",min_value=.1,value=2.)
         window = st.selectbox("Mean reversion window",[20,50,100])
-        series = {"Portfolio":equity, **{t:h["Adj Close"] for t,h in history.items()}}
-        analysis = {t:indicators(p,window) for t,p in series.items()}
-        signals = {t:signal(data,z) for t,data in analysis.items()}
-        st.caption(f"Portfolio state: {signals['Portfolio']['state']}")
-        store.put(identifier,[("signal",f"{last.date()}:{window}:{z}:{t}",v) for t,v in signals.items()])
+        confirmed_series = {"Portfolio": equity, **{t: h["Adj Close"] for t, h in history.items()}}
+        confirmed_analysis = {t: indicators(p, window) for t, p in confirmed_series.items() if not p.empty}
+        store.put(identifier, [
+            ("signal", f"{d.index[-1].date()}:{window}:{z}:{t}", signal(d, z))
+            for t, d in confirmed_analysis.items()
+        ])
+        series = {"Portfolio": temporary_series(equity, live_day, analysis_level), **{
+            t: temporary_series(h["Adj Close"], live[t].session, live[t].adjusted_price)
+            for t, h in history.items() if not h.empty
+        }}
+        analysis = {t: indicators(p, window) for t, p in series.items()}
+        signals = {t: signal(data, z) for t, data in analysis.items()}
+        status_by_price = {"INTRADAY": "PROVISIONAL", "OFFICIAL_CLOSE": "CONFIRMED",
+                           "STALE": "STALE", "UNAVAILABLE": "UNAVAILABLE"}
+        for ticker, result in signals.items():
+            status = live_status if ticker == "Portfolio" else status_by_price[live[ticker].status]
+            if result["state"] == "INSUFFICIENT DATA" or (
+                ticker != "Portfolio" and live[ticker].adjusted_price is None
+            ):
+                status = "UNAVAILABLE"
+            if status == "UNAVAILABLE":
+                result = {"state": "INSUFFICIENT DATA", "reason": "Current mark or signal inputs unavailable."}
+                signals[ticker] = result
+            result["status"] = status
+        st.caption(f"Portfolio state · {signals['Portfolio']['state']} · {signals['Portfolio']['status']}")
         if section == "Signals":
             st.dataframe(pd.DataFrame(signals).T)
             if meta.get("historical"):
-                states = [signal(analysis["Portfolio"].iloc[max(0, i-199):i+1], z)["state"]
+                states = [signal(confirmed_analysis["Portfolio"].iloc[max(0, i-199):i+1], z)["state"]
                           for i in range(len(equity))]
                 st.plotly_chart(go.Figure(go.Scatter(x=equity.index, y=states, mode="markers",
                                                    name="Reconstructed portfolio state")))
@@ -544,7 +751,7 @@ def dashboard(store, identifier, meta, metric):
             asset = st.selectbox("Series", list(series), index=0,
                                  key=f"monitor_trend_series_{identifier}")
             if asset == "Portfolio":
-                d = indicators(indicator_index, window).loc[start:]
+                d = indicators(live_index, window).loc[start:]
                 st.caption("Portfolio index based on executed holdings and cash. Indicators use the "
                            "conditional opening-basket history before activation for warm-up.")
             else:
@@ -753,7 +960,11 @@ def render_workspace(metric):
             if st.checkbox("Confirm archiving this portfolio") and st.button("Archive"):
                 store.put(identifier,[("archived","once",True)])
                 st.rerun()
-        dashboard(store,identifier,portfolios[identifier],metric)
+        interval = st.selectbox("Automatic market refresh", [0, 1, 2, 3, 4, 5],
+                                format_func=lambda n: "Off" if n == 0 else f"Every {n} min")
+        st.fragment(dashboard, run_every=interval * 60 if interval else None)(
+            store, identifier, portfolios[identifier], metric,
+        )
     except Exception as exc:
         # Database and provider errors may contain connection details.
         if type(exc) is ValueError:

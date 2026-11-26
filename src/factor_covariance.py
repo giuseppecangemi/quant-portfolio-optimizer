@@ -5,7 +5,8 @@ EUR equity excess returns and converted EUR factor returns are used for both exp
 import numpy as np
 import pandas as pd
 from src.eur_risk_free import ESTR_ONLY
-from src.factor_currency import factor_sample
+from src.factor_currency import configured_factor_inputs, factor_covariance_available, factor_sample
+from src.portfolio_context import portfolio_settings
 
 FACTOR_NAMES = {"ff3": ("MKT-RF", "SMB", "HML"),
                 "ff5": ("MKT-RF", "SMB", "HML", "RMW", "CMA")}
@@ -15,13 +16,19 @@ def estimate_factor_covariance(prices: pd.DataFrame, factors: pd.DataFrame,
                                *, model: str, annualization: int = 252,
                                min_observations: int = 80,
                                eurusd_prices=None, market="USA", return_components=False,
-                               eur_rf_mode=ESTR_ONLY):
+                               eur_rf_mode=None):
     if model not in FACTOR_NAMES:
         raise ValueError(f"Unknown factor model {model}")
     if annualization <= 0:
         raise ValueError("Annualization must be positive")
+    if portfolio_settings() is not None:
+        if not factor_covariance_available(prices.columns):
+            raise ValueError("Factor Covariance requires a common factor set. Regional sets differ for these assets.")
+        prices, factors, eurusd_prices, market, eur_rf_mode = next(
+            configured_factor_inputs(prices, factors, model, eurusd_prices, eur_rf_mode=eur_rf_mode)
+        )
     cols = list(FACTOR_NAMES[model])
-    returns, available = factor_sample(prices, factors, eurusd_prices, market=market, eur_rf_mode=eur_rf_mode)
+    returns, available = factor_sample(prices, factors, eurusd_prices, market=market, eur_rf_mode=eur_rf_mode or ESTR_ONLY)
     aligned = returns.join(available[[*cols, "RF"]], how="inner").dropna()
     if len(aligned) < max(min_observations, len(cols) + 3):
         raise ValueError("Insufficient aligned observations for factor covariance")

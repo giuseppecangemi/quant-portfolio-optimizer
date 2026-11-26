@@ -577,7 +577,10 @@ if not CORE_APP.is_file():
 # Run the original application on every Streamlit rerun (ordinary imports would be cached).
 # Keep __file__ pointing at app_core.py so its existing relative paths keep working.
 _original_code = compile(CORE_APP.read_bytes(), str(CORE_APP), "exec")
-exec(_original_code, {"__name__": "__main__", "__file__": str(CORE_APP), "__package__": None})
+from src.portfolio_context import portfolio_scope
+
+with portfolio_scope():
+    exec(_original_code, {"__name__": "__main__", "__file__": str(CORE_APP), "__package__": None})
 
 with st.sidebar:
     st.divider()

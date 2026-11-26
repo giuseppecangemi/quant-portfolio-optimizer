@@ -376,10 +376,10 @@ Usa tabelle quando migliorano realmente il confronto.
 
 
 
-def _request_analysis(payload: dict, api_key: str, model: str) -> str:
+def _request_analysis(payload: dict, api_key: str, model: str, *, instructions=SYSTEM_PROMPT) -> str:
     request_data = {
         "model": model,
-        "instructions": SYSTEM_PROMPT,
+        "instructions": instructions,
         "input": json.dumps(payload, ensure_ascii=False, allow_nan=False),
         "max_output_tokens": 2400,
         "store": False,

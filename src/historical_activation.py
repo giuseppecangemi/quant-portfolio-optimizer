@@ -14,6 +14,8 @@ class PortfolioConfiguration(dict):
     """JSON-compatible settings captured when the source optimizer runs."""
 
     def replay_blocker(self):
+        if self.get("effective_universe"):
+            return "Historical replay requires a single Milan session calendar. Paper activation is available."
         if self["return_model"] != "Historical":
             return "Historical replay for this model requires verified data vintages. Current Paper activation is available."
         if not self["universe"] or any(not ticker.endswith(".MI") for ticker in self["universe"]):

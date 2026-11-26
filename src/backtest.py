@@ -9,6 +9,7 @@ from src.fama_french_5 import estimate_ff5_eur_returns
 from src.factor_currency import estimate_factor_returns, factors_for_backtest_signal
 from src.transaction_costs import fund_orders
 from src.risk import portfolio_return, portfolio_volatility
+from src.portfolio_context import check_minimum, portfolio_settings
 from src.screening import screen_prices_point_in_time, screen_tradable_point_in_time, screen_quant_point_in_time
 from src.optimization import (
     optimize_minimum_volatility,
@@ -42,6 +43,9 @@ def backtest_portfolio(
     capture_initial_ex_ante=False,
     input_estimator=None,
     eur_rf_mode=ESTR_ONLY,
+    selection_prices=None,
+    manual_assets=None,
+    strict_estimation=False,
 ):
     """
     Esegue un backtest walk-forward realistico.
@@ -90,6 +94,15 @@ def backtest_portfolio(
     prices = prices.sort_index().copy()
     prices = prices.loc[~prices.index.duplicated(keep="last")]
     prices = prices.dropna(axis=1, how="all")
+    from src.hybrid_portfolio import eligible_manual, manual_records, native_ranking_prices
+    configured = portfolio_settings()
+    if configured is not None:
+        if selection_prices is None:
+            selection_prices = native_ranking_prices(prices)
+        if manual_assets is None:
+            manual_assets = manual_records(configured)
+    ranking_prices = prices if selection_prices is None else selection_prices.sort_index()
+    manual_assets = {} if manual_assets is None else manual_assets
     if len(prices) <= lookback_days:
         raise ValueError(
             "Non ci sono abbastanza dati storici "
@@ -97,7 +110,7 @@ def backtest_portfolio(
         )
     n_assets = prices.shape[1]
     effective_assets = (
-        min(int(selection_top_n), n_assets)
+        min(int(selection_top_n) + len(manual_assets), n_assets)
         if selection_top_n is not None
         else n_assets
     )
@@ -142,27 +155,28 @@ def backtest_portfolio(
         labels = tuple(frame.columns) if isinstance(frame, pd.DataFrame) else frame.name
         return labels, sha256(pd.util.hash_pandas_object(frame, index=True).to_numpy().tobytes()).digest()
 
-    fingerprint = digest(prices)
+    fingerprint = (digest(prices), digest(ranking_prices) if selection_prices is not None else None)
     factor_fingerprints = (market, digest(ff3_factors), digest(ff5_factors), digest(eurusd_prices))
     if (shared_window_cache.get("_dataset") != fingerprint
             or shared_window_cache.get("_fundamentals") is not historical_fundamentals):
         shared_window_cache.clear()
         shared_window_cache["_dataset"] = fingerprint
         shared_window_cache["_fundamentals"] = historical_fundamentals
+    def ranking_inputs(position):
+        decision = prices.index[position-1]
+        history = ranking_prices.loc[:decision].tail(lookback_days)
+        return history, history.iloc[-1], decision
+
     if selection_top_n is not None and selection_policy == "fixed":
-        initial_historical_universe = prices.iloc[
-            start_position - lookback_days:
-            start_position
-        ]
         fixed_key = ("fixed_selection_tplus1_v4", tuple(prices.columns), prices.index[start_position], lookback_days, int(selection_top_n), tuple(active_factors))
         if fixed_key not in shared_window_cache:
-            ranking, selected = screen_quant_point_in_time(initial_historical_universe, prices.iloc[start_position - 1], prices.index[start_position - 1], historical_fundamentals, top_n=int(selection_top_n), min_observations=max(252, min(lookback_days, 253)), active_factors=active_factors)
+            ranking, selected = screen_quant_point_in_time(*ranking_inputs(start_position), historical_fundamentals, top_n=int(selection_top_n), min_observations=max(252, min(lookback_days, 253)), active_factors=active_factors)
             shared_window_cache[fixed_key] = (list(selected), ranking.copy())
         cached_selection = shared_window_cache[fixed_key]
         fixed_selected_tickers = list(cached_selection[0])
         if selection_audit is not None:
             selection_audit[str(prices.index[start_position].date())] = cached_selection[1].copy()
-        if len(fixed_selected_tickers) < 2:
+        if len(fixed_selected_tickers) < 2 and not manual_assets:
             raise ValueError("Point-in-time screening produced fewer than two assets.")
     # =====================================================
     # WALK-FORWARD BACKTEST
@@ -193,12 +207,12 @@ def backtest_portfolio(
             else:
                 selection_key = ("dynamic_selection_tplus1_v4", tuple(prices.columns), prices.index[rebalance_start], lookback_days, int(selection_top_n), tuple(active_factors))
                 if selection_key not in shared_window_cache:
-                    ranking, selected = screen_quant_point_in_time(historical_universe, prices.iloc[rebalance_start - 1], prices.index[rebalance_start - 1], historical_fundamentals, top_n=int(selection_top_n), min_observations=max(252, min(lookback_days, 253)), active_factors=active_factors)
+                    ranking, selected = screen_quant_point_in_time(*ranking_inputs(rebalance_start), historical_fundamentals, top_n=int(selection_top_n), min_observations=max(252, min(lookback_days, 253)), active_factors=active_factors)
                     shared_window_cache[selection_key] = (list(selected), ranking.copy())
                 selected_tickers = list(shared_window_cache[selection_key][0])
                 if selection_audit is not None:
                     selection_audit[str(prices.index[rebalance_start].date())] = shared_window_cache[selection_key][1].copy()
-            if len(selected_tickers) < 2:
+            if len(selected_tickers) < 2 and not manual_assets:
                 raise ValueError(f"Fewer than two selected assets on {rebalance_date}.")
             historical_prices = historical_universe[
                 selected_tickers
@@ -206,7 +220,17 @@ def backtest_portfolio(
         else:
             selected_tickers = list(prices.columns)
             historical_prices = historical_universe.dropna()
+        if manual_assets:
+            decision = historical_universe.index[-1]
+            selected_tickers, manual_status = eligible_manual(historical_universe, selected_tickers, manual_assets,
+                                                               ranked=selection_top_n is not None)
+            if len(selected_tickers) < 2:
+                raise ValueError(f"Fewer than two eligible assets on {decision:%Y-%m-%d}.")
+            if selection_audit is not None and str(rebalance_date.date()) in selection_audit:
+                selection_audit[str(rebalance_date.date())].attrs["manual_status"] = manual_status
         factor_prices = historical_universe[selected_tickers]
+        if manual_assets:
+            historical_prices = factor_prices.dropna()
         if input_estimator is None:
             if len(historical_prices) < 2:
                 raise ValueError(
@@ -257,7 +281,7 @@ def backtest_portfolio(
                 target_weights, initial_mu, risk_cov = input_estimator(factor_prices)
             except (ValueError, ImportError, RuntimeError, np.linalg.LinAlgError) as exc:
                 estimator_failure = f"Rebalance {rebalance_date}: {exc}"
-                if not portfolio_values:
+                if strict_estimation or not portfolio_values:
                     raise ValueError(estimator_failure) from exc
                 break
         elif strategy == "max_sharpe":
@@ -409,6 +433,8 @@ def backtest_portfolio(
             target_weights
             / target_weights.sum()
         )
+        if configured:
+            check_minimum(target_weights.reindex(selected_tickers))
         if capture_initial_ex_ante and rebalance_start == start_position:
             labels = risk_cov.index
             weights = target_weights.reindex(labels).to_numpy()

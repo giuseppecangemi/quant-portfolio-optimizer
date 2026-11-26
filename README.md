@@ -25,6 +25,13 @@ Users can select assets manually or apply a multi-signal ranking approach. The q
 
 Signals are converted into cross-sectional percentile rankings and combined into a **Quant Score**. Missing fundamental data are not automatically treated as poor fundamentals. Screening and portfolio allocation remain separate stages, making it easier to distinguish the effects of asset choice from those of portfolio weights.
 
+
+In **Asset Selection**, add listed instruments under **Manual Asset Selection** to extend the current quantitative selection. A ticker already in the selection appears once. Confirm its economic factor region, historical eligibility date, and whether the optimizer may assign zero weight. A mandatory inclusion sets a minimum target weight. Whole-share allocations can fall below the target because of rounding.
+
+With manual additions, portfolio estimation uses adjusted closes converted to EUR with the latest available prior-date FX rate. Physical allocations use converted unadjusted closes. The original **Factor Models** controls continue to offer Historical and Factor Covariance. Regional FF3 and FF5 use Europe and USA factor datasets for the corresponding assets. Global mode uses Developed Markets factors. Joint Factor Covariance requires a common factor set.
+
+The original **Standard Walk-Forward** and **Fixed Horizon** actions use the configured historical eligibility date for manual entries. Earlier eligibility dates are retrospective assumptions. Mandatory entries require sufficient observed prices before the investment decision. **Time Series Portfolio** uses its existing quantitative selection checkbox to include the full selection, including manual entries.
+
 ### 2. Portfolio optimization and allocation
 
 The application explores Markowitz's mean–variance framework, the efficient frontier, and eight allocation strategies:
@@ -99,3 +106,15 @@ Historical estimates are noisy, correlations and factor premia can change, and b
 Future methodological directions include covariance shrinkage, Black–Litterman allocation, improved transaction-cost modeling, immutable data snapshots, and stronger rolling out-of-sample validation.
 
 > **Disclaimer:** Quant Portfolio Optimizer is intended for educational and research purposes. It is not personalized investment advice, and neither historical results nor simulated outcomes guarantee future performance.
+
+### Time Series Portfolio
+
+Aprire **Time Series Portfolio** dal menu dell’app. Configurare i ticker dal catalogo del mercato selezionato, dalla Quant Selection esistente o per inserimento manuale. Il pulsante **Calcola allocazione corrente** salva il risultato nella sessione. La finestra di ricostruzione, gli indicatori, il benchmark e la frequenza di ribilanciamento si possono cambiare usando la stessa allocazione. La stima e la ricostruzione hanno finestre indipendenti. La ricostruzione parte da cinque anni per default.
+
+- **Allocazione.** Sono disponibili Historical, CAPM, FF3, FF5 e ML con Maximum Sharpe, Minimum Volatility, Risk Parity, HRP ed Equal Weight. La covarianza campionaria annualizzata usa gli adjusted close in valuta di riferimento. FF3/FF5 riutilizzano il modello nativo per USA o Borsa Italiana e, se richiesto, combinano il rendimento giornaliero nativo con la variazione media del cambio osservata nella finestra. I modelli fattoriali mantengono il buffer di pubblicazione esistente e richiedono storico sufficiente.
+- **Dati e unità.** L’allocazione usa chiusure Yahoo complete e comuni. Le serie Price Return usano chiusure rettificate per split. Total Return usa adjusted close ancorati al prezzo corrente, con reinvestimento implicito nelle unità economiche. Il cambio è l’ultimo tasso osservato entro quattro giorni di calendario, mai una quotazione di data successiva. Chiusure di mercati diversi possono riferirsi a orari diversi. Le date senza osservazioni comuni restano escluse. I rendimenti attraversano eventuali interruzioni tra due osservazioni comuni.
+- **Ricostruzione.** Per default le quantità intere sono fissate oggi e la liquidità residua è costante. Il ribilanciamento opzionale ripristina i pesi correnti teorici o effettivi con quantità frazionarie al close, per i rendimenti successivi. L’ultimo periodo incompleto non impone un ribilanciamento periodico. La serie monetaria termina al valore corrente. Il capitale storico iniziale deriva dalla ricostruzione; l’indice base 100 si ancora alla prima osservazione mostrata.
+- **Analisi.** La pagina mostra indicatori tecnici, zone da swing ricorrenti, volatilità, breadth, contributi capitalizzati e confronto con benchmark sulla valuta e sulla convenzione dei dividendi scelte. FTSE MIB Total Return e MSCI World usano proxy ETF dichiarati. Il confronto usa il primo giorno comune e la breadth esclude liquidità e posizioni nulle.
+- **K.** Con `OPENAI_API_KEY` nei Secrets Streamlit, il pulsante invia un JSON con le sole statistiche della ricostruzione e conserva il report associato al payload corrente.
+
+La ricostruzione è descrittiva del paniere corrente e non è un backtest. I livelli tecnici sono evidenze statistiche della serie sintetica. Per avviare l’app usare `python -m streamlit run app.py` dalla cartella del repository.

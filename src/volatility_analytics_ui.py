@@ -10,6 +10,7 @@ import plotly.graph_objects as go
 import streamlit as st
 
 from src.data import get_prices
+from src.portfolio_context import configure_portfolio, portfolio_scope, portfolio_settings
 from src.risk_alerts import risk_alert
 from src.volatility_analytics import (
     available_portfolios, complete_suffix, dated_returns, estimate,
@@ -22,8 +23,10 @@ MODELS = ["Historical", "Rolling", "EWMA", *(["GARCH(1,1)", "GJR-GARCH", "EGARCH
 
 
 @st.cache_data(ttl=3600, max_entries=40, show_spinner=False)
-def market_prices(tickers, period):
-    return get_prices(list(tickers), period, preserve_missing=True)
+def market_prices(tickers, period, configuration=None):
+    with portfolio_scope():
+        configure_portfolio(configuration)
+        return get_prices(list(tickers), period, preserve_missing=True)
 
 
 def render_volatility(portfolio_mode, state, tickers, universe, metric):
@@ -61,7 +64,8 @@ def render_volatility(portfolio_mode, state, tickers, universe, metric):
         management = st.selectbox("Portfolio Management", ["Constant Weight","Buy & Hold"]) if portfolio_mode else None
         rebalance = st.selectbox("Rebalance every (sessions)", [1,21,63,126,252]) if management == "Constant Weight" else 0
         run = st.button("Run Volatility Analysis", type="primary", disabled=not assets, key=f"vol_run_{mode}")
-    params = dict(mode=mode, name=name, assets=assets, day=str(day), period=period, window=window,
+    configuration = allocation.configuration if allocation else portfolio_settings()
+    params = dict(portfolio_configuration=configuration, mode=mode, name=name, assets=assets, day=str(day), period=period, window=window,
                   rolling=rolling, horizon=horizon, model=model, decay=decay,
                   covariance=cov_method, management=management, rebalance=rebalance, sessions=ANNUALIZATION,
                   source=allocation.source if allocation else None,
@@ -86,7 +90,11 @@ def render_volatility(portfolio_mode, state, tickers, universe, metric):
         targets = [(name, tuple(assets))] if allocation else [(asset,(asset,)) for asset in assets]
         for label, symbols in targets:
             try:
-                prices = market_prices(symbols,period)
+                prices = market_prices(symbols, period, configuration)
+                if configuration and len(symbols) > 1:
+                    from src.hybrid_portfolio import hybrid_sessions
+
+                    prices = prices.loc[hybrid_sessions(prices.index, configuration)]
                 # Exclude today's bar, which may still be incomplete.
                 cutoff = min(pd.Timestamp(day), pd.Timestamp(date.today())-pd.Timedelta(days=1))
                 if allocation:
